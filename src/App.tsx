@@ -17,16 +17,20 @@ export function App() {
         </a>
       </header>
 
-      <div className="flex flex-1 items-center justify-center px-4 pb-24 pt-10 sm:px-6">
+      <div className="flex flex-1 items-center justify-center px-4 pt-10 pb-24 sm:px-6">
         <section className="w-full max-w-3xl">
           <h1 className="text-center text-2xl font-medium tracking-normal text-foreground sm:text-3xl">
             What kind of jobs are you looking for?
           </h1>
 
           <form className="mt-10" aria-label="Job search">
-            <div className="flex min-h-16 items-center gap-3 rounded-[2rem] border border-border bg-card px-4 py-3 shadow-[0_18px_60px_rgb(16_24_32/0.11)] transition-colors focus-within:border-ring focus-within:ring-4 focus-within:ring-ring/20 dark:shadow-[0_18px_70px_rgb(0_0_0/0.34)] sm:gap-4 sm:px-5">
+            <div className="flex min-h-16 items-center gap-3 rounded-[2rem] border border-border bg-card px-4 py-3 shadow-[0_18px_60px_rgb(16_24_32/0.11)] transition-colors focus-within:border-ring focus-within:ring-4 focus-within:ring-ring/20 sm:gap-4 sm:px-5 dark:shadow-[0_18px_70px_rgb(0_0_0/0.34)]">
+              <label htmlFor="job-search" className="sr-only">
+                Search jobs
+              </label>
               <input
                 className="h-10 min-w-0 flex-1 bg-transparent text-base text-foreground outline-none placeholder:text-muted-foreground"
+                id="job-search"
                 name="job-search"
                 placeholder="Enter search"
                 type="text"
