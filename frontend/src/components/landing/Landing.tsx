@@ -80,7 +80,7 @@ function JobsPreviewPanel() {
               Upload resume
             </Button>
             <p className="pointer-events-none text-xs leading-snug text-muted-foreground">
-              Coming soon — resume upload isn&apos;t wired yet.
+              Upload your resume and see jobs catered to you.
             </p>
           </div>
         </div>
@@ -107,7 +107,7 @@ export function Landing() {
         </h1>
         <p className="mt-6 max-w-lg text-lg leading-relaxed text-muted-foreground sm:text-xl">
           Upload once. MatchPoint reads your resume, pulls intent and skills, and
-          surfaces roles worth your time—before you ever create an account.
+          surfaces roles worth your time.
         </p>
       </div>
 
