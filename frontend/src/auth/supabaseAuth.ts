@@ -47,26 +47,39 @@ export const prepareEmailForAuth = (
   return { ok: true, email: trimmed.toLowerCase() }
 }
 
+/** Result of email+password sign-up or sign-in (validation runs via {@link prepareEmailForAuth}). */
+export type EmailPasswordAuthResult =
+  | { ok: true; error: AuthError | null }
+  | { ok: false; message: string }
+
 export const signUpWithEmail = async (
   email: string,
   password: string
-): Promise<{ error: AuthError | null }> => {
+): Promise<EmailPasswordAuthResult> => {
+  const prepared = prepareEmailForAuth(email)
+  if (!prepared.ok) {
+    return { ok: false, message: prepared.message }
+  }
   const { error } = await supabase.auth.signUp({
-    email: email.trim().toLowerCase(),
+    email: prepared.email,
     password,
   })
-  return { error }
+  return { ok: true, error }
 }
 
 export const signInWithEmail = async (
   email: string,
   password: string
-): Promise<{ error: AuthError | null }> => {
+): Promise<EmailPasswordAuthResult> => {
+  const prepared = prepareEmailForAuth(email)
+  if (!prepared.ok) {
+    return { ok: false, message: prepared.message }
+  }
   const { error } = await supabase.auth.signInWithPassword({
-    email: email.trim().toLowerCase(),
+    email: prepared.email,
     password,
   })
-  return { error }
+  return { ok: true, error }
 }
 
 /**

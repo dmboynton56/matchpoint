@@ -43,9 +43,14 @@ export function SignupLoginCard() {
 
     setIsSubmitting(true)
     try {
-      const { error } = isLogin
-        ? await signInWithEmail(prepared.email, password)
-        : await signUpWithEmail(prepared.email, password)
+      const result = isLogin
+        ? await signInWithEmail(email, password)
+        : await signUpWithEmail(email, password)
+      if (!result.ok) {
+        toast.error(result.message, { position: "top-center" })
+        return
+      }
+      const { error } = result
       if (error) {
         toast.error(
           error.message ||
@@ -131,7 +136,7 @@ export function SignupLoginCard() {
             <div className="grid gap-2">
               <div className="flex items-center">
                 <Label htmlFor="password">Password</Label>
-                {!isLogin && (
+                {isLogin && (
                   <a
                     href="#"
                     className="ml-auto inline-block text-sm underline-offset-4 hover:underline"
@@ -148,12 +153,12 @@ export function SignupLoginCard() {
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
               />
-              {isLogin && (
+              {!isLogin && (
                 <p className="text-xs text-muted-foreground">
                   Password must be at least 8 characters long
                 </p>
               )}
-              {isLogin && (
+              {!isLogin && (
                 <p className="text-xs text-muted-foreground">
                   Password must contain at least one uppercase letter, one
                   lowercase letter, one number, and one special character
@@ -181,8 +186,8 @@ export function SignupLoginCard() {
           {isSubmitting
             ? "Connecting…"
             : isLogin
-              ? "Sign up with Google"
-              : "Login with Google"}
+              ? "Login with Google"
+              : "Sign up with Google"}
         </Button>
       </CardFooter>
     </Card>
