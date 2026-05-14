@@ -11,10 +11,71 @@ if (!supabaseUrl || !supabasePubKey) {
 export const supabase = createClient(supabaseUrl, supabasePubKey)
 
 /**
+ * Trims and lowercases email for auth. Returns a user-facing message if the
+ * string is not in a shape Supabase GoTrue accepts (one @, non-empty parts,
+ * domain with a dot).
+ */
+export const prepareEmailForAuth = (
+  email: string
+): { ok: true; email: string } | { ok: false; message: string } => {
+  const trimmed = email.trim()
+  if (!trimmed) {
+    return { ok: false, message: "Enter an email address." }
+  }
+  const atMatches = trimmed.match(/@/g)
+  const atCount = atMatches?.length ?? 0
+  if (atCount !== 1) {
+    return {
+      ok: false,
+      message:
+        atCount > 1
+          ? "That email has more than one “@”. Use a single @ between your name and your provider (for example name@gmail.com)."
+          : "Email must include an @ between your name and your provider.",
+    }
+  }
+  const [local, domain] = trimmed.split("@")
+  if (!local?.length || !domain?.length) {
+    return { ok: false, message: "Enter a complete email address." }
+  }
+  if (!domain.includes(".")) {
+    return {
+      ok: false,
+      message:
+        "Enter a valid email with a domain that includes a dot (for example name@example.com).",
+    }
+  }
+  return { ok: true, email: trimmed.toLowerCase() }
+}
+
+export const signUpWithEmail = async (
+  email: string,
+  password: string
+): Promise<{ error: AuthError | null }> => {
+  const { error } = await supabase.auth.signUp({
+    email: email.trim().toLowerCase(),
+    password,
+  })
+  return { error }
+}
+
+export const signInWithEmail = async (
+  email: string,
+  password: string
+): Promise<{ error: AuthError | null }> => {
+  const { error } = await supabase.auth.signInWithPassword({
+    email: email.trim().toLowerCase(),
+    password,
+  })
+  return { error }
+}
+
+/**
  * Initiates the Google OAuth flow.
  * Returns the user to the current page after authentication.
  */
-export const signInWithGoogle = async (): Promise<{ error: AuthError | null }> => {
+export const signInWithGoogle = async (): Promise<{
+  error: AuthError | null
+}> => {
   const { error } = await supabase.auth.signInWithOAuth({
     provider: "google",
     options: {
@@ -47,7 +108,11 @@ export const consumeOAuthUrlError = (): string | null => {
   const hashParams = new URLSearchParams(window.location.hash.slice(1))
   const hashMessage = readMessage(hashParams)
   if (hashMessage) {
-    window.history.replaceState(null, "", window.location.pathname + window.location.search)
+    window.history.replaceState(
+      null,
+      "",
+      window.location.pathname + window.location.search
+    )
     return hashMessage
   }
 

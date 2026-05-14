@@ -151,10 +151,10 @@ auth.enable_anonymous_sign_ins = false
 # Allow/disallow testing manual linking of accounts
 auth.enable_manual_linking = false
 # Passwords shorter than this value will be rejected as weak. Minimum 6, recommended 8 or more.
-auth.minimum_password_length = 6
+auth.minimum_password_length = 8
 # Passwords that do not meet the following requirements will be rejected as weak. Supported values
 # are: `letters_digits`, `lower_upper_letters_digits`, `lower_upper_letters_digits_symbols`
-auth.password_requirements = ""
+auth.password_requirements = "lower_upper_letters_digits_symbols"
 
 # Configure passkey sign-ins.
 # auth.passkey.enabled = false
@@ -187,17 +187,17 @@ auth.rate_limit.web3 = 30
 auth.email.enable_signup = true
 # If enabled, a user will be required to confirm any email change on both the old, and new email
 # addresses. If disabled, only the new email is required to confirm.
-auth.email.double_confirm_changes = true
+auth.email.double_confirm_changes = false
 # If enabled, users need to confirm their email address before signing in.
 auth.email.enable_confirmations = false
 # If enabled, users will need to reauthenticate or have logged in recently to change their password.
-auth.email.secure_password_change = false
+auth.email.secure_password_change = true
 # Controls the minimum amount of time that must pass before sending another signup confirmation or password reset email.
 auth.email.max_frequency = "1s"
 # Number of characters used in the email OTP.
 auth.email.otp_length = 6
 # Number of seconds before the email OTP expires (defaults to 1 hour).
-auth.email.otp_expiry = 3600
+auth.email.otp_expiry = 7200
 
 # Use a production-ready SMTP server
 # auth.email.smtp.enabled = true
