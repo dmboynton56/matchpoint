@@ -8,6 +8,9 @@ from app.services.cleaning import (
 from app.services.embedding import (
     generateEmbedding
 )
+from app.db.database import (
+    supabase
+)
 app = FastAPI()
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -19,20 +22,32 @@ class JobRequest(BaseModel):
 @app.get("/")
 def root():
     return {
-        "message": "Backend running"
+        "message": "Backend Started"
     }
 
-@app.get("/first-job")
-def get_first_job():
-    csvPath = BASE_DIR / "job_board_data.csv"
+@app.get("/jobs")
+def insert_jobs_into_database():
+    csvPath = BASE_DIR / "job_board_data_100.csv"
     df = pd.read_csv(csvPath)
+    jobs = []
+    for _, job in df.iterrows():
+        cleanedPost = buildCleanedText(job)
+        embedding = generateEmbedding(cleanedPost)
+        data = {
+            "external_id": str(job["external_id"]),
+            "company": str(job["company"]),
+            "title": str(job["title"]),
+            "description": str(cleanedPost),
+            "location": str(job["location"]),
+            "posted_at": job["posted_at"],
+            "apply_url": job["apply_url"],
+            "embedding": embedding
+        }
+        response = supabase.table("jobs").upsert(data, on_conflict = "external_id").execute()
+        
+        jobs.append(response.data)
 
-    first_job = df.iloc[0]
-    cleanedPost = buildCleanedText(first_job)
-    vector = generateEmbedding(cleanedPost)
     return {
-        "title": first_job["title"],
-        "company": first_job["company"],
-        "vector_dimensions": len(vector),
-        "sample_vector": vector[:5]
+        "message": "Jobs inserted successfully",
+        "data": jobs
     }
