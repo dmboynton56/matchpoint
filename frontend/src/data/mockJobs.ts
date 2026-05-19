@@ -6,6 +6,9 @@ export type MockJob = {
   tags: string[]
 }
 
+/** Max listings shown in the landing preview card (1 sharp + rest blurred). */
+export const LANDING_PREVIEW_JOB_COUNT = 4
+
 export const MOCK_JOBS: MockJob[] = [
   {
     id: "1",
