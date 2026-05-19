@@ -36,3 +36,6 @@ frontend/.env
 # Supabase
 .temp/
 .branches/
+
+__pycache__/
+*.pyc
