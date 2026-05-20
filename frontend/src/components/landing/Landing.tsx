@@ -36,7 +36,13 @@ function JobsPreviewPanel() {
           className="pointer-events-none flex min-h-0 flex-1 flex-col justify-center gap-2.5 overflow-hidden px-3 py-3 select-none"
         >
           <div className="relative z-[1] shrink-0">
-            <JobListingCard job={featured} showTags={false} className="px-3 py-2.5" />
+            <JobListingCard
+              job={featured}
+              showMatchScore={false}
+              showHighlights={false}
+              showApplyLink={false}
+              className="px-3 py-2.5"
+            />
           </div>
           {rest.map((job, rowIndex) => (
             <div
@@ -46,7 +52,13 @@ function JobsPreviewPanel() {
                 blurredRowClasses(rowIndex)
               )}
             >
-              <JobListingCard job={job} showTags={false} className="px-3 py-2.5" />
+              <JobListingCard
+                job={job}
+                showMatchScore={false}
+                showHighlights={false}
+                showApplyLink={false}
+                className="px-3 py-2.5"
+              />
             </div>
           ))}
         </div>
