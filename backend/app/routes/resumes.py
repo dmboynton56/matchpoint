@@ -2,9 +2,10 @@ import io
 
 import pypdf
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+import openai
 
 from app.db.database import supabase
-from app.routes.auth import get_optional_user
+from app.routes.auth import get_optional_user, get_current_user
 
 router = APIRouter()
 
@@ -25,15 +26,16 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
 
 
 def fetch_job_matches(extracted_text: str, *, limit: int) -> list[dict]:
-    # Placeholder until embedding-based matching is implemented.
-    del extracted_text
-
-    response = (
-        supabase.table("jobs")
-        .select("id, title, company, location, apply_url")
-        .limit(limit)
-        .execute()
+    embedding_response = openai.embeddings.create(
+        input=extracted_text,
+        model="text-embedding-3-small"
     )
+    query_embedding = embedding_response.data[0].embedding
+
+    response = supabase.rpc("match_jobs", {
+        "query_embedding": query_embedding,
+        "match_limit": limit,
+    }).execute()
 
     jobs = response.data or []
     return [
@@ -79,6 +81,19 @@ async def handle_authenticated_upload(
 
     jobs = fetch_job_matches(extracted_text, limit=AUTHENTICATED_JOB_LIMIT)
 
+    supabase.table("job_matches").delete().eq("user_id", user_id).execute()
+    if jobs:
+        supabase.table("job_matches").insert([
+            {
+                "user_id": user_id,
+                "job_id": job["id"],
+                "match_score": job["match_score"],
+                "is_viewed": False,
+                "is_favorited": False,
+            }
+            for job in jobs
+        ]).execute()
+
     return {
         "message": "Resume uploaded and successfully parsed.",
         "is_authenticated": True,
@@ -114,3 +129,26 @@ async def upload_and_parse_resume(
         raise HTTPException(
             status_code=500, detail=f"Resume processing failed: {str(e)}"
         ) from e
+
+@router.delete("/resumes/me")
+async def delete_resume(
+    current_user=Depends(get_current_user),
+):
+    user_id = current_user.id
+    storage_path = f"{user_id}/resume.pdf"
+
+    try:
+        supabase.storage.from_("resumes").remove([storage_path])
+
+        supabase.table("profiles").update({
+            "resume_text": None,
+        }).eq("id", user_id).execute()
+
+        supabase.table("job_matches").delete().eq("user_id", user_id).execute()
+
+        return {"success": True, "message": "Resume and associated matches deleted."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete resume: {str(e)}") from e
+    
