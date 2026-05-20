@@ -1,30 +1,14 @@
 import { FileUp } from "lucide-react"
+import { Link } from "react-router-dom"
 
+import { JobListingCard } from "@/components/jobs/JobListingCard"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
-import { MOCK_JOBS, type MockJob } from "@/data/mockJobs"
+import {
+  LANDING_PREVIEW_JOB_COUNT,
+  MOCK_JOBS,
+} from "@/data/mockJobs"
 import { cn } from "@/lib/utils"
-
-function JobRowShell({ job }: { job: MockJob }) {
-  return (
-    <>
-      <p className="text-sm font-medium leading-snug tracking-tight text-foreground">
-        {job.title}
-      </p>
-      <p className="mt-0.5 text-xs text-muted-foreground">{job.company}</p>
-      <p className="text-[11px] text-muted-foreground/90">{job.location}</p>
-    </>
-  )
-}
-
-/** Same surface as featured listing — blurred stack uses identical tiles so chips stay “card white” */
-function JobPreviewTile({ job }: { job: MockJob }) {
-  return (
-    <div className="rounded-xl border border-border bg-card px-3 py-2.5 shadow-sm ring-1 ring-primary/20">
-      <JobRowShell job={job} />
-    </div>
-  )
-}
 
 /** Blur ramps row-by-row so each listing stays its own card (border/bg), unlike one giant blurred layer + mask. */
 function blurredRowClasses(rowIndex: number) {
@@ -36,8 +20,9 @@ function blurredRowClasses(rowIndex: number) {
 }
 
 function JobsPreviewPanel() {
-  const featured = MOCK_JOBS[0]
-  const rest = MOCK_JOBS.slice(1)
+  const previewJobs = MOCK_JOBS.slice(0, LANDING_PREVIEW_JOB_COUNT)
+  const featured = previewJobs[0]
+  const rest = previewJobs.slice(1)
 
   if (!featured) {
     return null
@@ -48,10 +33,16 @@ function JobsPreviewPanel() {
       <CardContent className="relative flex min-h-0 flex-1 flex-col p-0">
         <div
           aria-hidden="true"
-          className="pointer-events-none flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto overscroll-none px-3 pt-3 pb-3 select-none"
+          className="pointer-events-none flex min-h-0 flex-1 flex-col justify-center gap-2.5 overflow-hidden px-3 py-3 select-none"
         >
           <div className="relative z-[1] shrink-0">
-            <JobPreviewTile job={featured} />
+            <JobListingCard
+              job={featured}
+              showMatchScore={false}
+              showHighlights={false}
+              showApplyLink={false}
+              className="px-3 py-2.5"
+            />
           </div>
           {rest.map((job, rowIndex) => (
             <div
@@ -61,7 +52,13 @@ function JobsPreviewPanel() {
                 blurredRowClasses(rowIndex)
               )}
             >
-              <JobPreviewTile job={job} />
+              <JobListingCard
+                job={job}
+                showMatchScore={false}
+                showHighlights={false}
+                showApplyLink={false}
+                className="px-3 py-2.5"
+              />
             </div>
           ))}
         </div>
@@ -69,15 +66,15 @@ function JobsPreviewPanel() {
         <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-background/30 px-5 backdrop-blur-[2px]">
           <div className="flex max-w-[14rem] flex-col items-center gap-3 text-center">
             <Button
-              type="button"
-              disabled
+              asChild
               size="lg"
               variant="secondary"
-              className="pointer-events-auto h-11 gap-2 rounded-xl border border-accent/35 bg-accent px-6 text-base font-semibold text-accent-foreground shadow-md shadow-accent/15 hover:bg-accent/90 disabled:opacity-100"
-              aria-label="Upload resume (coming soon)"
+              className="pointer-events-auto h-11 gap-2 rounded-xl border border-accent/35 bg-accent px-6 text-base font-semibold text-accent-foreground shadow-md shadow-accent/15 hover:bg-accent/90"
             >
-              <FileUp className="size-4 shrink-0" aria-hidden="true" />
-              Upload resume
+              <Link to="/jobs">
+                <FileUp className="size-4 shrink-0" aria-hidden="true" />
+                Upload resume
+              </Link>
             </Button>
             <p className="pointer-events-none text-xs leading-snug text-muted-foreground">
               Upload your resume and see jobs catered to you.

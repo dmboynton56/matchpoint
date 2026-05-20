@@ -1,23 +1,28 @@
-import { Landing } from "@/components/landing/Landing"
+import { lazy, Suspense } from "react"
+import { Route, Routes } from "react-router-dom"
+
+import { LandingPage } from "@/pages/LandingPage"
+
+const JobsPage = lazy(() =>
+  import("@/pages/JobsPage").then((m) => ({ default: m.JobsPage }))
+)
+
+function RouteFallback() {
+  return (
+    <div className="flex min-h-svh items-center justify-center bg-background text-sm text-muted-foreground">
+      Loading…
+    </div>
+  )
+}
 
 export function App() {
   return (
-    <main className="flex min-h-svh flex-col bg-background text-foreground">
-      <header className="flex min-h-24 items-center px-5 py-3 sm:px-8">
-        <a href="/" className="inline-flex items-center gap-2.5 text-foreground">
-          <img
-            src="/matchpoint-logo.png"
-            alt="MatchPoint"
-            className="h-[4.5rem] w-auto"
-            width={360}
-            height={72}
-            decoding="async"
-          />
-        </a>
-      </header>
-
-      <Landing />
-    </main>
+    <Suspense fallback={<RouteFallback />}>
+      <Routes>
+        <Route path="/" element={<LandingPage />} />
+        <Route path="/jobs" element={<JobsPage />} />
+      </Routes>
+    </Suspense>
   )
 }
 
