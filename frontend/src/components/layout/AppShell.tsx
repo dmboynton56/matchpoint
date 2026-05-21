@@ -16,10 +16,7 @@ export function AppShell({ children }: AppShellProps) {
       </header>
 
       <div className="mx-auto grid w-full max-w-7xl flex-1 grid-cols-1 gap-6 px-4 py-6 sm:px-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,3fr)_minmax(0,1fr)] lg:gap-8 lg:px-8 lg:py-8">
-        <aside
-          aria-label="Site navigation"
-          className="hidden min-w-0 lg:block"
-        >
+        <aside aria-label="Site navigation" className="hidden min-w-0 lg:block">
           <SiteLogo className="sticky top-8" />
         </aside>
 

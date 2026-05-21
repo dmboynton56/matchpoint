@@ -1,17 +1,19 @@
 import { LogOut, Settings, User } from "lucide-react"
 import { useNavigate } from "react-router-dom"
 import { toast } from "sonner"
-
-import { signOut } from "@/auth/supabaseAuth"
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
 import { Button } from "@/components/ui/button"
-import {
-  getUserAvatarUrl,
-  getUserDisplayName,
-  useAuth,
-} from "@/hooks/useAuth"
+import { signOut } from "@/auth/supabaseAuth"
+import { getUserAvatarUrl, getUserDisplayName, useAuth } from "@/hooks/useAuth"
 import { cn } from "@/lib/utils"
 
-function AccountAvatar({ avatarUrl, name }: { avatarUrl?: string; name: string }) {
+const AccountAvatar = ({
+  avatarUrl,
+  name,
+}: {
+  avatarUrl?: string
+  name: string
+}) => {
   const initials = name
     .split(/\s+/)
     .map((part) => part[0])
@@ -19,24 +21,18 @@ function AccountAvatar({ avatarUrl, name }: { avatarUrl?: string; name: string }
     .slice(0, 2)
     .toUpperCase()
 
-  if (avatarUrl) {
-    return (
-      <img
-        src={avatarUrl}
-        alt=""
-        className="size-10 rounded-full border border-border object-cover ring-2 ring-primary/20"
-        referrerPolicy="no-referrer"
-      />
-    )
-  }
-
   return (
-    <span
-      aria-hidden="true"
-      className="flex size-10 items-center justify-center rounded-full border border-border bg-muted text-sm font-semibold text-muted-foreground ring-2 ring-primary/20"
-    >
-      {initials || "?"}
-    </span>
+    <Avatar className="size-10 border border-border ring-2 ring-primary/20">
+      <AvatarImage
+        src={avatarUrl}
+        alt={name}
+        referrerPolicy="no-referrer"
+        className="object-cover"
+      />
+      <AvatarFallback className="bg-muted text-sm font-semibold text-muted-foreground">
+        {initials || "?"}
+      </AvatarFallback>
+    </Avatar>
   )
 }
 
@@ -56,10 +52,7 @@ export function AccountNav({ className }: { className?: string }) {
   }
 
   return (
-    <nav
-      aria-label="Account"
-      className={cn("group relative", className)}
-    >
+    <nav aria-label="Account" className={cn("group relative", className)}>
       <button
         type="button"
         className="flex items-center gap-2 rounded-full outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
