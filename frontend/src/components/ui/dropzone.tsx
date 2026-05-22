@@ -15,6 +15,7 @@ import {
 import { useDropzone as rootUseDropzone } from "react-dropzone"
 import type { Accept, FileRejection } from "react-dropzone"
 import { Button } from "./button"
+import { toast } from "sonner"
 
 type ButtonProps = ComponentProps<typeof Button>
 
@@ -679,10 +680,14 @@ const DropzoneRemoveFile = forwardRef<
       "DropzoneRemoveFile must be used within a DropzoneFileListItem"
     )
   }
+  const handleFileDeletion = () => {
+    toast.error("Resume deleted successfully")
+    context.onRemoveFile()
+  }
   return (
     <Button
       ref={ref}
-      onClick={context.onRemoveFile}
+      onClick={handleFileDeletion}
       type="button"
       size="icon"
       {...props}

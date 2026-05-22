@@ -12,11 +12,21 @@ import {
 import { CloudUploadIcon, FileUp, Trash2Icon } from "lucide-react"
 import { Button } from "../ui/button"
 import { Spinner } from "../ui/spinner"
+import { toast } from "sonner"
 
 const UploadDropzone = () => {
+  // const handleFileUploadError = (error: string) => {
+  //   toast.error(error)
+  // }
+
+  const handleFileUploadSuccess = () => {
+    toast.success("Resume uploaded successfully")
+  }
+
   const dropzone = useDropzone({
     onDropFile: async (file: File) => {
       await new Promise((resolve) => setTimeout(resolve, 1000))
+      handleFileUploadSuccess()
       return {
         status: "success",
         result: URL.createObjectURL(file),
