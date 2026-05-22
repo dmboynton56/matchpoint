@@ -2,6 +2,8 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 import pandas as pd
 from pathlib import Path
+from app.routes.matches import router as matches_router
+from app.routes.resumes import router as resumes_router
 from app.services.cleaning import (
     buildCleanedText
 )
@@ -12,6 +14,9 @@ from app.db.database import (
     supabase
 )
 app = FastAPI()
+
+app.include_router(matches_router)
+app.include_router(resumes_router)
 
 BASE_DIR = Path(__file__).resolve().parent
 class JobRequest(BaseModel):
