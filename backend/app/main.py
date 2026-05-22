@@ -32,7 +32,6 @@ def root():
 
 @app.get("/jobs")
 def insert_jobs_into_database():
-    print(BASE_DIR)
     csvPath = BASE_DIR / "job_board_data_100.csv"
     df = pd.read_csv(csvPath)
     jobs = []
