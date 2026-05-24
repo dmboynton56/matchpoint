@@ -1,12 +1,9 @@
-import { SiteLogo } from "@/components/layout/SiteLogo"
 import UploadDropzone from "@/components/user/UploadDropzone"
-
+import Header from "@/components/layout/Header"
 export function LandingPage() {
   return (
     <main className="flex min-h-svh flex-col bg-background text-foreground">
-      <header className="flex min-h-24 items-center px-5 py-3 sm:px-8">
-        <SiteLogo />
-      </header>
+      <Header />
       <section
         className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-14 px-5 py-10 pb-20 lg:flex-row lg:items-center lg:gap-16 lg:py-14 xl:gap-24"
         aria-labelledby="landing-hero-heading"
