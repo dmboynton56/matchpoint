@@ -9,27 +9,35 @@ import {
   DropzoneTrigger,
   useDropzone,
 } from "@/components/ui/dropzone"
+import { uploadResume } from "@/apis/resumes"
 import { CloudUploadIcon, FileUp, Trash2Icon } from "lucide-react"
-import { Button } from "../ui/button"
-import { Spinner } from "../ui/spinner"
+import { useNavigate } from "react-router-dom"
 import { toast } from "sonner"
 
-const UploadDropzone = () => {
-  // const handleFileUploadError = (error: string) => {
-  //   toast.error(error)
-  // }
+import { Button } from "../ui/button"
+import { Spinner } from "../ui/spinner"
 
-  const handleFileUploadSuccess = () => {
-    toast.success("Resume uploaded successfully")
-  }
+const UploadDropzone = () => {
+  const navigate = useNavigate()
 
   const dropzone = useDropzone({
     onDropFile: async (file: File) => {
-      await new Promise((resolve) => setTimeout(resolve, 1000))
-      handleFileUploadSuccess()
-      return {
-        status: "success",
-        result: URL.createObjectURL(file),
+      try {
+        const response = await uploadResume(file)
+        toast.success("Resume uploaded successfully")
+        navigate("/jobs", { state: { jobs: response.jobs } })
+        return {
+          status: "success",
+          result: URL.createObjectURL(file),
+        }
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "Resume upload failed"
+        toast.error(message)
+        return {
+          status: "error",
+          error: message,
+        }
       }
     },
     validation: {

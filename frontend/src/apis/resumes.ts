@@ -11,7 +11,9 @@ export interface ResumeUploadResponse {
     company: string;
     location: string | null;
     apply_url: string | null;
+    rank: number;
     match_score: number;
+    match_highlights: string[];
   }>;
 }
 

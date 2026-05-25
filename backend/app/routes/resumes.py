@@ -2,15 +2,17 @@ import io
 
 import pypdf
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-import openai
 
 from app.db.database import supabase
 from app.routes.auth import get_optional_user, get_current_user
+from app.schemas.ranking import JobRankInput
+from app.services.embedding import generateEmbedding
+from app.services.ranking import rank_jobs_with_llm
 
 router = APIRouter()
 
 VISITOR_JOB_LIMIT = 3
-AUTHENTICATED_JOB_LIMIT = 20
+AUTHENTICATED_JOB_LIMIT = 10
 
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
@@ -25,34 +27,79 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
     return extracted_text
 
 
-def fetch_job_matches(extracted_text: str, *, limit: int) -> list[dict]:
-    embedding_response = openai.embeddings.create(
-        input=extracted_text,
-        model="text-embedding-3-small"
-    )
-    query_embedding = embedding_response.data[0].embedding
-
+def fetch_vector_job_matches(extracted_text: str, *, limit: int) -> list[dict]:
+    query_embedding = generateEmbedding(extracted_text)
     response = supabase.rpc("match_jobs", {
         "query_embedding": query_embedding,
         "match_limit": limit,
     }).execute()
 
-    jobs = response.data or []
-    return [
-        {
+    return response.data or []
+
+
+def fetch_full_jobs(job_ids: list[str]) -> dict[str, dict]:
+    if not job_ids:
+        return {}
+
+    response = (
+        supabase.table("jobs")
+        .select("id, title, company, location, apply_url, description")
+        .in_("id", job_ids)
+        .execute()
+    )
+    return {str(job["id"]): job for job in response.data or []}
+
+
+def rank_job_matches(extracted_text: str, *, limit: int) -> list[dict]:
+    vector_matches = fetch_vector_job_matches(extracted_text, limit=limit)
+    job_ids = [str(job["id"]) for job in vector_matches]
+    full_jobs_by_id = fetch_full_jobs(job_ids)
+
+    rank_inputs: list[JobRankInput] = []
+    display_jobs_by_id: dict[str, dict] = {}
+    for vector_match in vector_matches:
+        job_id = str(vector_match["id"])
+        full_job = full_jobs_by_id.get(job_id, {})
+        display_job = {
+            "id": job_id,
+            "title": full_job.get("title") or vector_match["title"],
+            "company": full_job.get("company") or vector_match["company"],
+            "location": full_job.get("location") or vector_match.get("location"),
+            "apply_url": full_job.get("apply_url") or vector_match.get("apply_url"),
+            "description": full_job.get("description") or "",
+        }
+        display_jobs_by_id[job_id] = display_job
+        rank_inputs.append(
+            JobRankInput(
+                job_id=job_id,
+                title=display_job["title"],
+                company=display_job["company"],
+                location=display_job["location"],
+                description=display_job["description"][:4000],
+                vector_similarity=float(vector_match.get("similarity") or 0),
+            )
+        )
+
+    ranking_response = rank_jobs_with_llm(extracted_text, rank_inputs)
+    ranked_jobs = []
+    for ranking in ranking_response.rankings:
+        job = display_jobs_by_id[ranking.job_id]
+        ranked_jobs.append({
             "id": job["id"],
             "title": job["title"],
             "company": job["company"],
-            "location": job.get("location"),
-            "apply_url": job.get("apply_url"),
-            "match_score": round(0.9 - (index * 0.05), 2),
-        }
-        for index, job in enumerate(jobs)
-    ]
+            "location": job["location"],
+            "apply_url": job["apply_url"],
+            "rank": ranking.rank,
+            "match_score": ranking.match_score,
+            "match_highlights": ranking.match_highlights,
+        })
+
+    return ranked_jobs
 
 
 async def handle_visitor_upload(extracted_text: str) -> dict:
-    jobs = fetch_job_matches(extracted_text, limit=VISITOR_JOB_LIMIT)
+    jobs = rank_job_matches(extracted_text, limit=VISITOR_JOB_LIMIT)
 
     return {
         "message": "Resume parsed. Sign up to interact with your job matches.",
@@ -79,7 +126,7 @@ async def handle_authenticated_upload(
         "resume_text": extracted_text,
     }).eq("id", user_id).execute()
 
-    jobs = fetch_job_matches(extracted_text, limit=AUTHENTICATED_JOB_LIMIT)
+    jobs = rank_job_matches(extracted_text, limit=AUTHENTICATED_JOB_LIMIT)
 
     supabase.table("job_matches").delete().eq("user_id", user_id).execute()
     if jobs:
@@ -88,6 +135,7 @@ async def handle_authenticated_upload(
                 "user_id": user_id,
                 "job_id": job["id"],
                 "match_score": job["match_score"],
+                "match_highlights": job["match_highlights"],
                 "is_viewed": False,
                 "is_favorited": False,
             }
@@ -151,4 +199,3 @@ async def delete_resume(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete resume: {str(e)}") from e
-    
