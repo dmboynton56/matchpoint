@@ -90,7 +90,7 @@ export function AccountNav({ className }: { className?: string }) {
             variant="ghost"
             role="menuitem"
             className="h-9 w-full justify-start gap-2 rounded-none px-3 font-normal"
-            onClick={() => toast.message("Profile — coming soon")}
+            onClick={() => navigate("/profile")}
           >
             <User className="size-4" aria-hidden="true" />
             Profile

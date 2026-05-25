@@ -152,3 +152,83 @@ export const signOut = async () => {
     throw error
   }
 }
+
+export type ProfileResult<T> =
+  | { ok: true; data: T }
+  | { ok: false; message: string }
+
+export const getProfileTargetRole = async (
+  userId: string
+): Promise<ProfileResult<string | null>> => {
+  const { data, error } = await supabase
+    .from("profiles")
+    .select("target_role")
+    .eq("id", userId)
+    .maybeSingle()
+
+  if (error) {
+    return { ok: false, message: error.message }
+  }
+  return { ok: true, data: data?.target_role ?? null }
+}
+
+export const updateProfileTargetRole = async (
+  userId: string,
+  targetRole: string
+): Promise<ProfileResult<null>> => {
+  const trimmed = targetRole.trim()
+  const { error } = await supabase.from("profiles").upsert(
+    { id: userId, target_role: trimmed || null },
+    { onConflict: "id" }
+  )
+
+  if (error) {
+    return { ok: false, message: error.message }
+  }
+  return { ok: true, data: null }
+}
+
+export type ChangeEmailResult =
+  | { ok: true }
+  | { ok: false; message: string; code?: string }
+
+export const changeEmailWithPassword = async (
+  currentEmail: string,
+  password: string,
+  newEmail: string
+): Promise<ChangeEmailResult> => {
+  const prepared = prepareEmailForAuth(newEmail)
+  if (!prepared.ok) {
+    return { ok: false, message: prepared.message }
+  }
+
+  const normalizedCurrent = currentEmail.trim().toLowerCase()
+  if (prepared.email === normalizedCurrent) {
+    return { ok: false, message: "That is already your email address." }
+  }
+
+  const { error: signInError } = await supabase.auth.signInWithPassword({
+    email: normalizedCurrent,
+    password,
+  })
+  if (signInError) {
+    return {
+      ok: false,
+      message: "Incorrect password. Enter your current password to continue.",
+      code: signInError.code,
+    }
+  }
+
+  const { error: updateError } = await supabase.auth.updateUser({
+    email: prepared.email,
+  })
+  if (updateError) {
+    return {
+      ok: false,
+      message: updateError.message,
+      code: updateError.code,
+    }
+  }
+
+  return { ok: true }
+}
