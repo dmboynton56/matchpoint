@@ -20,8 +20,11 @@ import {
 } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { useNavigate } from "react-router-dom"
 
-export function SignupLoginCard() {
+const SignupLoginCard = () => {
+  const navigate = useNavigate()
+
   useEffect(() => {
     const urlError = consumeOAuthUrlError()
     if (urlError) {
@@ -51,6 +54,13 @@ export function SignupLoginCard() {
         return
       }
       const { error } = result
+      if (error?.code === "weak_password") {
+        toast.error(
+          "Password must be at least 8 characters and include uppercase, lowercase, a number, and a special character.",
+          { position: "top-center" }
+        )
+        return
+      }
       if (error) {
         toast.error(
           error.message ||
@@ -62,6 +72,7 @@ export function SignupLoginCard() {
           `Successfully ${isLogin ? "logged in" : "signed up"}. Redirecting to dashboard...`,
           { position: "top-center" }
         )
+        navigate("/jobs", { replace: true })
       }
     } catch (err) {
       const message =
@@ -179,17 +190,21 @@ export function SignupLoginCard() {
         </Button>
         <Button
           variant="outline"
-          className="w-full"
-          disabled={isSubmitting}
+          className="w-full text-xs"
+          // disabled={isSubmitting}
+          disabled
           onClick={handleGoogleSignIn}
         >
-          {isSubmitting
+          {/* {isSubmitting
             ? "Connecting…"
             : isLogin
               ? "Login with Google"
-              : "Sign up with Google"}
+              : "Sign up with Google"} */}
+          Google Sign-in/Up (not available)
         </Button>
       </CardFooter>
     </Card>
   )
 }
+
+export default SignupLoginCard
