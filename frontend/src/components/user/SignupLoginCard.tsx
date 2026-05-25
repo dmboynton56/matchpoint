@@ -54,6 +54,13 @@ const SignupLoginCard = () => {
         return
       }
       const { error } = result
+      if (error?.code === "weak_password") {
+        toast.error(
+          "Password must be at least 8 characters and include uppercase, lowercase, a number, and a special character.",
+          { position: "top-center" }
+        )
+        return
+      }
       if (error) {
         toast.error(
           error.message ||

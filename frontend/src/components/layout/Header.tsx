@@ -25,7 +25,7 @@ const Header = () => {
         <Dialog>
           <DialogTrigger asChild>
             <Button variant="outline" size="xl">
-              Login
+              Sign up or Login
             </Button>
           </DialogTrigger>
           <DialogContent>
