@@ -10,6 +10,7 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+.vite/
 *.local
 
 # Editor directories and files
@@ -25,6 +26,7 @@ dist-ssr
 
 # Python environment
 backend/venv/
+backend/.venv/
 backend/app/__pycache__
 backend/app/services/__pycache__
 backend/*.pyc
@@ -35,6 +37,9 @@ __pycache__/*.pyc
 .env
 backend/.env
 frontend/.env
+
+# Personal documents
+Drew Boynton Resume March 2026.pdf
 
 # Supabase
 .temp/

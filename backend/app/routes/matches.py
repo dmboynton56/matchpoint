@@ -9,6 +9,7 @@ def _get_user_matches(user_id: str, viewed: bool | None, favorited: bool | None)
         supabase.table("job_matches")
         .select(
             "id, match_score, is_viewed, is_favorited, created_at, "
+            "match_highlights, "
             "jobs(id, title, company, location, apply_url, description, posted_at)"
         )
         .eq("user_id", user_id)
@@ -29,6 +30,7 @@ def _format_match(match: dict) -> dict:
     return {
         "match_id": match["id"],
         "match_score": match["match_score"],
+        "match_highlights": match.get("match_highlights"),
         "is_viewed": match["is_viewed"],
         "is_favorited": match["is_favorited"],
         "matched_at": match["created_at"],

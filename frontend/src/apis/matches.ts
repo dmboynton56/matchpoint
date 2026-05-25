@@ -13,6 +13,7 @@ export interface Job {
 export interface Match {
   match_id: string;
   match_score: number;
+  match_highlights: string[] | null;
   is_viewed: boolean;
   is_favorited: boolean;
   matched_at: string;

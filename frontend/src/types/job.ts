@@ -10,6 +10,7 @@ export type JobMatch = {
   company: string
   location: string | null
   apply_url: string | null
+  rank?: number
   /** 0–1 similarity score from matching; null when not yet computed. */
   match_score: number | null
   /** Short “why this matched” lines; optional until backend generates them. */
