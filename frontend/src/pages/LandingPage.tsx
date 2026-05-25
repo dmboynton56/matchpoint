@@ -2,9 +2,9 @@ import UploadDropzone from "@/components/user/UploadDropzone"
 import Header from "@/components/layout/Header"
 export function LandingPage() {
   return (
-    <main className="flex min-h-svh flex-col bg-background text-foreground">
+    <div className="flex min-h-svh flex-col bg-background text-foreground">
       <Header />
-      <section
+      <main
         className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-14 px-5 py-10 pb-20 lg:flex-row lg:items-center lg:gap-16 lg:py-14 xl:gap-24"
         aria-labelledby="landing-hero-heading"
       >
@@ -27,7 +27,7 @@ export function LandingPage() {
         <div className="flex w-full flex-1 justify-center lg:max-w-none lg:justify-end xl:flex-[0.85]">
           <UploadDropzone />
         </div>
-      </section>
-    </main>
+      </main>
+    </div>
   )
 }

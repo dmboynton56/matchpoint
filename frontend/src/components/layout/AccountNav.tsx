@@ -1,4 +1,4 @@
-import { LogOut, Settings, User } from "lucide-react"
+import { Briefcase, LogOut, Settings, User } from "lucide-react"
 import { useNavigate } from "react-router-dom"
 import { toast } from "sonner"
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
@@ -51,6 +51,10 @@ export function AccountNav({ className }: { className?: string }) {
     }
   }
 
+  if (!loading && !user) {
+    return null
+  }
+
   return (
     <nav aria-label="Account" className={cn("group relative", className)}>
       <button
@@ -71,6 +75,16 @@ export function AccountNav({ className }: { className?: string }) {
         className="invisible absolute top-full right-0 z-50 w-44 pt-2 opacity-0 transition-opacity group-focus-within:visible group-focus-within:opacity-100 group-hover:visible group-hover:opacity-100"
       >
         <div className="overflow-hidden rounded-xl border border-border bg-card py-1 shadow-lg ring-1 ring-foreground/5">
+          <Button
+            type="button"
+            variant="ghost"
+            role="menuitem"
+            className="h-9 w-full justify-start gap-2 rounded-none px-3 font-normal"
+            onClick={() => navigate("/jobs")}
+          >
+            <Briefcase className="size-4" aria-hidden="true" />
+            Jobs
+          </Button>
           <Button
             type="button"
             variant="ghost"

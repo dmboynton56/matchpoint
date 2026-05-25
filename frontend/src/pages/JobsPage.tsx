@@ -6,8 +6,8 @@ export function JobsPage() {
   return (
     <AppShell>
       <div className="space-y-6">
-        <header className="space-y-2">
-          <p className="text-xs font-semibold uppercase tracking-[0.22em] text-primary">
+        <section className="space-y-2">
+          <p className="text-xs font-semibold tracking-[0.22em] text-primary uppercase">
             Your matches
           </p>
           <h1 className="font-heading text-2xl font-bold tracking-tight text-foreground sm:text-3xl">
@@ -17,7 +17,7 @@ export function JobsPage() {
             Personalized results from your resume will appear here once matching
             is wired up. Showing sample listings for now.
           </p>
-        </header>
+        </section>
 
         <ul className="space-y-3">
           {MOCK_JOBS.map((job) => (
