@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 db_url = os.environ.get("SUPABASE_URL")
-db_key = os.environ.get("SUPABASE_SECRET_KEY")
+db_key = os.environ.get("SUPABASE_PUBLISHABLE_KEY")
 
 # Handle all CRUD operations
 if not db_url or not db_key:
