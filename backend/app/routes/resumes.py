@@ -27,8 +27,8 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
     return extracted_text
 
 
-def fetch_vector_job_matches(extracted_text: str, *, limit: int) -> list[dict]:
-    query_embedding = generateEmbedding(extracted_text)
+def fetch_vector_job_matches(query_embedding:list[float], *, limit: int) -> list[dict]:
+    
     response = supabase.rpc("match_jobs", {
         "query_embedding": query_embedding,
         "match_limit": limit,
@@ -50,8 +50,8 @@ def fetch_full_jobs(job_ids: list[str]) -> dict[str, dict]:
     return {str(job["id"]): job for job in response.data or []}
 
 
-def rank_job_matches(extracted_text: str, *, limit: int) -> list[dict]:
-    vector_matches = fetch_vector_job_matches(extracted_text, limit=limit)
+def rank_job_matches(extracted_text: str, query_embedding: list[float], *, limit: int) -> list[dict]:
+    vector_matches = fetch_vector_job_matches(query_embedding, limit=limit)
     job_ids = [str(job["id"]) for job in vector_matches]
     full_jobs_by_id = fetch_full_jobs(job_ids)
 
@@ -121,12 +121,13 @@ async def handle_authenticated_upload(
         file=file_bytes,
         file_options={"content-type": "application/pdf", "upsert": "true"},
     )
-
+    embedding = generateEmbedding(extracted_text)
     supabase.table("profiles").update({
         "resume_text": extracted_text,
+        "resume_embedding": embedding
     }).eq("id", user_id).execute()
 
-    jobs = rank_job_matches(extracted_text, limit=AUTHENTICATED_JOB_LIMIT)
+    jobs = rank_job_matches(extracted_text, embedding, limit=AUTHENTICATED_JOB_LIMIT)
 
     supabase.table("job_matches").delete().eq("user_id", user_id).execute()
     if jobs:
