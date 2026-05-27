@@ -99,7 +99,10 @@ def rank_job_matches(extracted_text: str, query_embedding: list[float], *, limit
 
 
 async def handle_visitor_upload(extracted_text: str) -> dict:
-    jobs = rank_job_matches(extracted_text, limit=VISITOR_JOB_LIMIT)
+    embedding = generateEmbedding(extracted_text)
+    jobs = rank_job_matches(
+        extracted_text, embedding, limit=VISITOR_JOB_LIMIT
+    )
 
     return {
         "message": "Resume parsed. Sign up to interact with your job matches.",
