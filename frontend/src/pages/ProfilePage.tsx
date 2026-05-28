@@ -6,7 +6,13 @@ import {
   getProfileTargetRole,
   updateProfileTargetRole,
 } from "@/auth/supabaseAuth"
+import {
+  deleteResume,
+  getResumeSignedUrl,
+  resumeExists,
+} from "@/apis/resumes"
 import { AppShell } from "@/components/layout/AppShell"
+import UploadDropzone from "@/components/user/UploadDropzone"
 import { Button } from "@/components/ui/button"
 import {
   Card,
@@ -32,6 +38,14 @@ export function ProfilePage() {
   const [emailPassword, setEmailPassword] = useState("")
   const [emailSaving, setEmailSaving] = useState(false)
 
+  const [resumeStatus, setResumeStatus] = useState<"unknown" | "none" | "ready">(
+    "unknown"
+  )
+  const [resumeLoading, setResumeLoading] = useState(true)
+  const [resumeViewing, setResumeViewing] = useState(false)
+  const [resumeDeleting, setResumeDeleting] = useState(false)
+  const [showReupload, setShowReupload] = useState(false)
+
   useEffect(() => {
     if (!user) return
 
@@ -50,6 +64,24 @@ export function ProfilePage() {
       setTargetRole(value)
       setSavedTargetRole(value)
       setProfileLoading(false)
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [user])
+
+  useEffect(() => {
+    if (!user) return
+
+    let cancelled = false
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setResumeLoading(true)
+
+    void resumeExists(user.id).then((exists) => {
+      if (cancelled) return
+      setResumeStatus(exists ? "ready" : "none")
+      setResumeLoading(false)
     })
 
     return () => {
@@ -97,8 +129,43 @@ export function ProfilePage() {
     }
   }
 
-  const resumePlaceholder = () => {
-    toast.message("Resume upload — coming soon", { position: "top-center" })
+  const handleViewResume = async () => {
+    if (!user) return
+
+    setResumeViewing(true)
+    try {
+      const signedUrl = await getResumeSignedUrl(user.id)
+      window.open(signedUrl, "_blank", "noopener,noreferrer")
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Could not open resume."
+      toast.error(message, { position: "top-center" })
+    } finally {
+      setResumeViewing(false)
+    }
+  }
+
+  const handleDeleteResume = async () => {
+    if (!user) return
+
+    setResumeDeleting(true)
+    try {
+      await deleteResume()
+      setResumeStatus("none")
+      setShowReupload(false)
+      toast.success("Resume deleted.", { position: "top-center" })
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Could not delete resume."
+      toast.error(message, { position: "top-center" })
+    } finally {
+      setResumeDeleting(false)
+    }
+  }
+
+  const handleResumeUploadSuccess = () => {
+    setResumeStatus("ready")
+    setShowReupload(false)
   }
 
   if (!user) {
@@ -206,32 +273,47 @@ export function ProfilePage() {
                 View your resume, re-upload it, or delete it.
               </CardDescription>
             </CardHeader>
-            <CardContent>
+            <CardContent className="space-y-4">
               <div className="rounded-lg border border-dashed border-border bg-muted/30 px-4 py-8 text-center text-sm text-muted-foreground">
-                No resume on file — preview coming soon
+                {resumeLoading
+                  ? "Checking resume status…"
+                  : resumeStatus === "ready"
+                    ? "Resume on file (PDF)"
+                    : "No resume on file"}
               </div>
+              {showReupload && (
+                <UploadDropzone
+                  navigateAfterUpload={false}
+                  onUploadSuccess={handleResumeUploadSuccess}
+                />
+              )}
             </CardContent>
             <CardFooter className="flex flex-wrap gap-2">
               <Button
                 type="button"
                 variant="outline"
-                onClick={resumePlaceholder}
+                disabled={resumeLoading || resumeStatus !== "ready" || resumeViewing}
+                onClick={() => void handleViewResume()}
               >
-                View
+                {resumeViewing ? "Opening…" : "View"}
               </Button>
               <Button
                 type="button"
                 variant="outline"
-                onClick={resumePlaceholder}
+                disabled={resumeLoading}
+                onClick={() => setShowReupload((current) => !current)}
               >
-                Re-upload
+                {showReupload ? "Cancel re-upload" : "Re-upload"}
               </Button>
               <Button
                 type="button"
                 variant="destructive"
-                onClick={resumePlaceholder}
+                disabled={
+                  resumeLoading || resumeStatus !== "ready" || resumeDeleting
+                }
+                onClick={() => void handleDeleteResume()}
               >
-                Delete
+                {resumeDeleting ? "Deleting…" : "Delete"}
               </Button>
             </CardFooter>
           </Card>

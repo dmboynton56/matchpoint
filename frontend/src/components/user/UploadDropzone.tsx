@@ -9,15 +9,24 @@ import {
   DropzoneTrigger,
   useDropzone,
 } from "@/components/ui/dropzone"
-import { uploadResume } from "@/apis/resumes"
+import { uploadResume, type ResumeUploadResponse } from "@/apis/resumes"
 import { CloudUploadIcon, FileUp, Trash2Icon } from "lucide-react"
+import { useEffect } from "react"
 import { useNavigate } from "react-router-dom"
 import { toast } from "sonner"
 
 import { Button } from "../ui/button"
 import { Spinner } from "../ui/spinner"
 
-const UploadDropzone = () => {
+type UploadDropzoneProps = {
+  navigateAfterUpload?: boolean
+  onUploadSuccess?: (response: ResumeUploadResponse) => void
+}
+
+const UploadDropzone = ({
+  navigateAfterUpload = true,
+  onUploadSuccess,
+}: UploadDropzoneProps) => {
   const navigate = useNavigate()
 
   const dropzone = useDropzone({
@@ -25,7 +34,10 @@ const UploadDropzone = () => {
       try {
         const response = await uploadResume(file)
         toast.success("Resume uploaded successfully")
-        navigate("/jobs", { state: { jobs: response.jobs } })
+        onUploadSuccess?.(response)
+        if (navigateAfterUpload) {
+          navigate("/jobs", { state: { jobs: response.jobs } })
+        }
         return {
           status: "success",
           result: URL.createObjectURL(file),
@@ -47,6 +59,18 @@ const UploadDropzone = () => {
       maxFiles: 1,
     },
   })
+
+  useEffect(() => {
+    const erroredFiles = dropzone.fileStatuses.filter(
+      (file) => file.status === "error"
+    )
+
+    if (erroredFiles.length === 0) {
+      return
+    }
+
+    void Promise.all(erroredFiles.map((file) => dropzone.onRemoveFile(file.id)))
+  }, [dropzone])
 
   return (
     <div className="not-prose flex flex-col gap-4">

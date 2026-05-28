@@ -1,5 +1,12 @@
 import { apiFetch, BASE_URL } from "./client";
-import { supabase } from "../auth/supabaseAuth"
+import { supabase } from "../auth/supabaseAuth";
+
+const RESUMES_BUCKET = "resumes";
+const RESUME_FILENAME = "resume.pdf";
+
+export function getResumeStoragePath(userId: string): string {
+  return `${userId}/${RESUME_FILENAME}`;
+}
 export interface ResumeUploadResponse {
   message: string;
   is_authenticated: boolean;
@@ -51,4 +58,32 @@ export async function deleteResume(): Promise<ResumeDeleteResponse> {
   return apiFetch<ResumeDeleteResponse>("/resumes/me", {
     method: "DELETE",
   });
+}
+
+export async function resumeExists(userId: string): Promise<boolean> {
+  const { data, error } = await supabase.storage
+    .from(RESUMES_BUCKET)
+    .list(userId, { limit: 1, search: RESUME_FILENAME });
+
+  if (error) {
+    return false;
+  }
+
+  return (data ?? []).some((file) => file.name === RESUME_FILENAME);
+}
+
+export async function getResumeSignedUrl(
+  userId: string,
+  expiresInSeconds = 60
+): Promise<string> {
+  const path = getResumeStoragePath(userId);
+  const { data, error } = await supabase.storage
+    .from(RESUMES_BUCKET)
+    .createSignedUrl(path, expiresInSeconds);
+
+  if (error || !data?.signedUrl) {
+    throw new Error(error?.message ?? "Could not generate resume URL.");
+  }
+
+  return data.signedUrl;
 }

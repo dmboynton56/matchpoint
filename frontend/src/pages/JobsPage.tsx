@@ -1,8 +1,7 @@
-import { Link, useLocation } from "react-router-dom"
-
+import { useLocation } from "react-router-dom"
+import UploadDropzone from "@/components/user/UploadDropzone"
 import { JobListingCard } from "@/components/jobs/JobListingCard"
 import { AppShell } from "@/components/layout/AppShell"
-import { Button } from "@/components/ui/button"
 import type { JobMatch } from "@/types/job"
 
 type JobsPageLocationState = {
@@ -49,9 +48,7 @@ export function JobsPage() {
             <p className="text-sm text-muted-foreground">
               No matches yet. Upload a PDF resume to get started.
             </p>
-            <Button asChild className="mt-4">
-              <Link to="/">Upload resume</Link>
-            </Button>
+            <UploadDropzone />
           </div>
         )}
       </div>
