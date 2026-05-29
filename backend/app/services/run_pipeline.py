@@ -15,11 +15,9 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
-load_dotenv(os.path.join(os.path.dirname(__file__), '..', '..', '.env'), override=True)
-
-from scraper100 import scrape_all
-from cleaning import buildCleanedText, stripHTML, normalizeText
-from embedding import generate_embeddings_batch
+from .scraper100 import scrape_all
+from .cleaning import buildCleanedText
+from .embedding import generate_embeddings_batch
 
 load_dotenv()
 
