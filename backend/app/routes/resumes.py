@@ -8,12 +8,12 @@ from app.routes.auth import get_optional_user, get_current_user
 from app.schemas.ranking import JobRankInput
 from app.services.embedding import generateEmbedding
 from app.services.ranking import rank_jobs_with_llm
-
+from app.services.cleaning import normalizeText
 router = APIRouter()
 
 VISITOR_JOB_LIMIT = 3
-AUTHENTICATED_JOB_LIMIT = 10
-
+AUTHENTICATED_JOB_LIMIT = 20
+DISPLAY_LIMIT = 10
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
     pdf_reader = pypdf.PdfReader(io.BytesIO(file_bytes))
@@ -23,8 +23,8 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
 
     if not extracted_text.strip():
         raise HTTPException(status_code=400, detail="Could not extract text from PDF.")
-
-    return extracted_text
+    cleaned_text = normalizeText(extracted_text)
+    return cleaned_text
 
 
 def fetch_vector_job_matches(query_embedding:list[float], *, limit: int) -> list[dict]:
@@ -95,7 +95,7 @@ def rank_job_matches(extracted_text: str, query_embedding: list[float], *, limit
             "match_highlights": ranking.match_highlights,
         })
 
-    return ranked_jobs
+    return ranked_jobs[:DISPLAY_LIMIT]
 
 
 async def handle_visitor_upload(extracted_text: str) -> dict:
