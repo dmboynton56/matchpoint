@@ -1,7 +1,13 @@
+import { useEffect, useMemo, useState } from "react"
 import { useLocation } from "react-router-dom"
-import UploadDropzone from "@/components/user/UploadDropzone"
+import { toast } from "sonner"
+
+import { getMyMatches, type Match } from "@/apis/matches"
 import { JobListingCard } from "@/components/jobs/JobListingCard"
 import { AppShell } from "@/components/layout/AppShell"
+import { RouteLoading } from "@/components/routing/RouteLoading"
+import UploadDropzone from "@/components/user/UploadDropzone"
+import { useAuth } from "@/hooks/useAuth"
 import type { JobMatch } from "@/types/job"
 
 type JobsPageLocationState = {
