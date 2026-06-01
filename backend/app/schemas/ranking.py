@@ -34,6 +34,11 @@ class JobRankInput(BaseModel):
     facts: JobFacts | None = None
 
 
+class MatchNote(BaseModel):
+    text: str = Field(max_length=150)
+    is_warning: bool = False
+
+
 class JobScore(BaseModel):
     job_id: str
     interview_likelihood: float = Field(ge=0, le=1)
@@ -44,14 +49,7 @@ class JobScore(BaseModel):
     pay_fit: float = Field(ge=0, le=1)
     role_fit: float = Field(ge=0, le=1)
     preference_fit: float = Field(ge=0, le=1)
-    match_highlights: list[str] = Field(min_length=2, max_length=3)
-    match_concerns: list[str] | None = Field(default=None, max_length=3)
-    location_reason: str | None = Field(default=None, max_length=180)
-    location_evidence: str | None = Field(default=None, max_length=180)
-    pay_reason: str | None = Field(default=None, max_length=180)
-    pay_evidence: str | None = Field(default=None, max_length=180)
-    role_reason: str | None = Field(default=None, max_length=180)
-    role_evidence: str | None = Field(default=None, max_length=180)
+    match_notes: list[MatchNote] = Field(min_length=3, max_length=3)
 
 
 class ScoringResponse(BaseModel):
@@ -74,26 +72,10 @@ def validate_scores(
         )
 
     for score in response.scores:
-        for highlight in score.match_highlights:
-            if not highlight.strip():
-                raise ValueError("Match highlights cannot be blank.")
-            if len(highlight) > 120:
-                raise ValueError("Match highlights must be 120 characters or fewer.")
-        for concern in score.match_concerns or []:
-            if not concern.strip():
-                raise ValueError("Match concerns cannot be blank.")
-            if len(concern) > 120:
-                raise ValueError("Match concerns must be 120 characters or fewer.")
-        for field_name in (
-            "location_reason",
-            "location_evidence",
-            "pay_reason",
-            "pay_evidence",
-            "role_reason",
-            "role_evidence",
-        ):
-            value = getattr(score, field_name)
-            if value is not None and not value.strip():
-                raise ValueError(f"{field_name} cannot be blank when provided.")
+        for note in score.match_notes:
+            if not note.text.strip():
+                raise ValueError("Match notes cannot be blank.")
+            if len(note.text) > 150:
+                raise ValueError("Match notes must be 150 characters or fewer.")
 
     return response

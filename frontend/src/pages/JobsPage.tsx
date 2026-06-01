@@ -30,6 +30,7 @@ function matchToJobMatch(match: Match): JobMatch {
     location: match.job.location,
     apply_url: match.job.apply_url,
     match_score: match.match_score,
+    match_notes: match.match_notes,
     match_highlights: match.match_highlights,
     match_concerns: match.match_concerns,
     interview_likelihood: match.interview_likelihood,

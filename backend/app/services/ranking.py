@@ -1,4 +1,6 @@
 import json
+import os
+from concurrent.futures import ThreadPoolExecutor
 
 from app.schemas.ranking import (
     JobRankInput,
@@ -9,13 +11,29 @@ from app.schemas.ranking import (
 )
 from app.services.embedding import client
 
+SCORING_MODEL = os.getenv("OPENAI_SCORING_MODEL", "gpt-5.4-nano")
+SCORING_TIMEOUT_SECONDS = float(os.getenv("OPENAI_SCORING_TIMEOUT_SECONDS", "75"))
+SCORING_MAX_RETRIES = int(os.getenv("OPENAI_SCORING_MAX_RETRIES", "0"))
+SCORING_RESUME_CHAR_LIMIT = int(os.getenv("SCORING_RESUME_CHAR_LIMIT", "6000"))
+SCORING_JOB_DESCRIPTION_CHAR_LIMIT = int(
+    os.getenv("SCORING_JOB_DESCRIPTION_CHAR_LIMIT", "1000")
+)
+SCORING_BATCH_SIZE = int(os.getenv("SCORING_BATCH_SIZE", "5"))
+SCORING_PARALLELISM = int(os.getenv("SCORING_PARALLELISM", "2"))
+SCORING_REASONING_EFFORT = os.getenv("SCORING_REASONING_EFFORT", "none")
+
+scoring_client = client.with_options(
+    timeout=SCORING_TIMEOUT_SECONDS,
+    max_retries=SCORING_MAX_RETRIES,
+)
+
 
 SYSTEM_PROMPT = """
 Score each job independently for this resume.
 
-Do not compare jobs to each other. Do not rank relatively. Do not force unique
-scores. The same resume/job pair should receive roughly the same scores regardless
-of what other jobs are included in the request.
+Return compact, grounded structured data only. Do not compare jobs to each other,
+rank relatively, or force unique scores. The same resume/job pair should receive
+roughly the same scores regardless of what other jobs are included in the request.
 
 Use JOB facts as grounded truth when they are present. Use USER_PREFERENCES only
 for preference scoring; do not invent location, pay, or position preferences from
@@ -28,12 +46,20 @@ preference_fit from 0-1. If a preference or job fact is unknown, use a neutral f
 near 0.75 and explain that the evidence is missing. Use vector_similarity only as
 weak context, not as the score.
 
-Highlights must be 2-3 bullets, each 120 characters or fewer, citing resume and job
-evidence. Concerns should be short and honest when there are clear gaps. Fill
-location_reason/evidence, pay_reason/evidence, and role_reason/evidence with the
-specific basis for the fit score, or note when the posting/preferences are unclear.
+For each job, return exactly three match_notes total. Notes may be positive,
+negative, or mixed. They should explain the most decision-useful reasons behind
+the scores, including location, pay, or role only when materially relevant. Set
+is_warning=true only for a meaningful drawback the candidate should notice.
+Do not add separate warning lists, evidence fields, or duplicate chip values.
 Never invent facts or omit job IDs.
 """.strip()
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    normalized = text.strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[:limit].rstrip() + "\n[truncated]"
 
 
 def _build_user_message(
@@ -44,8 +70,17 @@ def _build_user_message(
     correction: str | None = None,
 ) -> str:
     job_ids = [job.job_id for job in jobs]
+    compact_jobs = []
+    for job in jobs:
+        job_data = job.model_dump()
+        job_data["description"] = _truncate_text(
+            job.description,
+            SCORING_JOB_DESCRIPTION_CHAR_LIMIT,
+        )
+        compact_jobs.append(job_data)
+
     jobs_json = json.dumps(
-        [job.model_dump() for job in jobs],
+        compact_jobs,
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -55,7 +90,7 @@ def _build_user_message(
         separators=(",", ":"),
     )
     message = (
-        f"RESUME: {resume_text}\n\n"
+        f"RESUME: {_truncate_text(resume_text, SCORING_RESUME_CHAR_LIMIT)}\n\n"
         f"USER_PREFERENCES: {preferences_json}\n\n"
         f"JOBS ({len(jobs)} total - score all): {jobs_json}\n\n"
         f"Return exactly {len(jobs)} scores with these job_id values, each once: {job_ids}"
@@ -65,6 +100,12 @@ def _build_user_message(
     return message
 
 
+def _reasoning_effort_for_model(model: str) -> str:
+    if model.startswith("gpt-5-nano") and SCORING_REASONING_EFFORT == "none":
+        return "minimal"
+    return SCORING_REASONING_EFFORT
+
+
 def _request_scores(
     resume_text: str,
     jobs: list[JobRankInput],
@@ -72,11 +113,10 @@ def _request_scores(
     preferences: UserPreferences | None = None,
     correction: str | None = None,
 ) -> ScoringResponse | None:
-    completion = client.beta.chat.completions.parse(
-        model="gpt-4o-mini",
-        temperature=0.2,
-        response_format=ScoringResponse,
-        messages=[
+    request_params = {
+        "model": SCORING_MODEL,
+        "response_format": ScoringResponse,
+        "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "user",
@@ -88,6 +128,16 @@ def _request_scores(
                 ),
             },
         ],
+    }
+    if SCORING_MODEL.startswith("gpt-5"):
+        request_params["reasoning_effort"] = _reasoning_effort_for_model(
+            SCORING_MODEL
+        )
+    else:
+        request_params["temperature"] = 0.2
+
+    completion = scoring_client.beta.chat.completions.parse(
+        **request_params,
     )
     return completion.choices[0].message.parsed
 
@@ -112,6 +162,34 @@ def score_jobs_with_llm(
 ) -> ScoringResponse:
     if not jobs:
         return ScoringResponse(scores=[])
+
+    batch_size = max(1, SCORING_BATCH_SIZE)
+    if len(jobs) > batch_size:
+        chunks = [
+            jobs[index : index + batch_size]
+            for index in range(0, len(jobs), batch_size)
+        ]
+        max_workers = max(1, min(SCORING_PARALLELISM, len(chunks)))
+        if max_workers > 1:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                responses = list(
+                    executor.map(
+                        lambda chunk: score_jobs_with_llm(
+                            resume_text,
+                            chunk,
+                            preferences=preferences,
+                        ),
+                        chunks,
+                    )
+                )
+        else:
+            responses = [
+                score_jobs_with_llm(resume_text, chunk, preferences=preferences)
+                for chunk in chunks
+            ]
+
+        scores = [score for response in responses for score in response.scores]
+        return validate_scores(ScoringResponse(scores=scores), jobs)
 
     last_error: Exception | None = None
     correction: str | None = None

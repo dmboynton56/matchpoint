@@ -10,12 +10,12 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   formatMatchScore,
-  getMatchConcerns,
-  getMatchHighlights,
+  getMatchNotes,
   getMatchScoreTier,
   hasApplyUrl,
   matchScoreAccentClass,
   matchScoreBadgeClass,
+  type MatchNote,
   type JobListing,
 } from "@/types/job"
 import { cn } from "@/lib/utils"
@@ -33,26 +33,26 @@ type JobListingCardProps = {
   className?: string
 }
 
-function MatchHighlightsList({ highlights }: { highlights: string[] }) {
+function MatchNotesList({ notes }: { notes: MatchNote[] }) {
   return (
-    <ul className="mt-2 list-disc space-y-1 pl-4 text-xs leading-relaxed text-muted-foreground">
-      {highlights.map((line) => (
-        <li key={line}>{line}</li>
-      ))}
-    </ul>
-  )
-}
-
-function MatchConcernsList({ concerns }: { concerns: string[] }) {
-  return (
-    <ul className="mt-2 space-y-1 text-xs leading-relaxed text-amber-800 dark:text-amber-300">
-      {concerns.map((line) => (
-        <li key={line} className="flex gap-1.5">
-          <AlertTriangle
-            className="mt-0.5 size-3 shrink-0"
-            aria-hidden="true"
-          />
-          <span>{line}</span>
+    <ul className="mt-2 space-y-1 text-xs leading-relaxed text-muted-foreground">
+      {notes.map((note) => (
+        <li
+          key={note.text}
+          className={cn(
+            "flex gap-1.5",
+            note.is_warning && "text-amber-800 dark:text-amber-300"
+          )}
+        >
+          {note.is_warning ? (
+            <AlertTriangle
+              className="mt-0.5 size-3 shrink-0"
+              aria-hidden="true"
+            />
+          ) : (
+            <span className="mt-[0.45em] size-1.5 shrink-0 rounded-full bg-current opacity-65" />
+          )}
+          <span>{note.text}</span>
         </li>
       ))}
     </ul>
@@ -105,59 +105,6 @@ function FitSignals({ job }: { job: JobListing }) {
   )
 }
 
-function EvidenceLine({
-  label,
-  reason,
-  evidence,
-}: {
-  label: string
-  reason?: string | null
-  evidence?: string | null
-}) {
-  if (!reason && !evidence) return null
-
-  return (
-    <p className="text-xs leading-relaxed text-muted-foreground">
-      <span className="font-medium text-foreground">{label}:</span> {reason}
-      {evidence ? (
-        <span className="text-muted-foreground/80"> ({evidence})</span>
-      ) : null}
-    </p>
-  )
-}
-
-function FitEvidence({ job }: { job: JobListing }) {
-  const hasEvidence =
-    job.location_reason ||
-    job.location_evidence ||
-    job.pay_reason ||
-    job.pay_evidence ||
-    job.role_reason ||
-    job.role_evidence
-
-  if (!hasEvidence) return null
-
-  return (
-    <div className="mt-2 space-y-1">
-      <EvidenceLine
-        label="Location"
-        reason={job.location_reason}
-        evidence={job.location_evidence}
-      />
-      <EvidenceLine
-        label="Pay"
-        reason={job.pay_reason}
-        evidence={job.pay_evidence}
-      />
-      <EvidenceLine
-        label="Role"
-        reason={job.role_reason}
-        evidence={job.role_evidence}
-      />
-    </div>
-  )
-}
-
 export function JobListingCard({
   job,
   showMatchScore = true,
@@ -167,15 +114,14 @@ export function JobListingCard({
   className,
 }: JobListingCardProps) {
   const tags = job.tags ?? []
-  const highlights = getMatchHighlights(job)
-  const concerns = getMatchConcerns(job)
+  const notes = getMatchNotes(job)
   const showScore =
     showMatchScore && job.match_score != null && !Number.isNaN(job.match_score)
   const scoreTier =
     showScore && job.match_score != null
       ? getMatchScoreTier(job.match_score)
       : null
-  const showHighlightList = showHighlights && highlights.length > 0
+  const showNoteList = showHighlights && notes.length > 0
   const showApply = showApplyLink && hasApplyUrl(job)
 
   return (
@@ -210,12 +156,8 @@ export function JobListingCard({
             <p className="text-xs text-muted-foreground/90">{job.location}</p>
           ) : null}
           <FitSignals job={job} />
-          {showHighlightList ? (
-            <MatchHighlightsList highlights={highlights} />
-          ) : null}
-          <FitEvidence job={job} />
-          {concerns.length > 0 ? (
-            <MatchConcernsList concerns={concerns} />
+          {showNoteList ? (
+            <MatchNotesList notes={notes} />
           ) : null}
         </header>
 

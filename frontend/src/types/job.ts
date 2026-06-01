@@ -4,6 +4,11 @@
  *
  * Not included yet (see `job_matches` table): is_viewed, is_favorited.
  */
+export type MatchNote = {
+  text: string
+  is_warning: boolean
+}
+
 export type JobMatch = {
   id: string
   title: string
@@ -27,6 +32,7 @@ export type JobMatch = {
   pay_evidence?: string | null
   role_reason?: string | null
   role_evidence?: string | null
+  match_notes?: MatchNote[] | null
   /** Short “why this matched” lines; optional until backend generates them. */
   match_highlights?: string[] | null
   match_concerns?: string[] | null
@@ -87,6 +93,29 @@ export function getMatchHighlights(job: JobMatch): string[] {
 
 export function getMatchConcerns(job: JobMatch): string[] {
   return job.match_concerns?.filter((line) => line.trim().length > 0) ?? []
+}
+
+export function getMatchNotes(job: JobMatch): MatchNote[] {
+  const notes =
+    job.match_notes
+      ?.filter((note) => note.text.trim().length > 0)
+      .map((note) => ({
+        text: note.text.trim(),
+        is_warning: Boolean(note.is_warning),
+      })) ?? []
+
+  if (notes.length > 0) return notes
+
+  return [
+    ...getMatchHighlights(job).map((text) => ({
+      text,
+      is_warning: false,
+    })),
+    ...getMatchConcerns(job).map((text) => ({
+      text,
+      is_warning: true,
+    })),
+  ].slice(0, 3)
 }
 
 /** Response body from POST /resumes/upload (Phil's resume route). */

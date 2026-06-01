@@ -1,5 +1,8 @@
 import io
+import logging
+from time import perf_counter
 
+from openai import APITimeoutError
 import pypdf
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
@@ -9,19 +12,32 @@ from app.schemas.ranking import JobRankInput, UserPreferences
 from app.services.cleaning import resolve_job_location
 from app.services.embedding import generateEmbedding
 from app.services.job_facts import extract_job_facts
-from app.services.ranking import compute_match_score, score_jobs_with_llm
+from app.services.ranking import (
+    SCORING_JOB_DESCRIPTION_CHAR_LIMIT,
+    compute_match_score,
+    score_jobs_with_llm,
+)
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 VECTOR_RETRIEVAL_LIMIT = 10
 VISITOR_JOB_LIMIT = 3
 AUTHENTICATED_JOB_LIMIT = 10
+RESUME_SIGNED_URL_EXPIRES_SECONDS = 300
 
 
 def _normalize_text_array(value) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _response_data(response, *, stage: str):
+    if response is None:
+        logger.warning("%s returned no response object", stage)
+        return None
+    return getattr(response, "data", None)
 
 
 def fetch_user_preferences(user_id: str) -> UserPreferences:
@@ -45,7 +61,7 @@ def fetch_user_preferences(user_id: str) -> UserPreferences:
             .execute()
         )
 
-    data = response.data or {}
+    data = _response_data(response, stage="fetch_user_preferences") or {}
     return UserPreferences(
         target_role=data.get("target_role"),
         preferred_locations=_normalize_text_array(data.get("preferred_locations")),
@@ -98,7 +114,7 @@ def fetch_vector_job_matches(query_embedding: list[float], *, limit: int) -> lis
         },
     ).execute()
 
-    return response.data or []
+    return _response_data(response, stage="fetch_vector_job_matches") or []
 
 
 def fetch_full_jobs(job_ids: list[str]) -> dict[str, dict]:
@@ -111,7 +127,18 @@ def fetch_full_jobs(job_ids: list[str]) -> dict[str, dict]:
         .in_("id", job_ids)
         .execute()
     )
-    return {str(job["id"]): job for job in response.data or []}
+    jobs = _response_data(response, stage="fetch_full_jobs") or []
+    return {str(job["id"]): job for job in jobs}
+
+
+def _log_upload_stage(stage: str, started_at: float) -> float:
+    finished_at = perf_counter()
+    logger.info(
+        "Resume upload stage '%s' finished in %.2fs",
+        stage,
+        finished_at - started_at,
+    )
+    return finished_at
 
 
 def score_job_matches(
@@ -119,10 +146,11 @@ def score_job_matches(
     query_embedding: list[float],
     *,
     return_limit: int,
+    vector_retrieval_limit: int = VECTOR_RETRIEVAL_LIMIT,
     preferences: UserPreferences | None = None,
 ) -> list[dict]:
     vector_matches = fetch_vector_job_matches(
-        query_embedding, limit=VECTOR_RETRIEVAL_LIMIT
+        query_embedding, limit=vector_retrieval_limit
     )
     job_ids = [str(job["id"]) for job in vector_matches]
     full_jobs_by_id = fetch_full_jobs(job_ids)
@@ -157,7 +185,9 @@ def score_job_matches(
                 title=display_job["title"],
                 company=display_job["company"],
                 location=display_job["location"],
-                description=display_job["description"][:4000],
+                description=display_job["description"][
+                    :SCORING_JOB_DESCRIPTION_CHAR_LIMIT
+                ],
                 vector_similarity=float(vector_match.get("similarity") or 0),
                 facts=facts,
             )
@@ -187,8 +217,15 @@ def score_job_matches(
                 "location": job["location"],
                 "apply_url": job["apply_url"],
                 "match_score": compute_match_score(score),
-                "match_highlights": score.match_highlights,
-                "match_concerns": score.match_concerns or [],
+                "match_notes": [
+                    note.model_dump() for note in score.match_notes
+                ],
+                "match_highlights": [
+                    note.text for note in score.match_notes if not note.is_warning
+                ],
+                "match_concerns": [
+                    note.text for note in score.match_notes if note.is_warning
+                ],
                 "interview_likelihood": score.interview_likelihood,
                 "skills_fit": score.skills_fit,
                 "experience_fit": score.experience_fit,
@@ -197,12 +234,12 @@ def score_job_matches(
                 "pay_fit": score.pay_fit,
                 "role_fit": score.role_fit,
                 "preference_fit": score.preference_fit,
-                "location_reason": score.location_reason,
-                "location_evidence": score.location_evidence,
-                "pay_reason": score.pay_reason,
-                "pay_evidence": score.pay_evidence,
-                "role_reason": score.role_reason,
-                "role_evidence": score.role_evidence,
+                "location_reason": None,
+                "location_evidence": None,
+                "pay_reason": None,
+                "pay_evidence": None,
+                "role_reason": None,
+                "role_evidence": None,
                 "job_facts": facts.model_dump() if facts else None,
             }
         )
@@ -219,10 +256,16 @@ def score_job_matches(
 
 
 async def handle_visitor_upload(extracted_text: str) -> dict:
+    started_at = perf_counter()
     embedding = generateEmbedding(extracted_text)
+    started_at = _log_upload_stage("visitor_embedding", started_at)
     jobs = score_job_matches(
-        extracted_text, embedding, return_limit=VISITOR_JOB_LIMIT
+        extracted_text,
+        embedding,
+        return_limit=VISITOR_JOB_LIMIT,
+        vector_retrieval_limit=VISITOR_JOB_LIMIT,
     )
+    _log_upload_stage("visitor_scoring", started_at)
 
     return {
         "message": "Resume parsed. Sign up to interact with your job matches.",
@@ -239,22 +282,28 @@ async def handle_authenticated_upload(
     user_id = current_user.id
     storage_path = f"{user_id}/resume.pdf"
 
+    started_at = perf_counter()
     supabase.storage.from_("resumes").upload(
         path=storage_path,
         file=file_bytes,
         file_options={"content-type": "application/pdf", "upsert": "true"},
     )
+    started_at = _log_upload_stage("storage_upload", started_at)
     preferences = fetch_user_preferences(user_id)
+    started_at = _log_upload_stage("fetch_preferences", started_at)
     embedding = generateEmbedding(extracted_text)
+    started_at = _log_upload_stage("resume_embedding", started_at)
     match_query_embedding = generateEmbedding(
         build_match_query_text(extracted_text, preferences)
     )
+    started_at = _log_upload_stage("match_query_embedding", started_at)
     supabase.table("profiles").update(
         {
             "resume_text": extracted_text,
             "resume_embedding": embedding,
         }
     ).eq("id", user_id).execute()
+    started_at = _log_upload_stage("profile_update", started_at)
 
     jobs = score_job_matches(
         extracted_text,
@@ -262,6 +311,7 @@ async def handle_authenticated_upload(
         return_limit=AUTHENTICATED_JOB_LIMIT,
         preferences=preferences,
     )
+    started_at = _log_upload_stage("job_scoring", started_at)
 
     supabase.table("job_matches").delete().eq("user_id", user_id).execute()
     if jobs:
@@ -271,6 +321,7 @@ async def handle_authenticated_upload(
                     "user_id": user_id,
                     "job_id": job["id"],
                     "match_score": job["match_score"],
+                    "match_notes": job["match_notes"],
                     "match_highlights": job["match_highlights"],
                     "match_concerns": job["match_concerns"],
                     "interview_likelihood": job["interview_likelihood"],
@@ -294,6 +345,7 @@ async def handle_authenticated_upload(
                 for job in jobs
             ]
         ).execute()
+    _log_upload_stage("persist_job_matches", started_at)
 
     return {
         "message": "Resume uploaded and successfully parsed.",
@@ -326,9 +378,72 @@ async def upload_and_parse_resume(
 
     except HTTPException:
         raise
+    except APITimeoutError as e:
+        logger.exception("Resume processing timed out while calling OpenAI")
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                "Resume processing timed out while calling OpenAI. "
+                "Try again, or increase OPENAI_SCORING_TIMEOUT_SECONDS / reduce "
+                "SCORING_*_CHAR_LIMIT values if this keeps happening locally."
+            ),
+        ) from e
     except Exception as e:
+        logger.exception("Resume processing failed")
         raise HTTPException(
             status_code=500, detail=f"Resume processing failed: {str(e)}"
+        ) from e
+
+
+@router.get("/resumes/me")
+async def get_resume(
+    current_user=Depends(get_current_user),
+):
+    user_id = current_user.id
+    storage_path = f"{user_id}/resume.pdf"
+
+    try:
+        bucket = supabase.storage.from_("resumes")
+        files = bucket.list(
+            user_id,
+            {"limit": 10, "offset": 0, "sortBy": {"column": "name", "order": "asc"}},
+        )
+        resume_file = next(
+            (file for file in files if file.get("name") == "resume.pdf"),
+            None,
+        )
+
+        if not resume_file:
+            return {
+                "has_resume": False,
+                "file_name": None,
+                "uploaded_at": None,
+                "signed_url": None,
+                "expires_in": RESUME_SIGNED_URL_EXPIRES_SECONDS,
+            }
+
+        signed_url_response = bucket.create_signed_url(
+            storage_path, RESUME_SIGNED_URL_EXPIRES_SECONDS
+        )
+        signed_url = signed_url_response.get("signedUrl") or signed_url_response.get(
+            "signedURL"
+        )
+
+        return {
+            "has_resume": True,
+            "file_name": resume_file.get("name"),
+            "uploaded_at": resume_file.get("updated_at")
+            or resume_file.get("created_at")
+            or resume_file.get("last_accessed_at"),
+            "signed_url": signed_url,
+            "expires_in": RESUME_SIGNED_URL_EXPIRES_SECONDS,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to fetch resume metadata")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch resume: {str(e)}"
         ) from e
 
 
