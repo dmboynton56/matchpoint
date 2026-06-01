@@ -8,7 +8,8 @@ from pathlib import Path
 from app.routes.matches import router as matches_router
 from app.routes.resumes import router as resumes_router
 from app.services.cleaning import (
-    buildCleanedText
+    buildCleanedText,
+    resolve_job_location,
 )
 from app.services.embedding import (
     generateEmbedding
@@ -71,6 +72,9 @@ def insert_jobs_into_database():
                 f"Skipping job: missing required fields"
             )
             continue
+        raw_location = str(job["location"])
+        raw_description = str(job["description"])
+        resolved_location = resolve_job_location(raw_location, raw_description) or raw_location
         cleanedPost = buildCleanedText(job)
         try:
             embedding = generateEmbedding(cleanedPost)
@@ -83,7 +87,7 @@ def insert_jobs_into_database():
             "company": str(job["company"]),
             "title": str(job["title"]),
             "description": str(cleanedPost),
-            "location": str(job["location"]),
+            "location": resolved_location,
             "posted_at": job.get("posted_at"),
             "apply_url": job.get("apply_url"),
             "embedding": embedding

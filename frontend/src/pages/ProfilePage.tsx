@@ -3,8 +3,8 @@ import { toast } from "sonner"
 
 import {
   changeEmailWithPassword,
-  getProfileTargetRole,
-  updateProfileTargetRole,
+  getProfilePreferences,
+  updateProfilePreferences,
 } from "@/auth/supabaseAuth"
 import { AppShell } from "@/components/layout/AppShell"
 import { Button } from "@/components/ui/button"
@@ -20,13 +20,25 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useAuth } from "@/hooks/useAuth"
 
+const WORK_MODE_OPTIONS = ["Remote", "Hybrid", "On-site"]
+
+function parseCommaList(value: string): string[] {
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
 export function ProfilePage() {
   const { user } = useAuth()
 
   const [targetRole, setTargetRole] = useState("")
-  const [savedTargetRole, setSavedTargetRole] = useState("")
+  const [preferredLocations, setPreferredLocations] = useState("")
+  const [preferredWorkModes, setPreferredWorkModes] = useState<string[]>([])
+  const [minimumBaseSalary, setMinimumBaseSalary] = useState("")
+  const [savedPreferenceKey, setSavedPreferenceKey] = useState("")
   const [profileLoading, setProfileLoading] = useState(true)
-  const [targetRoleSaving, setTargetRoleSaving] = useState(false)
+  const [preferencesSaving, setPreferencesSaving] = useState(false)
 
   const [newEmail, setNewEmail] = useState("")
   const [emailPassword, setEmailPassword] = useState("")
@@ -39,16 +51,28 @@ export function ProfilePage() {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setProfileLoading(true)
 
-    void getProfileTargetRole(user.id).then((result) => {
+    void getProfilePreferences(user.id).then((result) => {
       if (cancelled) return
       if (!result.ok) {
         toast.error(result.message, { position: "top-center" })
         setProfileLoading(false)
         return
       }
-      const value = result.data ?? ""
-      setTargetRole(value)
-      setSavedTargetRole(value)
+      const preferences = result.data
+      const locations = preferences.preferred_locations.join(", ")
+      const salary = preferences.minimum_base_salary?.toString() ?? ""
+      setTargetRole(preferences.target_role ?? "")
+      setPreferredLocations(locations)
+      setPreferredWorkModes(preferences.preferred_work_modes)
+      setMinimumBaseSalary(salary)
+      setSavedPreferenceKey(
+        JSON.stringify({
+          targetRole: preferences.target_role ?? "",
+          preferredLocations: locations,
+          preferredWorkModes: preferences.preferred_work_modes,
+          minimumBaseSalary: salary,
+        })
+      )
       setProfileLoading(false)
     })
 
@@ -57,21 +81,52 @@ export function ProfilePage() {
     }
   }, [user])
 
-  const handleSaveTargetRole = async () => {
+  const handleSavePreferences = async () => {
     if (!user) return
 
-    setTargetRoleSaving(true)
+    const salary = minimumBaseSalary.trim()
+    if (salary && !/^\d+$/.test(salary)) {
+      toast.error("Enter minimum base salary as a whole number.", {
+        position: "top-center",
+      })
+      return
+    }
+
+    const preferences = {
+      target_role: targetRole,
+      preferred_locations: parseCommaList(preferredLocations),
+      preferred_work_modes: preferredWorkModes,
+      minimum_base_salary: salary ? Number(salary) : null,
+      salary_currency: "USD",
+    }
+
+    setPreferencesSaving(true)
     try {
-      const result = await updateProfileTargetRole(user.id, targetRole)
+      const result = await updateProfilePreferences(user.id, preferences)
       if (!result.ok) {
         toast.error(result.message, { position: "top-center" })
         return
       }
-      setSavedTargetRole(targetRole.trim())
-      toast.success("Target role saved.", { position: "top-center" })
+      setSavedPreferenceKey(
+        JSON.stringify({
+          targetRole: targetRole.trim(),
+          preferredLocations: preferences.preferred_locations.join(", "),
+          preferredWorkModes,
+          minimumBaseSalary: salary,
+        })
+      )
+      toast.success("Preferences saved.", { position: "top-center" })
     } finally {
-      setTargetRoleSaving(false)
+      setPreferencesSaving(false)
     }
+  }
+
+  const toggleWorkMode = (mode: string) => {
+    setPreferredWorkModes((current) =>
+      current.includes(mode)
+        ? current.filter((item) => item !== mode)
+        : [...current, mode]
+    )
   }
 
   const handleChangeEmail = async (e: React.FormEvent) => {
@@ -105,7 +160,13 @@ export function ProfilePage() {
     return null
   }
 
-  const targetRoleChanged = targetRole.trim() !== savedTargetRole.trim()
+  const currentPreferenceKey = JSON.stringify({
+    targetRole: targetRole.trim(),
+    preferredLocations: parseCommaList(preferredLocations).join(", "),
+    preferredWorkModes,
+    minimumBaseSalary: minimumBaseSalary.trim(),
+  })
+  const preferencesChanged = currentPreferenceKey !== savedPreferenceKey
 
   return (
     <AppShell>
@@ -168,9 +229,9 @@ export function ProfilePage() {
 
           <Card className="h-fit">
             <CardHeader>
-              <CardTitle>Target role</CardTitle>
+              <CardTitle>Match preferences</CardTitle>
               <CardDescription>
-                The role you are aiming for (used for job matching).
+                Used to ground role, location, and pay fit.
               </CardDescription>
             </CardHeader>
             <CardContent className="flex flex-col gap-4">
@@ -185,16 +246,59 @@ export function ProfilePage() {
                   onChange={(e) => setTargetRole(e.target.value)}
                 />
               </div>
+              <div className="grid gap-2">
+                <Label htmlFor="preferred-locations">Preferred locations</Label>
+                <Input
+                  id="preferred-locations"
+                  type="text"
+                  placeholder="e.g. Denver, Remote US"
+                  disabled={profileLoading}
+                  value={preferredLocations}
+                  onChange={(e) => setPreferredLocations(e.target.value)}
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label>Work mode</Label>
+                <div className="flex flex-wrap gap-3">
+                  {WORK_MODE_OPTIONS.map((mode) => (
+                    <label
+                      key={mode}
+                      className="flex items-center gap-2 text-sm text-foreground"
+                    >
+                      <input
+                        type="checkbox"
+                        className="size-4 accent-primary"
+                        disabled={profileLoading}
+                        checked={preferredWorkModes.includes(mode)}
+                        onChange={() => toggleWorkMode(mode)}
+                      />
+                      {mode}
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="minimum-base-salary">Minimum base salary</Label>
+                <Input
+                  id="minimum-base-salary"
+                  type="text"
+                  inputMode="numeric"
+                  placeholder="e.g. 160000"
+                  disabled={profileLoading}
+                  value={minimumBaseSalary}
+                  onChange={(e) => setMinimumBaseSalary(e.target.value)}
+                />
+              </div>
             </CardContent>
             <CardFooter>
               <Button
                 type="button"
                 disabled={
-                  profileLoading || targetRoleSaving || !targetRoleChanged
+                  profileLoading || preferencesSaving || !preferencesChanged
                 }
-                onClick={() => void handleSaveTargetRole()}
+                onClick={() => void handleSavePreferences()}
               >
-                {targetRoleSaving ? "Saving…" : "Save target role"}
+                {preferencesSaving ? "Saving…" : "Save preferences"}
               </Button>
             </CardFooter>
           </Card>

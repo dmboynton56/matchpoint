@@ -13,8 +13,24 @@ export type JobMatch = {
   rank?: number
   /** 0–1 similarity score from matching; null when not yet computed. */
   match_score: number | null
+  interview_likelihood?: number | null
+  skills_fit?: number | null
+  experience_fit?: number | null
+  seniority_fit?: number | null
+  location_fit?: number | null
+  pay_fit?: number | null
+  role_fit?: number | null
+  preference_fit?: number | null
+  location_reason?: string | null
+  location_evidence?: string | null
+  pay_reason?: string | null
+  pay_evidence?: string | null
+  role_reason?: string | null
+  role_evidence?: string | null
   /** Short “why this matched” lines; optional until backend generates them. */
   match_highlights?: string[] | null
+  match_concerns?: string[] | null
+  job_facts?: Record<string, unknown> | null
 }
 
 /** UI-only extras for landing previews — not returned by the API. */
@@ -59,12 +75,18 @@ export function formatMatchScore(score: number): string {
   return `${percent}% match`
 }
 
-export function hasApplyUrl(job: JobMatch): job is JobMatch & { apply_url: string } {
+export function hasApplyUrl(
+  job: JobMatch
+): job is JobMatch & { apply_url: string } {
   return typeof job.apply_url === "string" && job.apply_url.length > 0
 }
 
 export function getMatchHighlights(job: JobMatch): string[] {
   return job.match_highlights?.filter((line) => line.trim().length > 0) ?? []
+}
+
+export function getMatchConcerns(job: JobMatch): string[] {
+  return job.match_concerns?.filter((line) => line.trim().length > 0) ?? []
 }
 
 /** Response body from POST /resumes/upload (Phil's resume route). */

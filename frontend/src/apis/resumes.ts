@@ -12,7 +12,23 @@ export interface ResumeUploadResponse {
     apply_url: string | null
     rank: number
     match_score: number
+    interview_likelihood: number
+    skills_fit: number
+    experience_fit: number
+    seniority_fit: number
+    location_fit: number
+    pay_fit: number
+    role_fit: number
+    preference_fit: number
+    location_reason: string | null
+    location_evidence: string | null
+    pay_reason: string | null
+    pay_evidence: string | null
+    role_reason: string | null
+    role_evidence: string | null
     match_highlights: string[]
+    match_concerns: string[]
+    job_facts: Record<string, unknown> | null
   }>
 }
 

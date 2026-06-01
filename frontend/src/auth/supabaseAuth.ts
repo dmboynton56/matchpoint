@@ -158,19 +158,86 @@ export type ProfileResult<T> =
   | { ok: true; data: T }
   | { ok: false; message: string }
 
-export const getProfileTargetRole = async (
+export type ProfilePreferences = {
+  target_role: string | null
+  preferred_locations: string[]
+  preferred_work_modes: string[]
+  minimum_base_salary: number | null
+  salary_currency: string
+}
+
+export const getProfilePreferences = async (
   userId: string
-): Promise<ProfileResult<string | null>> => {
+): Promise<ProfileResult<ProfilePreferences>> => {
   const { data, error } = await supabase
     .from("profiles")
-    .select("target_role")
+    .select(
+      "target_role, preferred_locations, preferred_work_modes, minimum_base_salary, salary_currency"
+    )
     .eq("id", userId)
     .maybeSingle()
 
   if (error) {
     return { ok: false, message: error.message }
   }
-  return { ok: true, data: data?.target_role ?? null }
+  return {
+    ok: true,
+    data: {
+      target_role: data?.target_role ?? null,
+      preferred_locations: data?.preferred_locations ?? [],
+      preferred_work_modes: data?.preferred_work_modes ?? [],
+      minimum_base_salary: data?.minimum_base_salary ?? null,
+      salary_currency: data?.salary_currency ?? "USD",
+    },
+  }
+}
+
+export const updateProfilePreferences = async (
+  userId: string,
+  preferences: {
+    target_role: string
+    preferred_locations: string[]
+    preferred_work_modes: string[]
+    minimum_base_salary: number | null
+    salary_currency?: string
+  }
+): Promise<ProfileResult<null>> => {
+  const targetRole = preferences.target_role.trim()
+  const preferredLocations = preferences.preferred_locations
+    .map((location) => location.trim())
+    .filter(Boolean)
+  const preferredWorkModes = preferences.preferred_work_modes
+    .map((mode) => mode.trim())
+    .filter(Boolean)
+
+  const { error } = await supabase.from("profiles").upsert(
+    {
+      id: userId,
+      target_role: targetRole || null,
+      preferred_locations: preferredLocations.length
+        ? preferredLocations
+        : null,
+      preferred_work_modes: preferredWorkModes.length
+        ? preferredWorkModes
+        : null,
+      minimum_base_salary: preferences.minimum_base_salary,
+      salary_currency: preferences.salary_currency ?? "USD",
+    },
+    { onConflict: "id" }
+  )
+
+  if (error) {
+    return { ok: false, message: error.message }
+  }
+  return { ok: true, data: null }
+}
+
+export const getProfileTargetRole = async (
+  userId: string
+): Promise<ProfileResult<string | null>> => {
+  const result = await getProfilePreferences(userId)
+  if (!result.ok) return result
+  return { ok: true, data: result.data.target_role }
 }
 
 export const updateProfileTargetRole = async (
