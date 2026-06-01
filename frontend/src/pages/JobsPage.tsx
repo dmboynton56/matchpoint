@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useState } from "react"
-import { Link, useLocation } from "react-router-dom"
+import { useLocation } from "react-router-dom"
 import { toast } from "sonner"
 
 import { getMyMatches, type Match } from "@/apis/matches"
 import { JobListingCard } from "@/components/jobs/JobListingCard"
 import { AppShell } from "@/components/layout/AppShell"
 import { RouteLoading } from "@/components/routing/RouteLoading"
-import { Button } from "@/components/ui/button"
+import UploadDropzone from "@/components/user/UploadDropzone"
 import { useAuth } from "@/hooks/useAuth"
 import type { JobMatch } from "@/types/job"
 
@@ -99,7 +99,7 @@ export function JobsPage() {
           <p className="max-w-2xl text-sm leading-relaxed text-muted-foreground sm:text-base">
             {hasMatches
               ? `Showing ${jobs.length} role${jobs.length === 1 ? "" : "s"} ranked against your resume.`
-              : "Upload your resume from the home page to see personalized job matches."}
+              : "Upload your resume below to see personalized job matches."}
           </p>
         </section>
 
@@ -116,9 +116,7 @@ export function JobsPage() {
             <p className="text-sm text-muted-foreground">
               No matches yet. Upload a PDF resume to get started.
             </p>
-            <Button asChild className="mt-4">
-              <Link to="/">Upload resume</Link>
-            </Button>
+            <UploadDropzone />
           </div>
         )}
       </div>

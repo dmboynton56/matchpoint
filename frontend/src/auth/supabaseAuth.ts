@@ -89,10 +89,11 @@ export const signInWithEmail = async (
 export const signInWithGoogle = async (): Promise<{
   error: AuthError | null
 }> => {
+  const frontendUrl = window.location.origin
   const { error } = await supabase.auth.signInWithOAuth({
     provider: "google",
     options: {
-      redirectTo: window.location.origin, // Returns the user to app's home after login
+      redirectTo: `${frontendUrl}/jobs`,
     },
   })
 
@@ -177,10 +178,9 @@ export const updateProfileTargetRole = async (
   targetRole: string
 ): Promise<ProfileResult<null>> => {
   const trimmed = targetRole.trim()
-  const { error } = await supabase.from("profiles").upsert(
-    { id: userId, target_role: trimmed || null },
-    { onConflict: "id" }
-  )
+  const { error } = await supabase
+    .from("profiles")
+    .upsert({ id: userId, target_role: trimmed || null }, { onConflict: "id" })
 
   if (error) {
     return { ok: false, message: error.message }
