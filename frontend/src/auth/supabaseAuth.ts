@@ -89,10 +89,11 @@ export const signInWithEmail = async (
 export const signInWithGoogle = async (): Promise<{
   error: AuthError | null
 }> => {
+  const frontendUrl = window.location.origin
   const { error } = await supabase.auth.signInWithOAuth({
     provider: "google",
     options: {
-      redirectTo: `${import.meta.env.VITE_FRONTEND_URL}/jobs`,
+      redirectTo: `${frontendUrl}/jobs`,
     },
   })
 

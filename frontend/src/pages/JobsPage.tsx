@@ -31,7 +31,7 @@ export function JobsPage() {
           <p className="max-w-2xl text-sm leading-relaxed text-muted-foreground sm:text-base">
             {hasMatches
               ? `Showing ${jobs.length} role${jobs.length === 1 ? "" : "s"} ranked against your resume.`
-              : "Upload your resume from the home page to see personalized job matches."}
+              : "Upload your resume below to see personalized job matches."}
           </p>
         </section>
 
