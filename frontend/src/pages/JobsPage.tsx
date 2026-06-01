@@ -12,10 +12,72 @@ function sortByRank(jobs: JobMatch[]): JobMatch[] {
   return [...jobs].sort((a, b) => (a.rank ?? 0) - (b.rank ?? 0))
 }
 
+function sortByMatchScore(jobs: JobMatch[]): JobMatch[] {
+  return [...jobs].sort(
+    (a, b) => (b.match_score ?? 0) - (a.match_score ?? 0)
+  )
+}
+
+function matchToJobMatch(match: Match): JobMatch {
+  return {
+    id: match.job.id,
+    title: match.job.title,
+    company: match.job.company,
+    location: match.job.location,
+    apply_url: match.job.apply_url,
+    match_score: match.match_score,
+    match_highlights: match.match_highlights,
+  }
+}
+
 export function JobsPage() {
   const location = useLocation()
+  const { user, loading: authLoading } = useAuth()
   const state = location.state as JobsPageLocationState | null
-  const jobs = state?.jobs ? sortByRank(state.jobs) : []
+  const stateJobs = useMemo(
+    () => (state?.jobs ? sortByRank(state.jobs) : []),
+    [state?.jobs]
+  )
+
+  const [jobs, setJobs] = useState<JobMatch[]>(stateJobs)
+  const [matchesLoading, setMatchesLoading] = useState(false)
+
+  useEffect(() => {
+    if (authLoading) return
+
+    if (!user) {
+      setJobs(stateJobs)
+      return
+    }
+
+    let cancelled = false
+    setMatchesLoading(true)
+
+    void getMyMatches()
+      .then((response) => {
+        if (cancelled) return
+        setJobs(sortByMatchScore(response.matches.map(matchToJobMatch)))
+      })
+      .catch((error) => {
+        if (cancelled) return
+        const message =
+          error instanceof Error ? error.message : "Failed to load matches"
+        toast.error(message)
+        if (stateJobs.length > 0) setJobs(stateJobs)
+      })
+      .finally(() => {
+        if (!cancelled) setMatchesLoading(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [user, authLoading, stateJobs])
+
+  if (authLoading || (user && matchesLoading && jobs.length === 0)) {
+    return <RouteLoading />
+  }
+
   const hasMatches = jobs.length > 0
 
   return (
