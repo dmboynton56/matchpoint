@@ -40,10 +40,14 @@ frontend/.env
 
 # Personal documents
 Drew Boynton Resume March 2026.pdf
+PREFERENCES-PLAN.md
 
 # Supabase
 .temp/
 .branches/
 
-__pycache__/
-*.pyc
+# Local dev scripts and runtime files
+scripts/dev-up.sh
+scripts/dev-down.sh
+.dev-pids/
+.dev-logs/

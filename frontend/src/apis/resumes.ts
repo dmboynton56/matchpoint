@@ -12,13 +12,41 @@ export interface ResumeUploadResponse {
     apply_url: string | null
     rank: number
     match_score: number
+    match_notes: Array<{
+      text: string
+      is_warning: boolean
+    }> | null
+    interview_likelihood: number
+    skills_fit: number
+    experience_fit: number
+    seniority_fit: number
+    location_fit: number
+    pay_fit: number
+    role_fit: number
+    preference_fit: number
+    location_reason: string | null
+    location_evidence: string | null
+    pay_reason: string | null
+    pay_evidence: string | null
+    role_reason: string | null
+    role_evidence: string | null
     match_highlights: string[]
+    match_concerns: string[]
+    job_facts: Record<string, unknown> | null
   }>
 }
 
 export interface ResumeDeleteResponse {
   success: boolean
   message: string
+}
+
+export interface ResumeDetailsResponse {
+  has_resume: boolean
+  file_name: string | null
+  uploaded_at: string | null
+  signed_url: string | null
+  expires_in: number
 }
 
 // Upload a resume to the db
@@ -38,6 +66,10 @@ export async function uploadResume(file: File): Promise<ResumeUploadResponse> {
   }
 
   return res.json() as Promise<ResumeUploadResponse>
+}
+
+export async function getResumeDetails(): Promise<ResumeDetailsResponse> {
+  return apiFetch<ResumeDetailsResponse>("/resumes/me")
 }
 
 // Delete the current user's resume
