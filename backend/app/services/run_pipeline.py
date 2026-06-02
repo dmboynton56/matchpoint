@@ -15,11 +15,14 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
-from .scraper100 import scrape_all
-from .cleaning import buildCleanedText
-from .embedding import generate_embeddings_batch
-
-load_dotenv()
+try:
+    from .scraper100 import scrape_all
+    from .cleaning import buildCleanedText
+    from .embedding import generate_embeddings_batch
+except ImportError:
+    from scraper100 import scrape_all
+    from cleaning import buildCleanedText
+    from embedding import generate_embeddings_batch
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
@@ -27,8 +30,8 @@ SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
 if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
     raise RuntimeError("SUPABASE_URL and SUPABASE_SECRET_KEY must be set")
 
-BATCH_SIZE = 100 # OpenAI supports up to 2048
-STALE_AFTER_DAYS = 7 # Time of existing after which should be removed
+BATCH_SIZE = 100
+STALE_AFTER_DAYS = 7
 
 
 def chunk(lst: list, size: int):
@@ -87,15 +90,28 @@ def run_pipeline():
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
     existing_ids = fetch_existing_ids(supabase)
     print(f"  {len(existing_ids)} existing external_ids in DB")
-
+ 
     new_jobs = [j for j in jobs if str(j["external_id"]) not in existing_ids]
-    skipped = len(jobs) - len(new_jobs)
+    existing_jobs = [j for j in jobs if str(j["external_id"]) in existing_ids]
+ 
+    skipped = len(existing_jobs)
     print(f"  Skipping {skipped} duplicates — {len(new_jobs)} new jobs to process")
-
+ 
+    # Refresh created_at for jobs still live at the endpoint so they don't get purged
+    if existing_jobs:
+        now = datetime.now(timezone.utc).isoformat()
+        for batch in chunk(existing_jobs, BATCH_SIZE):
+            ids = [j["external_id"] for j in batch]
+            supabase.table("jobs").update(
+                {"created_at": now}
+            ).in_("external_id", ids).execute()
+        print(f"  Refreshed created_at for {len(existing_jobs)} existing jobs")
+ 
     if not new_jobs:
         print("No new jobs to insert — running purge and exiting.")
         purge_stale_jobs(supabase)
         sys.exit(0)
+
 
     print("\n=== STEP 3: Building embedding texts ===")
     for job in new_jobs:
@@ -129,9 +145,6 @@ def run_pipeline():
             total_inserted += len(batch)
         except Exception as e:
             print(f"Batch {i + 1} failed: {e}")
-    
-    for job in batch:
-        print(f"  + {job['company']} — {job['title']} ({job['location']})")
 
     print("\n=== STEP 6: Purging stale jobs ===")
     purge_stale_jobs(supabase)
