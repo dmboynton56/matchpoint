@@ -1,10 +1,18 @@
-import { useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
+import { useNavigate } from "react-router-dom"
+import { ExternalLink, FileText, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import {
+  deleteResume,
+  getResumeDetails,
+  type ResumeDetailsResponse,
+  uploadResume,
+} from "@/apis/resumes"
+import {
   changeEmailWithPassword,
-  getProfileTargetRole,
-  updateProfileTargetRole,
+  getProfilePreferences,
+  updateProfilePreferences,
 } from "@/auth/supabaseAuth"
 import { AppShell } from "@/components/layout/AppShell"
 import { Button } from "@/components/ui/button"
@@ -20,17 +28,55 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useAuth } from "@/hooks/useAuth"
 
+const WORK_MODE_OPTIONS = ["Remote", "Hybrid", "On-site"]
+
+function sortWorkModes(modes: string[]): string[] {
+  return [...modes].sort()
+}
+
+function parseCommaList(value: string): string[] {
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
 export function ProfilePage() {
   const { user } = useAuth()
+  const navigate = useNavigate()
+  const resumeInputRef = useRef<HTMLInputElement>(null)
 
   const [targetRole, setTargetRole] = useState("")
-  const [savedTargetRole, setSavedTargetRole] = useState("")
+  const [preferredLocations, setPreferredLocations] = useState("")
+  const [preferredWorkModes, setPreferredWorkModes] = useState<string[]>([])
+  const [minimumBaseSalary, setMinimumBaseSalary] = useState("")
+  const [savedPreferenceKey, setSavedPreferenceKey] = useState("")
   const [profileLoading, setProfileLoading] = useState(true)
-  const [targetRoleSaving, setTargetRoleSaving] = useState(false)
+  const [preferencesSaving, setPreferencesSaving] = useState(false)
 
   const [newEmail, setNewEmail] = useState("")
   const [emailPassword, setEmailPassword] = useState("")
   const [emailSaving, setEmailSaving] = useState(false)
+  const [resume, setResume] = useState<ResumeDetailsResponse | null>(null)
+  const [resumeLoading, setResumeLoading] = useState(true)
+  const [resumeUploading, setResumeUploading] = useState(false)
+  const [resumeDeleting, setResumeDeleting] = useState(false)
+  const [resumeMutationPending, setResumeMutationPending] = useState(false)
+
+  const refreshResume = useCallback(async (showLoading = true) => {
+    if (showLoading) {
+      setResumeLoading(true)
+    }
+    try {
+      setResume(await getResumeDetails())
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Could not load resume."
+      toast.error(message, { position: "top-center" })
+    } finally {
+      setResumeLoading(false)
+    }
+  }, [])
 
   useEffect(() => {
     if (!user) return
@@ -39,16 +85,28 @@ export function ProfilePage() {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setProfileLoading(true)
 
-    void getProfileTargetRole(user.id).then((result) => {
+    void getProfilePreferences(user.id).then((result) => {
       if (cancelled) return
       if (!result.ok) {
         toast.error(result.message, { position: "top-center" })
         setProfileLoading(false)
         return
       }
-      const value = result.data ?? ""
-      setTargetRole(value)
-      setSavedTargetRole(value)
+      const preferences = result.data
+      const locations = preferences.preferred_locations.join(", ")
+      const salary = preferences.minimum_base_salary?.toString() ?? ""
+      setTargetRole(preferences.target_role ?? "")
+      setPreferredLocations(locations)
+      setPreferredWorkModes(preferences.preferred_work_modes)
+      setMinimumBaseSalary(salary)
+      setSavedPreferenceKey(
+        JSON.stringify({
+          targetRole: preferences.target_role ?? "",
+          preferredLocations: locations,
+          preferredWorkModes: sortWorkModes(preferences.preferred_work_modes),
+          minimumBaseSalary: salary,
+        })
+      )
       setProfileLoading(false)
     })
 
@@ -57,21 +115,59 @@ export function ProfilePage() {
     }
   }, [user])
 
-  const handleSaveTargetRole = async () => {
+  useEffect(() => {
     if (!user) return
 
-    setTargetRoleSaving(true)
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void refreshResume(false)
+  }, [refreshResume, user])
+
+  const handleSavePreferences = async () => {
+    if (!user) return
+
+    const salary = minimumBaseSalary.trim()
+    if (salary && !/^\d+$/.test(salary)) {
+      toast.error("Enter minimum base salary as a whole number.", {
+        position: "top-center",
+      })
+      return
+    }
+
+    const preferences = {
+      target_role: targetRole,
+      preferred_locations: parseCommaList(preferredLocations),
+      preferred_work_modes: preferredWorkModes,
+      minimum_base_salary: salary ? Number(salary) : null,
+      salary_currency: "USD",
+    }
+
+    setPreferencesSaving(true)
     try {
-      const result = await updateProfileTargetRole(user.id, targetRole)
+      const result = await updateProfilePreferences(user.id, preferences)
       if (!result.ok) {
         toast.error(result.message, { position: "top-center" })
         return
       }
-      setSavedTargetRole(targetRole.trim())
-      toast.success("Target role saved.", { position: "top-center" })
+      setSavedPreferenceKey(
+        JSON.stringify({
+          targetRole: targetRole.trim(),
+          preferredLocations: preferences.preferred_locations.join(", "),
+          preferredWorkModes: sortWorkModes(preferredWorkModes),
+          minimumBaseSalary: salary,
+        })
+      )
+      toast.success("Preferences saved.", { position: "top-center" })
     } finally {
-      setTargetRoleSaving(false)
+      setPreferencesSaving(false)
     }
+  }
+
+  const toggleWorkMode = (mode: string) => {
+    setPreferredWorkModes((current) =>
+      current.includes(mode)
+        ? current.filter((item) => item !== mode)
+        : [...current, mode]
+    )
   }
 
   const handleChangeEmail = async (e: React.FormEvent) => {
@@ -97,15 +193,75 @@ export function ProfilePage() {
     }
   }
 
-  const resumePlaceholder = () => {
-    toast.message("Resume upload — coming soon", { position: "top-center" })
+  const handleViewResume = () => {
+    if (!resume?.signed_url) return
+
+    window.open(resume.signed_url, "_blank", "noopener,noreferrer")
+  }
+
+  const handleResumeUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    e.target.value = ""
+
+    if (!file) return
+    if (file.type !== "application/pdf") {
+      toast.error("Only PDF files are supported.", { position: "top-center" })
+      return
+    }
+
+    setResumeMutationPending(true)
+    setResumeUploading(true)
+    try {
+      const response = await uploadResume(file)
+      await refreshResume()
+      toast.success("Resume updated.", { position: "top-center" })
+      navigate("/jobs", { state: { jobs: response.jobs } })
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Resume upload failed."
+      toast.error(message, { position: "top-center" })
+    } finally {
+      setResumeUploading(false)
+      setResumeMutationPending(false)
+    }
+  }
+
+  const handleDeleteResume = async () => {
+    setResumeMutationPending(true)
+    setResumeDeleting(true)
+    try {
+      await deleteResume()
+      await refreshResume()
+      toast.success("Resume deleted.", { position: "top-center" })
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Resume delete failed."
+      toast.error(message, { position: "top-center" })
+    } finally {
+      setResumeDeleting(false)
+      setResumeMutationPending(false)
+    }
   }
 
   if (!user) {
     return null
   }
 
-  const targetRoleChanged = targetRole.trim() !== savedTargetRole.trim()
+  const currentPreferenceKey = JSON.stringify({
+    targetRole: targetRole.trim(),
+    preferredLocations: parseCommaList(preferredLocations).join(", "),
+    preferredWorkModes: sortWorkModes(preferredWorkModes),
+    minimumBaseSalary: minimumBaseSalary.trim(),
+  })
+  const preferencesChanged = currentPreferenceKey !== savedPreferenceKey
+  const resumeUploadedAt =
+    resume?.uploaded_at === null || resume?.uploaded_at === undefined
+      ? null
+      : new Intl.DateTimeFormat(undefined, {
+          month: "short",
+          day: "numeric",
+          year: "numeric",
+        }).format(new Date(resume.uploaded_at))
 
   return (
     <AppShell>
@@ -168,9 +324,9 @@ export function ProfilePage() {
 
           <Card className="h-fit">
             <CardHeader>
-              <CardTitle>Target role</CardTitle>
+              <CardTitle>Match preferences</CardTitle>
               <CardDescription>
-                The role you are aiming for (used for job matching).
+                Used to ground role, location, and pay fit.
               </CardDescription>
             </CardHeader>
             <CardContent className="flex flex-col gap-4">
@@ -185,16 +341,59 @@ export function ProfilePage() {
                   onChange={(e) => setTargetRole(e.target.value)}
                 />
               </div>
+              <div className="grid gap-2">
+                <Label htmlFor="preferred-locations">Preferred locations</Label>
+                <Input
+                  id="preferred-locations"
+                  type="text"
+                  placeholder="e.g. Denver, Remote US"
+                  disabled={profileLoading}
+                  value={preferredLocations}
+                  onChange={(e) => setPreferredLocations(e.target.value)}
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label>Work mode</Label>
+                <div className="flex flex-wrap gap-3">
+                  {WORK_MODE_OPTIONS.map((mode) => (
+                    <label
+                      key={mode}
+                      className="flex items-center gap-2 text-sm text-foreground"
+                    >
+                      <input
+                        type="checkbox"
+                        className="size-4 accent-primary"
+                        disabled={profileLoading}
+                        checked={preferredWorkModes.includes(mode)}
+                        onChange={() => toggleWorkMode(mode)}
+                      />
+                      {mode}
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="minimum-base-salary">Minimum base salary</Label>
+                <Input
+                  id="minimum-base-salary"
+                  type="text"
+                  inputMode="numeric"
+                  placeholder="e.g. 160000"
+                  disabled={profileLoading}
+                  value={minimumBaseSalary}
+                  onChange={(e) => setMinimumBaseSalary(e.target.value)}
+                />
+              </div>
             </CardContent>
             <CardFooter>
               <Button
                 type="button"
                 disabled={
-                  profileLoading || targetRoleSaving || !targetRoleChanged
+                  profileLoading || preferencesSaving || !preferencesChanged
                 }
-                onClick={() => void handleSaveTargetRole()}
+                onClick={() => void handleSavePreferences()}
               >
-                {targetRoleSaving ? "Saving…" : "Save target role"}
+                {preferencesSaving ? "Saving…" : "Save preferences"}
               </Button>
             </CardFooter>
           </Card>
@@ -207,30 +406,92 @@ export function ProfilePage() {
               </CardDescription>
             </CardHeader>
             <CardContent>
-              <div className="rounded-lg border border-dashed border-border bg-muted/30 px-4 py-8 text-center text-sm text-muted-foreground">
-                No resume on file — preview coming soon
-              </div>
+              {resumeLoading ? (
+                <div className="flex h-72 items-center justify-center rounded-lg border border-dashed border-border bg-muted/30 text-sm text-muted-foreground">
+                  Loading resume…
+                </div>
+              ) : resume?.has_resume && resume.signed_url ? (
+                <div className="space-y-3">
+                  <div
+                    role="button"
+                    tabIndex={0}
+                    className="group relative h-72 w-full overflow-hidden rounded-lg border border-border bg-muted/30 text-left"
+                    onClick={handleViewResume}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault()
+                        handleViewResume()
+                      }
+                    }}
+                    aria-label="Open uploaded resume"
+                  >
+                    <iframe
+                      title="Uploaded resume preview"
+                      src={`${resume.signed_url}#page=1&toolbar=0&navpanes=0&scrollbar=0`}
+                      className="pointer-events-none h-full w-full bg-white"
+                    />
+                    <span className="absolute inset-0 bg-transparent transition-colors group-hover:bg-background/10" />
+                  </div>
+                  <div className="flex items-center gap-3 text-sm">
+                    <FileText
+                      className="size-4 shrink-0 text-muted-foreground"
+                      aria-hidden="true"
+                    />
+                    <div className="min-w-0">
+                      <p className="truncate font-medium text-foreground">
+                        {resume.file_name ?? "resume.pdf"}
+                      </p>
+                      <p className="text-xs text-muted-foreground">
+                        {resumeUploadedAt
+                          ? `Uploaded ${resumeUploadedAt}`
+                          : "Uploaded resume on file"}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex h-72 flex-col items-center justify-center gap-3 rounded-lg border border-dashed border-border bg-muted/30 px-4 text-center text-sm text-muted-foreground">
+                  <FileText className="size-8" aria-hidden="true" />
+                  No resume on file
+                </div>
+              )}
+              <input
+                ref={resumeInputRef}
+                type="file"
+                accept="application/pdf"
+                className="hidden"
+                disabled={resumeMutationPending}
+                onChange={(e) => void handleResumeUpload(e)}
+              />
             </CardContent>
             <CardFooter className="flex flex-wrap gap-2">
               <Button
                 type="button"
                 variant="outline"
-                onClick={resumePlaceholder}
+                disabled={!resume?.has_resume || !resume.signed_url}
+                onClick={handleViewResume}
               >
+                <ExternalLink className="size-4" aria-hidden="true" />
                 View
               </Button>
               <Button
                 type="button"
                 variant="outline"
-                onClick={resumePlaceholder}
+                disabled={resumeUploading || resumeMutationPending}
+                onClick={() => resumeInputRef.current?.click()}
               >
-                Re-upload
+                <Upload className="size-4" aria-hidden="true" />
+                {resume?.has_resume ? "Re-upload" : "Upload"}
               </Button>
               <Button
                 type="button"
                 variant="destructive"
-                onClick={resumePlaceholder}
+                disabled={
+                  !resume?.has_resume || resumeDeleting || resumeMutationPending
+                }
+                onClick={() => void handleDeleteResume()}
               >
+                <Trash2 className="size-4" aria-hidden="true" />
                 Delete
               </Button>
             </CardFooter>
