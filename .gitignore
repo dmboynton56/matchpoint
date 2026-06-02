@@ -32,6 +32,7 @@ backend/app/services/__pycache__
 backend/*.pyc
 backend/app/db/__pycache__
 __pycache__/*.pyc
+__pycache__/
 
 # Sensitive environment variables
 .env
