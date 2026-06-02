@@ -30,6 +30,10 @@ import { useAuth } from "@/hooks/useAuth"
 
 const WORK_MODE_OPTIONS = ["Remote", "Hybrid", "On-site"]
 
+function sortWorkModes(modes: string[]): string[] {
+  return [...modes].sort()
+}
+
 function parseCommaList(value: string): string[] {
   return value
     .split(",")
@@ -57,6 +61,7 @@ export function ProfilePage() {
   const [resumeLoading, setResumeLoading] = useState(true)
   const [resumeUploading, setResumeUploading] = useState(false)
   const [resumeDeleting, setResumeDeleting] = useState(false)
+  const [resumeMutationPending, setResumeMutationPending] = useState(false)
 
   const refreshResume = useCallback(async (showLoading = true) => {
     if (showLoading) {
@@ -98,7 +103,7 @@ export function ProfilePage() {
         JSON.stringify({
           targetRole: preferences.target_role ?? "",
           preferredLocations: locations,
-          preferredWorkModes: preferences.preferred_work_modes,
+          preferredWorkModes: sortWorkModes(preferences.preferred_work_modes),
           minimumBaseSalary: salary,
         })
       )
@@ -147,7 +152,7 @@ export function ProfilePage() {
         JSON.stringify({
           targetRole: targetRole.trim(),
           preferredLocations: preferences.preferred_locations.join(", "),
-          preferredWorkModes,
+          preferredWorkModes: sortWorkModes(preferredWorkModes),
           minimumBaseSalary: salary,
         })
       )
@@ -204,6 +209,7 @@ export function ProfilePage() {
       return
     }
 
+    setResumeMutationPending(true)
     setResumeUploading(true)
     try {
       const response = await uploadResume(file)
@@ -216,10 +222,12 @@ export function ProfilePage() {
       toast.error(message, { position: "top-center" })
     } finally {
       setResumeUploading(false)
+      setResumeMutationPending(false)
     }
   }
 
   const handleDeleteResume = async () => {
+    setResumeMutationPending(true)
     setResumeDeleting(true)
     try {
       await deleteResume()
@@ -231,6 +239,7 @@ export function ProfilePage() {
       toast.error(message, { position: "top-center" })
     } finally {
       setResumeDeleting(false)
+      setResumeMutationPending(false)
     }
   }
 
@@ -241,7 +250,7 @@ export function ProfilePage() {
   const currentPreferenceKey = JSON.stringify({
     targetRole: targetRole.trim(),
     preferredLocations: parseCommaList(preferredLocations).join(", "),
-    preferredWorkModes,
+    preferredWorkModes: sortWorkModes(preferredWorkModes),
     minimumBaseSalary: minimumBaseSalary.trim(),
   })
   const preferencesChanged = currentPreferenceKey !== savedPreferenceKey
@@ -451,6 +460,7 @@ export function ProfilePage() {
                 type="file"
                 accept="application/pdf"
                 className="hidden"
+                disabled={resumeMutationPending}
                 onChange={(e) => void handleResumeUpload(e)}
               />
             </CardContent>
@@ -467,7 +477,7 @@ export function ProfilePage() {
               <Button
                 type="button"
                 variant="outline"
-                disabled={resumeUploading}
+                disabled={resumeUploading || resumeMutationPending}
                 onClick={() => resumeInputRef.current?.click()}
               >
                 <Upload className="size-4" aria-hidden="true" />
@@ -476,7 +486,9 @@ export function ProfilePage() {
               <Button
                 type="button"
                 variant="destructive"
-                disabled={!resume?.has_resume || resumeDeleting}
+                disabled={
+                  !resume?.has_resume || resumeDeleting || resumeMutationPending
+                }
                 onClick={() => void handleDeleteResume()}
               >
                 <Trash2 className="size-4" aria-hidden="true" />

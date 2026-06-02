@@ -100,10 +100,9 @@ def _build_user_message(
     return message
 
 
-def _reasoning_effort_for_model(model: str) -> str:
-    if model.startswith("gpt-5-nano") and SCORING_REASONING_EFFORT == "none":
-        return "minimal"
-    return SCORING_REASONING_EFFORT
+_SCORING_RETRY_CORRECTION = (
+    "The scoring request failed. Return a valid scoring response for every input job."
+)
 
 
 def _request_scores(
@@ -130,9 +129,7 @@ def _request_scores(
         ],
     }
     if SCORING_MODEL.startswith("gpt-5"):
-        request_params["reasoning_effort"] = _reasoning_effort_for_model(
-            SCORING_MODEL
-        )
+        request_params["reasoning_effort"] = SCORING_REASONING_EFFORT
     else:
         request_params["temperature"] = 0.2
 
@@ -195,12 +192,17 @@ def score_jobs_with_llm(
     correction: str | None = None
 
     for _ in range(4):
-        parsed = _request_scores(
-            resume_text,
-            jobs,
-            preferences=preferences,
-            correction=correction,
-        )
+        try:
+            parsed = _request_scores(
+                resume_text,
+                jobs,
+                preferences=preferences,
+                correction=correction,
+            )
+        except Exception as exc:
+            last_error = exc
+            correction = _SCORING_RETRY_CORRECTION
+            continue
         if parsed is None:
             last_error = ValueError("OpenAI scoring response was not parsed.")
             correction = "Return a valid scoring response for every input job."
@@ -216,12 +218,17 @@ def score_jobs_with_llm(
     for job in jobs:
         job_correction: str | None = None
         for _ in range(3):
-            parsed = _request_scores(
-                resume_text,
-                [job],
-                preferences=preferences,
-                correction=job_correction,
-            )
+            try:
+                parsed = _request_scores(
+                    resume_text,
+                    [job],
+                    preferences=preferences,
+                    correction=job_correction,
+                )
+            except Exception as exc:
+                last_error = exc
+                job_correction = "Return one valid score for the single input job."
+                continue
             if parsed is None:
                 last_error = ValueError("OpenAI scoring response was not parsed.")
                 job_correction = "Return one valid score for the single input job."

@@ -37,6 +37,14 @@ class JobFactsTests(unittest.TestCase):
     def test_salary_unknown_when_no_pay_evidence(self):
         self.assertIsNone(extract_salary_facts("This role has strong benefits."))
 
+    def test_product_designer_maps_to_design(self):
+        facts = extract_job_facts(
+            title="Product Designer",
+            location="Remote",
+            description="",
+        )
+        self.assertEqual(facts.role_family, "design")
+
 
 if __name__ == "__main__":
     unittest.main()

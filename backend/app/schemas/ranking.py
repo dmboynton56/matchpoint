@@ -75,7 +75,5 @@ def validate_scores(
         for note in score.match_notes:
             if not note.text.strip():
                 raise ValueError("Match notes cannot be blank.")
-            if len(note.text) > 150:
-                raise ValueError("Match notes must be 150 characters or fewer.")
 
     return response

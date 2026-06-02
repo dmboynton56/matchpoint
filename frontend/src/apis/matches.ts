@@ -1,3 +1,5 @@
+import type { MatchNote } from "@/types/job"
+
 import { apiFetch } from "./client"
 
 export interface Job {
@@ -13,10 +15,7 @@ export interface Job {
 export interface Match {
   match_id: string
   match_score: number
-  match_notes: Array<{
-    text: string
-    is_warning: boolean
-  }> | null
+  match_notes: MatchNote[] | null
   match_highlights: string[] | null
   match_concerns: string[] | null
   interview_likelihood: number | null

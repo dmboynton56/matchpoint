@@ -136,10 +136,14 @@ def extract_salary_facts(description_text: str) -> SalaryFacts | None:
     return None
 
 
+def _role_family_check_order() -> list[str]:
+    return [family for family in ROLE_FAMILIES if family != "product"] + ["product"]
+
+
 def infer_role_family(title: str) -> str | None:
     lowered = f" {title.lower()} "
-    for family, markers in ROLE_FAMILIES.items():
-        if any(marker in lowered for marker in markers):
+    for family in _role_family_check_order():
+        if any(marker in lowered for marker in ROLE_FAMILIES[family]):
             return family
     return None
 

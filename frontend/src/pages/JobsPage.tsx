@@ -14,10 +14,6 @@ type JobsPageLocationState = {
   jobs?: JobMatch[]
 }
 
-function sortByRank(jobs: JobMatch[]): JobMatch[] {
-  return [...jobs].sort((a, b) => (a.rank ?? 0) - (b.rank ?? 0))
-}
-
 function sortByMatchScore(jobs: JobMatch[]): JobMatch[] {
   return [...jobs].sort((a, b) => (b.match_score ?? 0) - (a.match_score ?? 0))
 }
@@ -56,7 +52,7 @@ export function JobsPage() {
   const { user, loading: authLoading } = useAuth()
   const state = location.state as JobsPageLocationState | null
   const stateJobs = useMemo(
-    () => (state?.jobs ? sortByRank(state.jobs) : []),
+    () => (state?.jobs ? sortByMatchScore(state.jobs) : []),
     [state]
   )
 

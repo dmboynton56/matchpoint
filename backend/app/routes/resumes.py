@@ -40,6 +40,14 @@ def _response_data(response, *, stage: str):
     return getattr(response, "data", None)
 
 
+def _is_missing_preference_columns_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return any(
+        phrase in message
+        for phrase in ("does not exist", "column", "schema", "unknown field")
+    )
+
+
 def fetch_user_preferences(user_id: str) -> UserPreferences:
     try:
         response = (
@@ -52,7 +60,10 @@ def fetch_user_preferences(user_id: str) -> UserPreferences:
             .maybe_single()
             .execute()
         )
-    except Exception:
+    except Exception as exc:
+        if not _is_missing_preference_columns_error(exc):
+            logger.exception("fetch_user_preferences failed")
+            raise
         response = (
             supabase.table("profiles")
             .select("target_role")
@@ -86,6 +97,15 @@ def build_match_query_text(resume_text: str, preferences: UserPreferences | None
         preference_lines.append(
             f"Preferred work modes: {', '.join(preferences.preferred_work_modes)}"
         )
+    amount = preferences.minimum_base_salary
+    currency = (preferences.salary_currency or "").strip()
+    if amount is not None or currency:
+        if amount is not None and currency:
+            preference_lines.append(f"Minimum base salary: {currency} {amount:,}")
+        elif amount is not None:
+            preference_lines.append(f"Minimum base salary: {amount:,}")
+        else:
+            preference_lines.append(f"Minimum base salary currency: {currency}")
 
     if not preference_lines:
         return resume_text
@@ -129,6 +149,48 @@ def fetch_full_jobs(job_ids: list[str]) -> dict[str, dict]:
     )
     jobs = _response_data(response, stage="fetch_full_jobs") or []
     return {str(job["id"]): job for job in jobs}
+
+
+def _job_match_payload(job: dict) -> dict:
+    return {
+        "job_id": job["id"],
+        "match_score": job["match_score"],
+        "match_notes": job["match_notes"],
+        "match_highlights": job["match_highlights"],
+        "match_concerns": job["match_concerns"],
+        "interview_likelihood": job["interview_likelihood"],
+        "skills_fit": job["skills_fit"],
+        "experience_fit": job["experience_fit"],
+        "seniority_fit": job["seniority_fit"],
+        "location_fit": job["location_fit"],
+        "pay_fit": job["pay_fit"],
+        "role_fit": job["role_fit"],
+        "preference_fit": job["preference_fit"],
+        "location_reason": job["location_reason"],
+        "location_evidence": job["location_evidence"],
+        "pay_reason": job["pay_reason"],
+        "pay_evidence": job["pay_evidence"],
+        "role_reason": job["role_reason"],
+        "role_evidence": job["role_evidence"],
+        "job_facts": job["job_facts"],
+        "is_viewed": False,
+        "is_favorited": False,
+    }
+
+
+def _persist_job_matches(user_id: str, jobs: list[dict]) -> None:
+    payload = [_job_match_payload(job) for job in jobs]
+    try:
+        supabase.rpc(
+            "replace_job_matches",
+            {"p_user_id": user_id, "p_matches": payload},
+        ).execute()
+    except Exception:
+        logger.exception("Failed to persist job matches for user %s", user_id)
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error persisting job matches",
+        )
 
 
 def _log_upload_stage(stage: str, started_at: float) -> float:
@@ -313,38 +375,7 @@ async def handle_authenticated_upload(
     )
     started_at = _log_upload_stage("job_scoring", started_at)
 
-    supabase.table("job_matches").delete().eq("user_id", user_id).execute()
-    if jobs:
-        supabase.table("job_matches").insert(
-            [
-                {
-                    "user_id": user_id,
-                    "job_id": job["id"],
-                    "match_score": job["match_score"],
-                    "match_notes": job["match_notes"],
-                    "match_highlights": job["match_highlights"],
-                    "match_concerns": job["match_concerns"],
-                    "interview_likelihood": job["interview_likelihood"],
-                    "skills_fit": job["skills_fit"],
-                    "experience_fit": job["experience_fit"],
-                    "seniority_fit": job["seniority_fit"],
-                    "location_fit": job["location_fit"],
-                    "pay_fit": job["pay_fit"],
-                    "role_fit": job["role_fit"],
-                    "preference_fit": job["preference_fit"],
-                    "location_reason": job["location_reason"],
-                    "location_evidence": job["location_evidence"],
-                    "pay_reason": job["pay_reason"],
-                    "pay_evidence": job["pay_evidence"],
-                    "role_reason": job["role_reason"],
-                    "role_evidence": job["role_evidence"],
-                    "job_facts": job["job_facts"],
-                    "is_viewed": False,
-                    "is_favorited": False,
-                }
-                for job in jobs
-            ]
-        ).execute()
+    _persist_job_matches(user_id, jobs)
     _log_upload_stage("persist_job_matches", started_at)
 
     return {
@@ -391,7 +422,8 @@ async def upload_and_parse_resume(
     except Exception as e:
         logger.exception("Resume processing failed")
         raise HTTPException(
-            status_code=500, detail=f"Resume processing failed: {str(e)}"
+            status_code=500,
+            detail="Internal server error processing resume",
         ) from e
 
 
@@ -443,7 +475,8 @@ async def get_resume(
     except Exception as e:
         logger.exception("Failed to fetch resume metadata")
         raise HTTPException(
-            status_code=500, detail=f"Failed to fetch resume: {str(e)}"
+            status_code=500,
+            detail="Internal server error fetching resume",
         ) from e
 
 
@@ -460,6 +493,7 @@ async def delete_resume(
         supabase.table("profiles").update(
             {
                 "resume_text": None,
+                "resume_embedding": None,
             }
         ).eq("id", user_id).execute()
 
@@ -469,6 +503,8 @@ async def delete_resume(
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("Failed to delete resume")
         raise HTTPException(
-            status_code=500, detail=f"Failed to delete resume: {str(e)}"
+            status_code=500,
+            detail="Internal server error deleting resume",
         ) from e
