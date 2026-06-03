@@ -7,6 +7,7 @@ import App from "./App.tsx"
 import { ThemeProvider } from "@/components/theme-provider.tsx"
 import { Toaster } from "@/components/ui/sonner"
 import { AuthProvider } from "@/context/AuthContext"
+import Footer from "@/components/Footer"
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
@@ -14,6 +15,7 @@ createRoot(document.getElementById("root")!).render(
       <ThemeProvider>
         <AuthProvider>
           <App />
+          <Footer />
           <Toaster richColors closeButton />
         </AuthProvider>
       </ThemeProvider>
