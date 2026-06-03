@@ -7,6 +7,7 @@ import { JobApplyFollowUpDrawer } from "@/components/jobs/JobApplyFollowUpDrawer
 import { JobListingCard } from "@/components/jobs/JobListingCard"
 import { AppShell } from "@/components/layout/AppShell"
 import { RouteLoading } from "@/components/routing/RouteLoading"
+import { SignupLoginDialog } from "@/components/user/SignupLoginCard"
 import UploadDropzone from "@/components/user/UploadDropzone"
 import { useAuth } from "@/hooks/useAuth"
 import type { JobMatch } from "@/types/job"
@@ -62,6 +63,7 @@ export function JobsPage() {
   const [applyFollowUpJob, setApplyFollowUpJob] = useState<JobMatch | null>(
     null
   )
+  const [signupOpen, setSignupOpen] = useState(false)
 
   useEffect(() => {
     if (authLoading) return
@@ -127,9 +129,7 @@ export function JobsPage() {
               <li key={job.id}>
                 <JobListingCard
                   job={job}
-                  onApplyClick={
-                    user ? (selected) => setApplyFollowUpJob(selected) : undefined
-                  }
+                  onApplyClick={(selected) => setApplyFollowUpJob(selected)}
                 />
               </li>
             ))}
@@ -147,10 +147,14 @@ export function JobsPage() {
       <JobApplyFollowUpDrawer
         job={applyFollowUpJob}
         open={applyFollowUpJob != null}
+        isAuthenticated={!!user}
+        onSignUpClick={() => setSignupOpen(true)}
         onOpenChange={(open) => {
           if (!open) setApplyFollowUpJob(null)
         }}
       />
+
+      <SignupLoginDialog open={signupOpen} onOpenChange={setSignupOpen} />
     </AppShell>
   )
 }

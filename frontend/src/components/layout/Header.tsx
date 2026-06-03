@@ -1,14 +1,7 @@
 import { Button } from "@/components/ui/button"
 import { AccountNav } from "@/components/layout/AccountNav"
-import SignupLoginCard from "@/components/user/SignupLoginCard"
+import { SignupLoginDialog } from "@/components/user/SignupLoginCard"
 import { useAuth } from "@/hooks/useAuth"
-import {
-  Dialog,
-  DialogContent,
-  DialogTitle,
-  DialogDescription,
-  DialogTrigger,
-} from "../ui/dialog"
 import { SiteLogo } from "./SiteLogo"
 
 const Header = () => {
@@ -22,22 +15,13 @@ const Header = () => {
       ) : user ? (
         <AccountNav />
       ) : (
-        <Dialog>
-          <DialogTrigger asChild>
+        <SignupLoginDialog
+          trigger={
             <Button variant="outline" size="xl">
               Sign up or Login
             </Button>
-          </DialogTrigger>
-          <DialogContent>
-            <DialogTitle className="sr-only">
-              Sign in or create an account
-            </DialogTitle>
-            <DialogDescription className="sr-only">
-              Use email, password, or Google to sign in or sign up.
-            </DialogDescription>
-            <SignupLoginCard />
-          </DialogContent>
-        </Dialog>
+          }
+        />
       )}
     </header>
   )
