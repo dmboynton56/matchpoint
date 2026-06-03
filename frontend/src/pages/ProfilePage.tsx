@@ -15,7 +15,19 @@ import {
   updateProfilePreferences,
 } from "@/auth/supabaseAuth"
 import { AppShell } from "@/components/layout/AppShell"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog"
 import { Button } from "@/components/ui/button"
+import { Checkbox } from "@/components/ui/checkbox"
 import {
   Card,
   CardContent,
@@ -265,7 +277,7 @@ export function ProfilePage() {
 
   return (
     <AppShell>
-      <div className="space-y-8">
+      <div className="mx-auto w-full max-w-5xl space-y-8">
         <section className="space-y-2">
           <p className="text-xs font-semibold tracking-[0.22em] text-primary uppercase">
             Account
@@ -278,8 +290,8 @@ export function ProfilePage() {
           </p>
         </section>
 
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <Card>
+        <div className="flex flex-col items-center gap-6">
+          <Card className="h-fit min-w-100 md:min-w-150 lg:min-w-200">
             <CardHeader>
               <CardTitle>Email</CardTitle>
               <CardDescription>
@@ -315,14 +327,23 @@ export function ProfilePage() {
                 </div>
               </CardContent>
               <CardFooter>
-                <Button type="submit" disabled={emailSaving}>
+                <Button
+                  type="submit"
+                  disabled={
+                    emailSaving ||
+                    !newEmail ||
+                    !emailPassword ||
+                    newEmail === user.email
+                  }
+                  className="w-full md:w-auto"
+                >
                   {emailSaving ? "Saving…" : "Update email"}
                 </Button>
               </CardFooter>
             </form>
           </Card>
 
-          <Card className="h-fit">
+          <Card className="h-fit min-w-100 md:min-w-150 lg:min-w-200">
             <CardHeader>
               <CardTitle>Match preferences</CardTitle>
               <CardDescription>
@@ -360,12 +381,10 @@ export function ProfilePage() {
                       key={mode}
                       className="flex items-center gap-2 text-sm text-foreground"
                     >
-                      <input
-                        type="checkbox"
-                        className="size-4 accent-primary"
+                      <Checkbox
                         disabled={profileLoading}
                         checked={preferredWorkModes.includes(mode)}
-                        onChange={() => toggleWorkMode(mode)}
+                        onCheckedChange={() => toggleWorkMode(mode)}
                       />
                       {mode}
                     </label>
@@ -398,7 +417,7 @@ export function ProfilePage() {
             </CardFooter>
           </Card>
 
-          <Card>
+          <Card className="h-fit min-w-100 md:min-w-150 lg:min-w-200">
             <CardHeader>
               <CardTitle>Resume</CardTitle>
               <CardDescription>
@@ -483,17 +502,41 @@ export function ProfilePage() {
                 <Upload className="size-4" aria-hidden="true" />
                 {resume?.has_resume ? "Re-upload" : "Upload"}
               </Button>
-              <Button
-                type="button"
-                variant="destructive"
-                disabled={
-                  !resume?.has_resume || resumeDeleting || resumeMutationPending
-                }
-                onClick={() => void handleDeleteResume()}
-              >
-                <Trash2 className="size-4" aria-hidden="true" />
-                Delete
-              </Button>
+              <AlertDialog>
+                <AlertDialogTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="destructive"
+                    disabled={
+                      !resume?.has_resume ||
+                      resumeDeleting ||
+                      resumeMutationPending
+                    }
+                  >
+                    <Trash2 className="size-4" aria-hidden="true" />
+                    Delete
+                  </Button>
+                </AlertDialogTrigger>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>Delete resume?</AlertDialogTitle>
+                    <AlertDialogDescription>
+                      This removes your uploaded resume from your profile. You
+                      can upload a new one anytime.
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel>Cancel</AlertDialogCancel>
+                    <AlertDialogAction
+                      variant="destructive"
+                      disabled={resumeDeleting || resumeMutationPending}
+                      onClick={() => void handleDeleteResume()}
+                    >
+                      Confirm
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
             </CardFooter>
           </Card>
         </div>
