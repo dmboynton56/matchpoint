@@ -1,6 +1,11 @@
 import { useTheme } from "@/components/theme-provider"
+import { cn } from "@/lib/utils"
 import { Toaster as Sonner, type ToasterProps } from "sonner"
 import { CircleCheckIcon, InfoIcon, TriangleAlertIcon, OctagonXIcon, Loader2Icon } from "lucide-react"
+
+function LoadingIcon({ className }: { className?: string }) {
+  return <Loader2Icon className={cn("size-4 animate-spin", className)} />
+}
 
 const Toaster = ({ ...props }: ToasterProps) => {
   const { theme = "system" } = useTheme()
@@ -22,9 +27,7 @@ const Toaster = ({ ...props }: ToasterProps) => {
         error: (
           <OctagonXIcon className="size-4" />
         ),
-        loading: (
-          <Loader2Icon className="size-4 animate-spin" />
-        ),
+        loading: <LoadingIcon />,
       }}
       style={
         {
@@ -44,4 +47,4 @@ const Toaster = ({ ...props }: ToasterProps) => {
   )
 }
 
-export { Toaster }
+export { Toaster, LoadingIcon }
