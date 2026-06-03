@@ -22,6 +22,35 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useNavigate } from "react-router-dom"
 
+const GoogleGIcon = (props: React.SVGProps<SVGSVGElement>) => (
+  <svg
+    viewBox="0 0 48 48"
+    width="18"
+    height="18"
+    aria-hidden="true"
+    focusable="false"
+    {...props}
+  >
+    <path
+      fill="#EA4335"
+      d="M24 9.5c3.15 0 5.78 1.09 7.93 2.9l5.81-5.81C34.18 3.1 29.53 1 24 1 14.62 1 6.51 6.38 2.56 14.22l6.76 5.25C11.12 13.54 17.04 9.5 24 9.5z"
+    />
+    <path
+      fill="#4285F4"
+      d="M46.5 24.5c0-1.62-.15-3.17-.42-4.67H24v8.84h12.6c-.54 2.9-2.19 5.36-4.67 7.02l7.16 5.55C43.25 37.4 46.5 31.54 46.5 24.5z"
+    />
+    <path
+      fill="#FBBC05"
+      d="M9.32 28.53A14.45 14.45 0 0 1 8.5 24c0-1.58.27-3.1.82-4.53l-6.76-5.25A23 23 0 0 0 1 24c0 3.7.88 7.2 2.56 10.28l6.76-5.25z"
+    />
+    <path
+      fill="#34A853"
+      d="M24 47c5.53 0 10.18-1.83 13.59-4.96l-7.16-5.55c-1.98 1.33-4.5 2.11-6.43 2.11-6.96 0-12.88-4.04-14.68-9.97l-6.76 5.25C6.51 41.62 14.62 47 24 47z"
+    />
+    <path fill="none" d="M0 0h48v48H0z" />
+  </svg>
+)
+
 const SignupLoginCard = () => {
   const navigate = useNavigate()
 
@@ -189,18 +218,14 @@ const SignupLoginCard = () => {
           {isSubmitting ? "Connecting…" : "Submit"}
         </Button>
         <Button
+          type="button"
           variant="outline"
-          className="w-full text-xs"
-          // disabled={isSubmitting}
-          disabled
+          className="w-full bg-white! text-black ring-0! hover:bg-white/80! hover:text-black"
+          disabled={isSubmitting}
           onClick={handleGoogleSignIn}
         >
-          {/* {isSubmitting
-            ? "Connecting…"
-            : isLogin
-              ? "Login with Google"
-              : "Sign up with Google"} */}
-          Google Sign-in/Up (not available)
+          <GoogleGIcon />
+          {isSubmitting ? "Connecting…" : "Login with Google"}
         </Button>
       </CardFooter>
     </Card>

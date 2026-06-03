@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from app.db.database import supabase
 from app.routes.auth import get_current_user
+from app.services.cleaning import resolve_job_location
 
 router = APIRouter()
 
@@ -9,7 +10,11 @@ def _get_user_matches(user_id: str, viewed: bool | None, favorited: bool | None)
         supabase.table("job_matches")
         .select(
             "id, match_score, is_viewed, is_favorited, created_at, "
-            "match_highlights, "
+            "match_notes, match_highlights, match_concerns, interview_likelihood, "
+            "skills_fit, experience_fit, seniority_fit, location_fit, "
+            "pay_fit, role_fit, preference_fit, location_reason, "
+            "location_evidence, pay_reason, pay_evidence, role_reason, "
+            "role_evidence, job_facts, "
             "jobs(id, title, company, location, apply_url, description, posted_at)"
         )
         .eq("user_id", user_id)
@@ -30,7 +35,24 @@ def _format_match(match: dict) -> dict:
     return {
         "match_id": match["id"],
         "match_score": match["match_score"],
+        "match_notes": match.get("match_notes"),
         "match_highlights": match.get("match_highlights"),
+        "match_concerns": match.get("match_concerns"),
+        "interview_likelihood": match.get("interview_likelihood"),
+        "skills_fit": match.get("skills_fit"),
+        "experience_fit": match.get("experience_fit"),
+        "seniority_fit": match.get("seniority_fit"),
+        "location_fit": match.get("location_fit"),
+        "pay_fit": match.get("pay_fit"),
+        "role_fit": match.get("role_fit"),
+        "preference_fit": match.get("preference_fit"),
+        "location_reason": match.get("location_reason"),
+        "location_evidence": match.get("location_evidence"),
+        "pay_reason": match.get("pay_reason"),
+        "pay_evidence": match.get("pay_evidence"),
+        "role_reason": match.get("role_reason"),
+        "role_evidence": match.get("role_evidence"),
+        "job_facts": match.get("job_facts"),
         "is_viewed": match["is_viewed"],
         "is_favorited": match["is_favorited"],
         "matched_at": match["created_at"],
@@ -38,7 +60,10 @@ def _format_match(match: dict) -> dict:
             "id": job.get("id"),
             "title": job.get("title"),
             "company": job.get("company"),
-            "location": job.get("location"),
+            "location": resolve_job_location(
+                job.get("location") or "",
+                job.get("description") or "",
+            ),
             "apply_url": job.get("apply_url"),
             "description": job.get("description"),
             "posted_at": job.get("posted_at"),

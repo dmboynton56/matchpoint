@@ -1,6 +1,29 @@
 from pydantic import BaseModel, Field
 
 
+class SalaryFacts(BaseModel):
+    minimum: int | None = Field(default=None, ge=0)
+    maximum: int | None = Field(default=None, ge=0)
+    currency: str | None = None
+    period: str | None = None
+    evidence: str | None = Field(default=None, max_length=240)
+
+
+class JobFacts(BaseModel):
+    work_modes: list[str] = Field(default_factory=list, max_length=4)
+    locations: list[str] = Field(default_factory=list, max_length=12)
+    salary: SalaryFacts | None = None
+    role_family: str | None = Field(default=None, max_length=80)
+
+
+class UserPreferences(BaseModel):
+    target_role: str | None = Field(default=None, max_length=160)
+    preferred_locations: list[str] = Field(default_factory=list, max_length=8)
+    preferred_work_modes: list[str] = Field(default_factory=list, max_length=4)
+    minimum_base_salary: int | None = Field(default=None, ge=0)
+    salary_currency: str = Field(default="USD", max_length=8)
+
+
 class JobRankInput(BaseModel):
     job_id: str
     title: str
@@ -8,46 +31,49 @@ class JobRankInput(BaseModel):
     location: str | None = None
     description: str = Field(max_length=4000)
     vector_similarity: float
+    facts: JobFacts | None = None
 
 
-class JobRanking(BaseModel):
+class MatchNote(BaseModel):
+    text: str = Field(max_length=150)
+    is_warning: bool = False
+
+
+class JobScore(BaseModel):
     job_id: str
-    rank: int = Field(ge=1)
-    match_score: float = Field(ge=0, le=1)
-    match_highlights: list[str] = Field(min_length=2, max_length=3)
+    interview_likelihood: float = Field(ge=0, le=1)
+    skills_fit: float = Field(ge=0, le=1)
+    experience_fit: float = Field(ge=0, le=1)
+    seniority_fit: float = Field(ge=0, le=1)
+    location_fit: float = Field(ge=0, le=1)
+    pay_fit: float = Field(ge=0, le=1)
+    role_fit: float = Field(ge=0, le=1)
+    preference_fit: float = Field(ge=0, le=1)
+    match_notes: list[MatchNote] = Field(min_length=3, max_length=3)
 
 
-class RankingResponse(BaseModel):
-    rankings: list[JobRanking]
+class ScoringResponse(BaseModel):
+    scores: list[JobScore]
 
 
-def validate_rankings(
-    response: RankingResponse, input_jobs: list[JobRankInput]
-) -> RankingResponse:
+def validate_scores(
+    response: ScoringResponse, input_jobs: list[JobRankInput]
+) -> ScoringResponse:
     expected_ids = {job.job_id for job in input_jobs}
-    actual_ids = {ranking.job_id for ranking in response.rankings}
+    actual_ids = {score.job_id for score in response.scores}
+    if len(response.scores) != len(input_jobs) or len(actual_ids) != len(response.scores):
+        raise ValueError("Scoring response must include each input job exactly once.")
+
     if actual_ids != expected_ids:
         missing = sorted(expected_ids - actual_ids)
         extra = sorted(actual_ids - expected_ids)
         raise ValueError(
-            f"Ranking IDs must match input jobs. Missing: {missing}. Extra: {extra}."
+            f"Scored job IDs must match input jobs. Missing: {missing}. Extra: {extra}."
         )
 
-    expected_ranks = list(range(1, len(input_jobs) + 1))
-    rankings_by_rank = sorted(response.rankings, key=lambda ranking: ranking.rank)
-    actual_ranks = [ranking.rank for ranking in rankings_by_rank]
-    if actual_ranks != expected_ranks:
-        raise ValueError(
-            f"Ranks must be unique and cover 1-{len(input_jobs)}. Got: {actual_ranks}."
-        )
+    for score in response.scores:
+        for note in score.match_notes:
+            if not note.text.strip():
+                raise ValueError("Match notes cannot be blank.")
 
-    for previous, current in zip(rankings_by_rank, rankings_by_rank[1:]):
-        if previous.match_score <= current.match_score:
-            raise ValueError("Scores must strictly decrease by rank.")
-
-    for ranking in rankings_by_rank:
-        for highlight in ranking.match_highlights:
-            if len(highlight) > 120:
-                raise ValueError("Match highlights must be 120 characters or fewer.")
-
-    return RankingResponse(rankings=rankings_by_rank)
+    return response
