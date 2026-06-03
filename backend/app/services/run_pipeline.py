@@ -61,23 +61,32 @@ def fetch_existing_ids(supabase: Client) -> set[str]:
 
 
 def purge_stale_jobs(supabase: Client):
-    # Delete any job whose created_at is older than STALE_AFTER_DAYS
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=STALE_AFTER_DAYS)).isoformat()
+    cutoff = (
+        datetime.now(timezone.utc)
+        - timedelta(days=STALE_AFTER_DAYS)
+    ).isoformat()
+
     try:
         result = (
             supabase.table("jobs")
             .delete()
-            .lt("created_at", cutoff)
+            .lt("last_seen_at", cutoff)
             .execute()
         )
+
         deleted = len(result.data) if result.data else 0
-        print(f"Purged {deleted} jobs older than {STALE_AFTER_DAYS} days")
+        print(
+            f"Purged {deleted} jobs older than "
+            f"{STALE_AFTER_DAYS} days"
+        )
     except Exception as e:
         print(f"Purge failed: {e}")
+        raise
 
 
 def run_pipeline():
     start = time.perf_counter()
+    now = datetime.now(timezone.utc).isoformat()
 
     print("=== STEP 1: Scraping ===")
     jobs = scrape_all()
@@ -97,15 +106,14 @@ def run_pipeline():
     skipped = len(existing_jobs)
     print(f"  Skipping {skipped} duplicates — {len(new_jobs)} new jobs to process")
  
-    # Refresh created_at for jobs still live at the endpoint so they don't get purged
+    # Refresh last_seen_at for jobs still live at the endpoint so they don't get purged
     if existing_jobs:
-        now = datetime.now(timezone.utc).isoformat()
         for batch in chunk(existing_jobs, BATCH_SIZE):
             ids = [j["external_id"] for j in batch]
             supabase.table("jobs").update(
-                {"created_at": now}
+                {"last_seen_at": now}
             ).in_("external_id", ids).execute()
-        print(f"  Refreshed created_at for {len(existing_jobs)} existing jobs")
+        print(f"  Refreshed last_seen_at for {len(existing_jobs)} existing jobs")
  
     if not new_jobs:
         print("No new jobs to insert — running purge and exiting.")
@@ -114,8 +122,10 @@ def run_pipeline():
 
 
     print("\n=== STEP 3: Building embedding texts ===")
+
     for job in new_jobs:
         job["description"] = buildCleanedText(job)
+        job["last_seen_at"] = now
 
     embedding_texts = [job["description"] for job in new_jobs]
 
@@ -145,6 +155,7 @@ def run_pipeline():
             total_inserted += len(batch)
         except Exception as e:
             print(f"Batch {i + 1} failed: {e}")
+            raise
 
     print("\n=== STEP 6: Purging stale jobs ===")
     purge_stale_jobs(supabase)

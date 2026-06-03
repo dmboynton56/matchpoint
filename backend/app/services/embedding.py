@@ -39,7 +39,7 @@ def generate_embeddings_batch(texts: list[str]) -> list[list[float]]:
     if not all(texts):
         raise ValueError("One or more texts for batch embedding are empty")
 
-    response = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
+    response = client.embeddings.create(model="text-embedding-3-small", input=texts)
 
     if not response.data:
         raise RuntimeError("OpenAI batch embedding response returned no data")
