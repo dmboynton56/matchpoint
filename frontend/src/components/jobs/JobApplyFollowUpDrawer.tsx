@@ -56,7 +56,7 @@ export function JobApplyFollowUpDrawer({
                 close()
               }}
             >
-              Mark as applied?
+              Mark as applied
             </Button>
             <Button
               type="button"
@@ -67,7 +67,7 @@ export function JobApplyFollowUpDrawer({
                 close()
               }}
             >
-              Mark as favorite?
+              Mark as favorite
             </Button>
             <DrawerClose asChild>
               <Button
@@ -87,7 +87,7 @@ export function JobApplyFollowUpDrawer({
                 close()
               }}
             >
-              Delete this job?
+              Delete this job
             </Button>
           </DrawerFooter>
         ) : (
@@ -100,10 +100,14 @@ export function JobApplyFollowUpDrawer({
                 onSignUpClick()
               }}
             >
-              Sign up?
+              Sign up
             </Button>
             <DrawerClose asChild>
-              <Button type="button" variant="outline" className="w-full max-w-56">
+              <Button
+                type="button"
+                variant="outline"
+                className="w-full max-w-56"
+              >
                 Cancel
               </Button>
             </DrawerClose>

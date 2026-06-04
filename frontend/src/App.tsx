@@ -4,6 +4,8 @@ import { Route, Routes } from "react-router-dom"
 import { ProtectedRoute } from "@/components/auth/ProtectedRoute"
 import { RouteLoading } from "@/components/routing/RouteLoading"
 import { LandingPage } from "@/pages/LandingPage"
+import { NotFoundPage } from "@/pages/NotFoundPage"
+import Footer from "@/components/Footer"
 
 const JobsPage = lazy(() =>
   import("@/pages/JobsPage").then((m) => ({ default: m.JobsPage }))
@@ -27,7 +29,9 @@ export function App() {
             </ProtectedRoute>
           }
         />
+        <Route path="*" element={<NotFoundPage />} />
       </Routes>
+      <Footer />
     </Suspense>
   )
 }
