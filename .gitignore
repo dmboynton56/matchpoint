@@ -42,6 +42,7 @@ frontend/.env
 # Personal documents
 Drew Boynton Resume March 2026.pdf
 PREFERENCES-PLAN.md
+.cursor/
 
 # Supabase
 .temp/

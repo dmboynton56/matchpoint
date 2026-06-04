@@ -1,12 +1,20 @@
 import { useEffect, useMemo, useState } from "react"
-import { useLocation } from "react-router-dom"
+import { Link, useLocation } from "react-router-dom"
+import { InfoIcon } from "lucide-react"
 import { toast } from "sonner"
 
 import { getMyMatches, type Match } from "@/apis/matches"
+import {
+  getProfilePreferences,
+  type ProfilePreferences,
+} from "@/auth/supabaseAuth"
 import { JobApplyFollowUpDrawer } from "@/components/jobs/JobApplyFollowUpDrawer"
 import { JobListingCard } from "@/components/jobs/JobListingCard"
 import { AppShell } from "@/components/layout/AppShell"
 import { RouteLoading } from "@/components/routing/RouteLoading"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import { Button } from "@/components/ui/button"
+import { getMissingProfilePreferenceLabels } from "@/lib/profilePreferences"
 import { SignupLoginDialog } from "@/components/user/SignupLoginCard"
 import UploadDropzone from "@/components/user/UploadDropzone"
 import { useAuth } from "@/hooks/useAuth"
@@ -64,6 +72,36 @@ export function JobsPage() {
     null
   )
   const [signupOpen, setSignupOpen] = useState(false)
+  const [profilePreferences, setProfilePreferences] =
+    useState<ProfilePreferences | null>(null)
+  const [profilePreferencesLoading, setProfilePreferencesLoading] =
+    useState(false)
+
+  useEffect(() => {
+    if (authLoading || !user) return
+
+    let cancelled = false
+
+    void Promise.resolve()
+      .then(() => {
+        if (!cancelled) setProfilePreferencesLoading(true)
+        return getProfilePreferences(user.id)
+      })
+      .then((result) => {
+        if (cancelled) return
+        if (result.ok) {
+          setProfilePreferences(result.data)
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setProfilePreferencesLoading(false)
+      })
+
+    return () => {
+      cancelled = true
+      setProfilePreferences(null)
+    }
+  }, [user, authLoading])
 
   useEffect(() => {
     if (authLoading) return
@@ -103,6 +141,11 @@ export function JobsPage() {
 
   const displayedJobs = user ? jobs : stateJobs
   const hasMatches = displayedJobs.length > 0
+  const missingPreferenceLabels = profilePreferences
+    ? getMissingProfilePreferenceLabels(profilePreferences)
+    : []
+  const showProfilePreferencesAlert =
+    !!user && !profilePreferencesLoading && missingPreferenceLabels.length > 0
 
   return (
     <AppShell>
@@ -122,6 +165,25 @@ export function JobsPage() {
               : "Upload your resume below to see personalized job matches."}
           </p>
         </section>
+
+        {showProfilePreferencesAlert ? (
+          <Alert className="bg-black/35 py-4">
+            <InfoIcon className="mr-4 size-8 fill-yellow-500" />
+            <AlertTitle>Improve your matches</AlertTitle>
+            <AlertDescription className="flex flex-col gap-2">
+              Add the following on your profile so we can rank jobs more
+              accurately against your goals:
+              <ul className="list-inside list-disc">
+                {missingPreferenceLabels.map((label) => (
+                  <li key={label}>{label}</li>
+                ))}
+              </ul>
+              <Button asChild className="w-fit min-w-48">
+                <Link to="/profile">Complete profile</Link>
+              </Button>
+            </AlertDescription>
+          </Alert>
+        ) : null}
 
         {hasMatches ? (
           <ul className="space-y-3">
