@@ -28,6 +28,8 @@ type JobListingCardProps = {
   showHighlights?: boolean
   /** Show apply link when `job.apply_url` is set. */
   showApplyLink?: boolean
+  /** Opens apply URL in a new tab, then runs follow-up (e.g. post-apply drawer). */
+  onApplyClick?: (job: JobListing) => void
   /** Optional marketing tags (preview only; not from API). */
   showTags?: boolean
   className?: string
@@ -110,6 +112,7 @@ export function JobListingCard({
   showMatchScore = true,
   showHighlights = true,
   showApplyLink = true,
+  onApplyClick,
   showTags = false,
   className,
 }: JobListingCardProps) {
@@ -174,17 +177,37 @@ export function JobListingCard({
 
       {showApply ? (
         <div className="mt-3 flex justify-end border-t border-border/60 pt-2.5">
-          <Button
-            asChild
-            variant="outline"
-            size="sm"
-            className="h-8 gap-1.5 text-xs font-medium"
-          >
-            <a href={job.apply_url} target="_blank" rel="noopener noreferrer">
+          {onApplyClick ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-8 gap-1.5 text-xs font-medium"
+              onClick={() => {
+                window.open(job.apply_url!, "_blank", "noopener,noreferrer")
+                onApplyClick(job)
+              }}
+            >
               Apply
               <ExternalLink className="size-3.5" aria-hidden="true" />
-            </a>
-          </Button>
+            </Button>
+          ) : (
+            <Button
+              asChild
+              variant="outline"
+              size="sm"
+              className="h-8 gap-1.5 text-xs font-medium"
+            >
+              <a
+                href={job.apply_url}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Apply
+                <ExternalLink className="size-3.5" aria-hidden="true" />
+              </a>
+            </Button>
+          )}
         </div>
       ) : null}
     </article>

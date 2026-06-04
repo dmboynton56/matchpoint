@@ -3,9 +3,11 @@ import { useLocation } from "react-router-dom"
 import { toast } from "sonner"
 
 import { getMyMatches, type Match } from "@/apis/matches"
+import { JobApplyFollowUpDrawer } from "@/components/jobs/JobApplyFollowUpDrawer"
 import { JobListingCard } from "@/components/jobs/JobListingCard"
 import { AppShell } from "@/components/layout/AppShell"
 import { RouteLoading } from "@/components/routing/RouteLoading"
+import { SignupLoginDialog } from "@/components/user/SignupLoginCard"
 import UploadDropzone from "@/components/user/UploadDropzone"
 import { useAuth } from "@/hooks/useAuth"
 import type { JobMatch } from "@/types/job"
@@ -58,6 +60,10 @@ export function JobsPage() {
 
   const [jobs, setJobs] = useState<JobMatch[]>(stateJobs)
   const [matchesLoading, setMatchesLoading] = useState(false)
+  const [applyFollowUpJob, setApplyFollowUpJob] = useState<JobMatch | null>(
+    null
+  )
+  const [signupOpen, setSignupOpen] = useState(false)
 
   useEffect(() => {
     if (authLoading) return
@@ -121,7 +127,10 @@ export function JobsPage() {
           <ul className="space-y-3">
             {displayedJobs.map((job) => (
               <li key={job.id}>
-                <JobListingCard job={job} />
+                <JobListingCard
+                  job={job}
+                  onApplyClick={(selected) => setApplyFollowUpJob(selected)}
+                />
               </li>
             ))}
           </ul>
@@ -134,6 +143,18 @@ export function JobsPage() {
           </div>
         )}
       </div>
+
+      <JobApplyFollowUpDrawer
+        job={applyFollowUpJob}
+        open={applyFollowUpJob != null}
+        isAuthenticated={!!user}
+        onSignUpClick={() => setSignupOpen(true)}
+        onOpenChange={(open) => {
+          if (!open) setApplyFollowUpJob(null)
+        }}
+      />
+
+      <SignupLoginDialog open={signupOpen} onOpenChange={setSignupOpen} />
     </AppShell>
   )
 }

@@ -10,6 +10,13 @@ import {
 } from "@/auth/supabaseAuth"
 import { Button } from "@/components/ui/button"
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog"
+import {
   Card,
   CardAction,
   CardContent,
@@ -229,6 +236,31 @@ const SignupLoginCard = () => {
         </Button>
       </CardFooter>
     </Card>
+  )
+}
+
+type SignupLoginDialogProps = {
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
+  trigger?: React.ReactNode
+}
+
+export function SignupLoginDialog({
+  open,
+  onOpenChange,
+  trigger,
+}: SignupLoginDialogProps) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      {trigger ? <DialogTrigger asChild>{trigger}</DialogTrigger> : null}
+      <DialogContent>
+        <DialogTitle className="sr-only">Sign in or create an account</DialogTitle>
+        <DialogDescription className="sr-only">
+          Use email, password, or Google to sign in or sign up.
+        </DialogDescription>
+        <SignupLoginCard />
+      </DialogContent>
+    </Dialog>
   )
 }
 
