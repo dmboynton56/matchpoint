@@ -1,5 +1,7 @@
+import { useState } from "react"
 import { toast } from "sonner"
 
+import { toggleMatchFavorite } from "@/apis/matches"
 import { Button } from "@/components/ui/button"
 import {
   Drawer,
@@ -14,20 +16,50 @@ import type { JobListing } from "@/types/job"
 
 type JobApplyFollowUpDrawerProps = {
   job: JobListing | null
+  matchId?: string | null
   open: boolean
   onOpenChange: (open: boolean) => void
   isAuthenticated: boolean
   onSignUpClick: () => void
+  onFavorited?: (isFavorited: boolean) => void
 }
 
 export function JobApplyFollowUpDrawer({
   job,
+  matchId,
   open,
   onOpenChange,
   isAuthenticated,
   onSignUpClick,
+  onFavorited,
 }: JobApplyFollowUpDrawerProps) {
+  const [favoriteSaving, setFavoriteSaving] = useState(false)
   const close = () => onOpenChange(false)
+
+  const handleMarkFavorite = async () => {
+    if (!matchId) {
+      toast.error("Could not favorite this job. Try again from your matches.")
+      return
+    }
+
+    setFavoriteSaving(true)
+    try {
+      const result = await toggleMatchFavorite(matchId)
+      onFavorited?.(result.is_favorited ?? true)
+      toast.success(
+        result.is_favorited
+          ? "Added to favorites."
+          : "Removed from favorites."
+      )
+      close()
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Failed to update favorite."
+      toast.error(message)
+    } finally {
+      setFavoriteSaving(false)
+    }
+  }
 
   return (
     <Drawer open={open} onOpenChange={onOpenChange}>
@@ -62,12 +94,14 @@ export function JobApplyFollowUpDrawer({
               type="button"
               variant="secondary"
               className="w-full max-w-56 md:w-auto"
-              onClick={() => {
-                toast.message("Mark as favorite — coming soon")
-                close()
-              }}
+              disabled={favoriteSaving || !matchId}
+              onClick={() => void handleMarkFavorite()}
             >
-              Mark as favorite
+              {favoriteSaving
+                ? "Saving…"
+                : job?.is_favorited
+                  ? "Remove from favorites"
+                  : "Mark as favorite"}
             </Button>
             <DrawerClose asChild>
               <Button

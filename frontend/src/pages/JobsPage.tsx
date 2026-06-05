@@ -3,7 +3,7 @@ import { Link, useLocation } from "react-router-dom"
 import { InfoIcon } from "lucide-react"
 import { toast } from "sonner"
 
-import { getMyMatches, type Match } from "@/apis/matches"
+import { getMyMatches } from "@/apis/matches"
 import {
   getProfilePreferences,
   type ProfilePreferences,
@@ -14,6 +14,7 @@ import { AppShell } from "@/components/layout/AppShell"
 import { RouteLoading } from "@/components/routing/RouteLoading"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
+import { matchToJobMatch, sortByMatchScore } from "@/lib/matchToJobMatch"
 import { getMissingProfilePreferenceLabels } from "@/lib/profilePreferences"
 import { SignupLoginDialog } from "@/components/user/SignupLoginCard"
 import UploadDropzone from "@/components/user/UploadDropzone"
@@ -22,39 +23,6 @@ import type { JobMatch } from "@/types/job"
 
 type JobsPageLocationState = {
   jobs?: JobMatch[]
-}
-
-function sortByMatchScore(jobs: JobMatch[]): JobMatch[] {
-  return [...jobs].sort((a, b) => (b.match_score ?? 0) - (a.match_score ?? 0))
-}
-
-function matchToJobMatch(match: Match): JobMatch {
-  return {
-    id: match.job.id,
-    title: match.job.title,
-    company: match.job.company,
-    location: match.job.location,
-    apply_url: match.job.apply_url,
-    match_score: match.match_score,
-    match_notes: match.match_notes,
-    match_highlights: match.match_highlights,
-    match_concerns: match.match_concerns,
-    interview_likelihood: match.interview_likelihood,
-    skills_fit: match.skills_fit,
-    experience_fit: match.experience_fit,
-    seniority_fit: match.seniority_fit,
-    location_fit: match.location_fit,
-    pay_fit: match.pay_fit,
-    role_fit: match.role_fit,
-    preference_fit: match.preference_fit,
-    location_reason: match.location_reason,
-    location_evidence: match.location_evidence,
-    pay_reason: match.pay_reason,
-    pay_evidence: match.pay_evidence,
-    role_reason: match.role_reason,
-    role_evidence: match.role_evidence,
-    job_facts: match.job_facts,
-  }
 }
 
 export function JobsPage() {
@@ -208,9 +176,23 @@ export function JobsPage() {
 
       <JobApplyFollowUpDrawer
         job={applyFollowUpJob}
+        matchId={applyFollowUpJob?.match_id}
         open={applyFollowUpJob != null}
         isAuthenticated={!!user}
         onSignUpClick={() => setSignupOpen(true)}
+        onFavorited={(isFavorited) => {
+          if (!applyFollowUpJob?.match_id) return
+          setJobs((current) =>
+            current.map((job) =>
+              job.match_id === applyFollowUpJob.match_id
+                ? { ...job, is_favorited: isFavorited }
+                : job
+            )
+          )
+          setApplyFollowUpJob((current) =>
+            current ? { ...current, is_favorited: isFavorited } : current
+          )
+        }}
         onOpenChange={(open) => {
           if (!open) setApplyFollowUpJob(null)
         }}

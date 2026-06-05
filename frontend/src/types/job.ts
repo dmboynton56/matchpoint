@@ -11,6 +11,9 @@ export type MatchNote = {
 
 export type JobMatch = {
   id: string
+  /** `job_matches.id` when loaded from the matches API. */
+  match_id?: string
+  is_favorited?: boolean
   title: string
   company: string
   location: string | null

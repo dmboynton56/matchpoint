@@ -1,4 +1,4 @@
-import { Briefcase, LogOut, Settings, User } from "lucide-react"
+import { Briefcase, Heart, LogOut, Settings, User } from "lucide-react"
 import { useNavigate } from "react-router-dom"
 import { toast } from "sonner"
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
@@ -84,6 +84,16 @@ export function AccountNav({ className }: { className?: string }) {
           >
             <Briefcase className="size-4" aria-hidden="true" />
             Jobs
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            role="menuitem"
+            className="h-9 w-full justify-start gap-2 rounded-none px-3 font-normal"
+            onClick={() => navigate("/favorites")}
+          >
+            <Heart className="size-4" aria-hidden="true" />
+            Favorites
           </Button>
           <Button
             type="button"

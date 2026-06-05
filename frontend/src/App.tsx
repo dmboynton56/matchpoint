@@ -15,6 +15,10 @@ const ProfilePage = lazy(() =>
   import("@/pages/ProfilePage").then((m) => ({ default: m.ProfilePage }))
 )
 
+const FavoritesPage = lazy(() =>
+  import("@/pages/FavoritesPage").then((m) => ({ default: m.FavoritesPage }))
+)
+
 export function App() {
   return (
     <Suspense fallback={<RouteLoading />}>
@@ -26,6 +30,14 @@ export function App() {
           element={
             <ProtectedRoute>
               <ProfilePage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/favorites"
+          element={
+            <ProtectedRoute>
+              <FavoritesPage />
             </ProtectedRoute>
           }
         />
