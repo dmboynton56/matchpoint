@@ -193,6 +193,19 @@ export function JobsPage() {
             current ? { ...current, is_favorited: isFavorited } : current
           )
         }}
+        onApplied={(isApplied) => {
+          if (!applyFollowUpJob?.match_id) return
+          setJobs((current) =>
+            current.map((job) =>
+              job.match_id === applyFollowUpJob.match_id
+                ? { ...job, is_applied: isApplied }
+                : job
+            )
+          )
+          setApplyFollowUpJob((current) =>
+            current ? { ...current, is_applied: isApplied } : current
+          )
+        }}
         onOpenChange={(open) => {
           if (!open) setApplyFollowUpJob(null)
         }}

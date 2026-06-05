@@ -1,7 +1,7 @@
 import { useState } from "react"
 import { toast } from "sonner"
 
-import { toggleMatchFavorite } from "@/apis/matches"
+import { toggleMatchApplied, toggleMatchFavorite } from "@/apis/matches"
 import { Button } from "@/components/ui/button"
 import {
   Drawer,
@@ -22,6 +22,7 @@ type JobApplyFollowUpDrawerProps = {
   isAuthenticated: boolean
   onSignUpClick: () => void
   onFavorited?: (isFavorited: boolean) => void
+  onApplied?: (isApplied: boolean) => void
 }
 
 export function JobApplyFollowUpDrawer({
@@ -32,9 +33,36 @@ export function JobApplyFollowUpDrawer({
   isAuthenticated,
   onSignUpClick,
   onFavorited,
+  onApplied,
 }: JobApplyFollowUpDrawerProps) {
   const [favoriteSaving, setFavoriteSaving] = useState(false)
+  const [appliedSaving, setAppliedSaving] = useState(false)
   const close = () => onOpenChange(false)
+
+  const handleMarkApplied = async () => {
+    if (!matchId) {
+      toast.error("Could not mark this job as applied. Try again from your matches.")
+      return
+    }
+
+    setAppliedSaving(true)
+    try {
+      const result = await toggleMatchApplied(matchId)
+      onApplied?.(result.is_applied ?? true)
+      toast.success(
+        result.is_applied
+          ? "Marked as applied."
+          : "Removed from applied jobs."
+      )
+      close()
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Failed to update applied status."
+      toast.error(message)
+    } finally {
+      setAppliedSaving(false)
+    }
+  }
 
   const handleMarkFavorite = async () => {
     if (!matchId) {
@@ -83,12 +111,14 @@ export function JobApplyFollowUpDrawer({
             <Button
               type="button"
               className="w-full max-w-56 md:w-auto"
-              onClick={() => {
-                toast.message("Mark as applied — coming soon")
-                close()
-              }}
+              disabled={appliedSaving || !matchId}
+              onClick={() => void handleMarkApplied()}
             >
-              Mark as applied
+              {appliedSaving
+                ? "Saving…"
+                : job?.is_applied
+                  ? "Remove from applied"
+                  : "Mark as applied"}
             </Button>
             <Button
               type="button"

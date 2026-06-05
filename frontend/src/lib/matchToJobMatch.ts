@@ -10,6 +10,7 @@ export function matchToJobMatch(match: Match): JobMatch {
     id: match.job.id,
     match_id: match.match_id,
     is_favorited: match.is_favorited,
+    is_applied: match.is_applied,
     title: match.job.title,
     company: match.job.company,
     location: match.job.location,

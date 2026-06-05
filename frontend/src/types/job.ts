@@ -2,7 +2,7 @@
  * A single job in match results from POST /resumes/upload (and future match APIs).
  * Field names mirror the FastAPI/Supabase response (snake_case).
  *
- * Not included yet (see `job_matches` table): is_viewed, is_favorited.
+ * Match flags (`is_viewed`, `is_favorited`, `is_applied`) come from the matches API.
  */
 export type MatchNote = {
   text: string
@@ -14,6 +14,7 @@ export type JobMatch = {
   /** `job_matches.id` when loaded from the matches API. */
   match_id?: string
   is_favorited?: boolean
+  is_applied?: boolean
   title: string
   company: string
   location: string | null
