@@ -1,7 +1,11 @@
 import { useState } from "react"
 import { toast } from "sonner"
 
-import { deleteMatch, toggleMatchApplied, toggleMatchFavorite } from "@/apis/matches"
+import {
+  deleteMatch,
+  toggleMatchApplied,
+  toggleMatchFavorite,
+} from "@/apis/matches"
 import {
   AlertDialog,
   AlertDialogAction,
@@ -76,23 +80,28 @@ export function JobApplyFollowUpDrawer({
 
   const handleMarkApplied = async () => {
     if (!matchId) {
-      toast.error("Could not mark this job as applied. Try again from your matches.")
+      toast.error(
+        "Could not mark this job as applied. Try again from your matches."
+      )
       return
     }
 
     setAppliedSaving(true)
     try {
       const result = await toggleMatchApplied(matchId)
-      onApplied?.(result.is_applied ?? true)
+      if (result.is_applied === undefined) {
+        throw new Error("Invalid response from server")
+      }
+      onApplied?.(result.is_applied)
       toast.success(
-        result.is_applied
-          ? "Marked as applied."
-          : "Removed from applied jobs."
+        result.is_applied ? "Marked as applied." : "Removed from applied jobs."
       )
       close()
     } catch (error) {
       const message =
-        error instanceof Error ? error.message : "Failed to update applied status."
+        error instanceof Error
+          ? error.message
+          : "Failed to update applied status."
       toast.error(message)
     } finally {
       setAppliedSaving(false)
@@ -108,11 +117,12 @@ export function JobApplyFollowUpDrawer({
     setFavoriteSaving(true)
     try {
       const result = await toggleMatchFavorite(matchId)
-      onFavorited?.(result.is_favorited ?? true)
+      if (result.is_favorited === undefined) {
+        throw new Error("Invalid response from server")
+      }
+      onFavorited?.(result.is_favorited)
       toast.success(
-        result.is_favorited
-          ? "Added to favorites."
-          : "Removed from favorites."
+        result.is_favorited ? "Added to favorites." : "Removed from favorites."
       )
       close()
     } catch (error) {
