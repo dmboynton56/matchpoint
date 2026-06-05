@@ -206,6 +206,12 @@ export function JobsPage() {
             current ? { ...current, is_applied: isApplied } : current
           )
         }}
+        onDeleted={(deletedMatchId) => {
+          setJobs((current) =>
+            current.filter((job) => job.match_id !== deletedMatchId)
+          )
+          setApplyFollowUpJob(null)
+        }}
         onOpenChange={(open) => {
           if (!open) setApplyFollowUpJob(null)
         }}
