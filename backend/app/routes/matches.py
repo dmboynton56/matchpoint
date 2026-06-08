@@ -5,11 +5,16 @@ from app.services.cleaning import resolve_job_location
 
 router = APIRouter()
 
-def _get_user_matches(user_id: str, viewed: bool | None, favorited: bool | None) -> list[dict]:
+def _get_user_matches(
+    user_id: str,
+    viewed: bool | None,
+    favorited: bool | None,
+    applied: bool | None,
+) -> list[dict]:
     query = (
         supabase.table("job_matches")
         .select(
-            "id, match_score, is_viewed, is_favorited, created_at, "
+            "id, match_score, is_viewed, is_favorited, is_applied, created_at, "
             "match_notes, match_highlights, match_concerns, interview_likelihood, "
             "skills_fit, experience_fit, seniority_fit, location_fit, "
             "pay_fit, role_fit, preference_fit, location_reason, "
@@ -25,6 +30,8 @@ def _get_user_matches(user_id: str, viewed: bool | None, favorited: bool | None)
         query = query.eq("is_viewed", viewed)
     if favorited is not None:
         query = query.eq("is_favorited", favorited)
+    if applied is not None:
+        query = query.eq("is_applied", applied)
 
     response = query.execute()
     return response.data or []
@@ -55,6 +62,7 @@ def _format_match(match: dict) -> dict:
         "job_facts": match.get("job_facts"),
         "is_viewed": match["is_viewed"],
         "is_favorited": match["is_favorited"],
+        "is_applied": match["is_applied"],
         "matched_at": match["created_at"],
         "job": {
             "id": job.get("id"),
@@ -75,14 +83,15 @@ def _format_match(match: dict) -> dict:
 async def get_my_matches(
     viewed: bool | None = None,
     favorited: bool | None = None,
+    applied: bool | None = None,
     current_user=Depends(get_current_user),
 ):
     """
     Returns all job matches for the current user, sorted by match score.
-    Optionally filter by is_viewed or is_favorited.
+    Optionally filter by is_viewed, is_favorited, or is_applied.
     """
     try:
-        raw = _get_user_matches(current_user.id, viewed, favorited)
+        raw = _get_user_matches(current_user.id, viewed, favorited, applied)
         matches = [_format_match(m) for m in raw]
         return {
             "count": len(matches),
@@ -141,6 +150,33 @@ async def toggle_favorite(
         new_value = not existing.data["is_favorited"]
         supabase.table("job_matches").update({"is_favorited": new_value}).eq("id", match_id).execute()
         return {"success": True, "match_id": match_id, "is_favorited": new_value}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update match: {str(e)}") from e
+
+
+@router.patch("/matches/{match_id}/applied")
+async def toggle_applied(
+    match_id: str,
+    current_user=Depends(get_current_user),
+):
+    """Toggles the is_applied flag on a match. Verifies ownership before updating."""
+    try:
+        existing = (
+            supabase.table("job_matches")
+            .select("id, is_applied")
+            .eq("id", match_id)
+            .eq("user_id", current_user.id)
+            .single()
+            .execute()
+        )
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Match not found.")
+
+        new_value = not existing.data["is_applied"]
+        supabase.table("job_matches").update({"is_applied": new_value}).eq("id", match_id).execute()
+        return {"success": True, "match_id": match_id, "is_applied": new_value}
     except HTTPException:
         raise
     except Exception as e:

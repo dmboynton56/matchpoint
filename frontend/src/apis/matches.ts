@@ -35,6 +35,7 @@ export interface Match {
   job_facts: Record<string, unknown> | null
   is_viewed: boolean
   is_favorited: boolean
+  is_applied: boolean
   matched_at: string
   job: Job
 }
@@ -49,18 +50,22 @@ export interface MatchUpdateResponse {
   match_id: string
   is_viewed?: boolean
   is_favorited?: boolean
+  is_applied?: boolean
   deleted?: boolean
 }
 
 export async function getMyMatches(filters?: {
   viewed?: boolean
   favorited?: boolean
+  applied?: boolean
 }): Promise<MatchesResponse> {
   const params = new URLSearchParams()
   if (filters?.viewed !== undefined)
     params.set("viewed", String(filters.viewed))
   if (filters?.favorited !== undefined)
     params.set("favorited", String(filters.favorited))
+  if (filters?.applied !== undefined)
+    params.set("applied", String(filters.applied))
 
   const qs = params.size ? `?${params}` : ""
   return apiFetch<MatchesResponse>(`/matches/me${qs}`)
@@ -80,6 +85,15 @@ export async function toggleMatchFavorite(
   matchId: string
 ): Promise<MatchUpdateResponse> {
   return apiFetch<MatchUpdateResponse>(`/matches/${matchId}/favorite`, {
+    method: "PATCH",
+  })
+}
+
+// Toggle the applied state of a match
+export async function toggleMatchApplied(
+  matchId: string
+): Promise<MatchUpdateResponse> {
+  return apiFetch<MatchUpdateResponse>(`/matches/${matchId}/applied`, {
     method: "PATCH",
   })
 }

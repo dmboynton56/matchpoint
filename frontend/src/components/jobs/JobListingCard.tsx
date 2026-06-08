@@ -1,3 +1,4 @@
+import type { ReactNode } from "react"
 import {
   AlertTriangle,
   BriefcaseBusiness,
@@ -32,6 +33,8 @@ type JobListingCardProps = {
   onApplyClick?: (job: JobListing) => void
   /** Optional marketing tags (preview only; not from API). */
   showTags?: boolean
+  /** Shown in the card header row (e.g. favorite control). */
+  headerAddon?: ReactNode
   className?: string
 }
 
@@ -114,6 +117,7 @@ export function JobListingCard({
   showApplyLink = true,
   onApplyClick,
   showTags = false,
+  headerAddon,
   className,
 }: JobListingCardProps) {
   const tags = job.tags ?? []
@@ -142,17 +146,20 @@ export function JobListingCard({
             <h2 className="text-sm leading-snug font-semibold tracking-tight text-foreground">
               {job.title}
             </h2>
-            {showScore && scoreTier ? (
-              <Badge
-                variant="secondary"
-                className={cn(
-                  "shrink-0 font-medium",
-                  matchScoreBadgeClass(scoreTier)
-                )}
-              >
-                {formatMatchScore(job.match_score!)}
-              </Badge>
-            ) : null}
+            <div className="flex shrink-0 items-center gap-2">
+              {headerAddon}
+              {showScore && scoreTier ? (
+                <Badge
+                  variant="secondary"
+                  className={cn(
+                    "font-medium",
+                    matchScoreBadgeClass(scoreTier)
+                  )}
+                >
+                  {formatMatchScore(job.match_score!)}
+                </Badge>
+              ) : null}
+            </div>
           </div>
           <p className="text-sm text-muted-foreground">{job.company}</p>
           {job.location ? (

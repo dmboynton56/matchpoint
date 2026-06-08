@@ -1,5 +1,22 @@
+import { useState } from "react"
 import { toast } from "sonner"
 
+import {
+  deleteMatch,
+  toggleMatchApplied,
+  toggleMatchFavorite,
+} from "@/apis/matches"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog"
 import { Button } from "@/components/ui/button"
 import {
   Drawer,
@@ -14,20 +31,108 @@ import type { JobListing } from "@/types/job"
 
 type JobApplyFollowUpDrawerProps = {
   job: JobListing | null
+  matchId?: string | null
   open: boolean
   onOpenChange: (open: boolean) => void
   isAuthenticated: boolean
   onSignUpClick: () => void
+  onFavorited?: (isFavorited: boolean) => void
+  onApplied?: (isApplied: boolean) => void
+  onDeleted?: (matchId: string) => void
 }
 
 export function JobApplyFollowUpDrawer({
   job,
+  matchId,
   open,
   onOpenChange,
   isAuthenticated,
   onSignUpClick,
+  onFavorited,
+  onApplied,
+  onDeleted,
 }: JobApplyFollowUpDrawerProps) {
+  const [favoriteSaving, setFavoriteSaving] = useState(false)
+  const [appliedSaving, setAppliedSaving] = useState(false)
+  const [deleteSaving, setDeleteSaving] = useState(false)
   const close = () => onOpenChange(false)
+
+  const handleDeleteMatch = async () => {
+    if (!matchId) {
+      toast.error("Could not remove this job. Try again from your matches.")
+      return
+    }
+
+    setDeleteSaving(true)
+    try {
+      await deleteMatch(matchId)
+      onDeleted?.(matchId)
+      toast.success("Job removed from your matches.")
+      close()
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Failed to remove job."
+      toast.error(message)
+    } finally {
+      setDeleteSaving(false)
+    }
+  }
+
+  const handleMarkApplied = async () => {
+    if (!matchId) {
+      toast.error(
+        "Could not mark this job as applied. Try again from your matches."
+      )
+      return
+    }
+
+    setAppliedSaving(true)
+    try {
+      const result = await toggleMatchApplied(matchId)
+      if (result.is_applied === undefined) {
+        throw new Error("Invalid response from server")
+      }
+      onApplied?.(result.is_applied)
+      toast.success(
+        result.is_applied ? "Marked as applied." : "Removed from applied jobs."
+      )
+      close()
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Failed to update applied status."
+      toast.error(message)
+    } finally {
+      setAppliedSaving(false)
+    }
+  }
+
+  const handleMarkFavorite = async () => {
+    if (!matchId) {
+      toast.error("Could not favorite this job. Try again from your matches.")
+      return
+    }
+
+    setFavoriteSaving(true)
+    try {
+      const result = await toggleMatchFavorite(matchId)
+      if (result.is_favorited === undefined) {
+        throw new Error("Invalid response from server")
+      }
+      onFavorited?.(result.is_favorited)
+      toast.success(
+        result.is_favorited ? "Added to favorites." : "Removed from favorites."
+      )
+      close()
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Failed to update favorite."
+      toast.error(message)
+    } finally {
+      setFavoriteSaving(false)
+    }
+  }
 
   return (
     <Drawer open={open} onOpenChange={onOpenChange}>
@@ -51,23 +156,27 @@ export function JobApplyFollowUpDrawer({
             <Button
               type="button"
               className="w-full max-w-56 md:w-auto"
-              onClick={() => {
-                toast.message("Mark as applied — coming soon")
-                close()
-              }}
+              disabled={appliedSaving || !matchId}
+              onClick={() => void handleMarkApplied()}
             >
-              Mark as applied
+              {appliedSaving
+                ? "Saving…"
+                : job?.is_applied
+                  ? "Remove from applied"
+                  : "Mark as applied"}
             </Button>
             <Button
               type="button"
               variant="secondary"
               className="w-full max-w-56 md:w-auto"
-              onClick={() => {
-                toast.message("Mark as favorite — coming soon")
-                close()
-              }}
+              disabled={favoriteSaving || !matchId}
+              onClick={() => void handleMarkFavorite()}
             >
-              Mark as favorite
+              {favoriteSaving
+                ? "Saving…"
+                : job?.is_favorited
+                  ? "Remove from favorites"
+                  : "Mark as favorite"}
             </Button>
             <DrawerClose asChild>
               <Button
@@ -78,17 +187,38 @@ export function JobApplyFollowUpDrawer({
                 Done
               </Button>
             </DrawerClose>
-            <Button
-              type="button"
-              variant="destructive"
-              className="w-full max-w-56 md:w-auto"
-              onClick={() => {
-                toast.message("Hide job — coming soon")
-                close()
-              }}
-            >
-              Delete this job
-            </Button>
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <Button
+                  type="button"
+                  variant="destructive"
+                  className="w-full max-w-56 md:w-auto"
+                  disabled={deleteSaving || !matchId}
+                >
+                  Delete this job
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>Remove this job?</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    {job
+                      ? `This removes ${job.title} at ${job.company} from your matches. You can't undo this.`
+                      : "This removes the job from your matches. You can't undo this."}
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <AlertDialogAction
+                    variant="destructive"
+                    disabled={deleteSaving || !matchId}
+                    onClick={() => void handleDeleteMatch()}
+                  >
+                    {deleteSaving ? "Removing…" : "Confirm"}
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
           </DrawerFooter>
         ) : (
           <DrawerFooter className="flex flex-col items-center gap-2 pt-0">

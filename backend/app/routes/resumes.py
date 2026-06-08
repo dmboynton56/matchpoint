@@ -175,6 +175,7 @@ def _job_match_payload(job: dict) -> dict:
         "job_facts": job["job_facts"],
         "is_viewed": False,
         "is_favorited": False,
+        "is_applied": False,
     }
 
 

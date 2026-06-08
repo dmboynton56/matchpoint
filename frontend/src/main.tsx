@@ -6,6 +6,7 @@ import "./index.css"
 import App from "./App.tsx"
 import { ThemeProvider } from "@/components/theme-provider.tsx"
 import { Toaster } from "@/components/ui/sonner"
+import { TooltipProvider } from "@/components/ui/tooltip"
 import { AuthProvider } from "@/context/AuthContext"
 
 createRoot(document.getElementById("root")!).render(
@@ -13,8 +14,10 @@ createRoot(document.getElementById("root")!).render(
     <BrowserRouter>
       <ThemeProvider>
         <AuthProvider>
-          <App />
-          <Toaster richColors closeButton />
+          <TooltipProvider>
+            <App />
+            <Toaster richColors closeButton />
+          </TooltipProvider>
         </AuthProvider>
       </ThemeProvider>
     </BrowserRouter>
