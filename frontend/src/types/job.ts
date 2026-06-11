@@ -99,7 +99,7 @@ export function getMatchConcerns(job: JobMatch): string[] {
   return job.match_concerns?.filter((line) => line.trim().length > 0) ?? []
 }
 
-export function getMatchNotes(job: JobMatch): MatchNote[] {
+function normalizeMatchNotes(job: JobMatch): MatchNote[] {
   const notes =
     job.match_notes
       ?.filter((note) => note.text.trim().length > 0)
@@ -119,7 +119,24 @@ export function getMatchNotes(job: JobMatch): MatchNote[] {
       text,
       is_warning: true,
     })),
-  ].slice(0, 3)
+  ]
+}
+
+export function splitMatchNotes(job: JobMatch): {
+  highlights: MatchNote[]
+  warnings: MatchNote[]
+} {
+  const notes = normalizeMatchNotes(job)
+  const highlights = notes.filter((note) => !note.is_warning).slice(0, 3)
+  const warnings = notes.filter((note) => note.is_warning)
+
+  return { highlights, warnings }
+}
+
+/** @deprecated Use splitMatchNotes instead */
+export function getMatchNotes(job: JobMatch): MatchNote[] {
+  const { highlights, warnings } = splitMatchNotes(job)
+  return [...highlights, ...warnings]
 }
 
 /** Response body from POST /resumes/upload (Phil's resume route). */

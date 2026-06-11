@@ -51,10 +51,23 @@ export const MOCK_JOBS: JobListing[] = [
     location: "On-site · Austin",
     apply_url: "https://example.com/jobs/atlas-platform",
     match_score: 0.81,
-    match_highlights: [
-      "Kubernetes and infra keywords overlap with your resume",
-      "Staff-level scope is adjacent to your platform lead title",
-      "On-site in Austin — note relocation if you’re not local",
+    match_notes: [
+      {
+        text: "Kubernetes and infra keywords overlap with your resume",
+        is_warning: false,
+      },
+      {
+        text: "Staff-level scope is adjacent to your platform lead title",
+        is_warning: false,
+      },
+      {
+        text: "Platform ownership experience maps to the team charter",
+        is_warning: false,
+      },
+      {
+        text: "On-site in Austin — relocation would be required unless you already live in the metro area and can commute daily without a long-term remote exception.",
+        is_warning: true,
+      },
     ],
   },
   {
@@ -64,10 +77,27 @@ export const MOCK_JOBS: JobListing[] = [
     location: "Remote · EU",
     apply_url: null,
     match_score: 0.78,
-    match_highlights: [
-      "Experimentation and analytics tools listed on your resume",
-      "Growth engineering is a stretch vs your backend-heavy profile",
-      "EU remote may require hours overlap with your timezone",
+    match_notes: [
+      {
+        text: "Experimentation and analytics tools listed on your resume",
+        is_warning: false,
+      },
+      {
+        text: "Growth engineering is a stretch vs your backend-heavy profile",
+        is_warning: false,
+      },
+      {
+        text: "A/B testing and funnel metrics experience partially overlap with the role",
+        is_warning: false,
+      },
+      {
+        text: "EU remote may require significant hours overlap with CET business hours, which could conflict with a US-based schedule unless you explicitly note timezone flexibility.",
+        is_warning: true,
+      },
+      {
+        text: "Listed salary band appears below your stated minimum base compensation target based on the job posting evidence.",
+        is_warning: true,
+      },
     ],
   },
   {

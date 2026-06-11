@@ -1,21 +1,26 @@
-import type { ReactNode } from "react"
+import { useState, type ReactNode } from "react"
 import {
   AlertTriangle,
   BriefcaseBusiness,
+  ChevronDown,
   DollarSign,
   ExternalLink,
   MapPin,
 } from "lucide-react"
-
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible"
+import {
   formatMatchScore,
-  getMatchNotes,
   getMatchScoreTier,
   hasApplyUrl,
   matchScoreAccentClass,
   matchScoreBadgeClass,
+  splitMatchNotes,
   type MatchNote,
   type JobListing,
 } from "@/types/job"
@@ -42,25 +47,56 @@ function MatchNotesList({ notes }: { notes: MatchNote[] }) {
   return (
     <ul className="mt-2 space-y-1 text-xs leading-relaxed text-muted-foreground">
       {notes.map((note) => (
-        <li
-          key={note.text}
-          className={cn(
-            "flex gap-1.5",
-            note.is_warning && "text-amber-800 dark:text-amber-300"
-          )}
-        >
-          {note.is_warning ? (
-            <AlertTriangle
-              className="mt-0.5 size-3 shrink-0"
-              aria-hidden="true"
-            />
-          ) : (
-            <span className="mt-[0.45em] size-1.5 shrink-0 rounded-full bg-current opacity-65" />
-          )}
-          <span>{note.text}</span>
+        <li key={note.text} className="flex min-w-0 items-start gap-1.5">
+          <span className="mt-[0.45em] size-1.5 shrink-0 rounded-full bg-current opacity-65" />
+          <span className="min-w-0 whitespace-normal break-words">
+            {note.text}
+          </span>
         </li>
       ))}
     </ul>
+  )
+}
+
+function MatchWarningsAccordion({ warnings }: { warnings: MatchNote[] }) {
+  const [open, setOpen] = useState(false)
+
+  if (warnings.length === 0) return null
+
+  return (
+    <Collapsible
+      open={open}
+      onOpenChange={setOpen}
+      className="mt-2 rounded-lg border border-amber-500/25 bg-amber-500/5 px-2.5 py-2"
+    >
+      <CollapsibleTrigger className="text-xs font-medium text-amber-800 dark:text-amber-300">
+        <AlertTriangle className="size-3 shrink-0" aria-hidden="true" />
+        <span>Warnings ({warnings.length})</span>
+        <ChevronDown
+          className={cn(
+            "ml-auto size-3.5 shrink-0 transition-transform",
+            open && "rotate-180"
+          )}
+          aria-hidden="true"
+        />
+      </CollapsibleTrigger>
+
+      <CollapsibleContent>
+        <ul className="mt-2 space-y-1 border-t border-amber-500/20 pt-2 text-xs leading-relaxed text-amber-800 dark:text-amber-300">
+          {warnings.map((warning) => (
+            <li key={warning.text} className="flex min-w-0 items-start gap-1.5">
+              <AlertTriangle
+                className="mt-0.5 size-3 shrink-0"
+                aria-hidden="true"
+              />
+              <span className="min-w-0 whitespace-normal break-words">
+                {warning.text}
+              </span>
+            </li>
+          ))}
+        </ul>
+      </CollapsibleContent>
+    </Collapsible>
   )
 }
 
@@ -120,103 +156,104 @@ export function JobListingCard({
   headerAddon,
   className,
 }: JobListingCardProps) {
-  const tags = job.tags ?? []
-  const notes = getMatchNotes(job)
+  const { highlights, warnings } = splitMatchNotes(job)
   const showScore =
     showMatchScore && job.match_score != null && !Number.isNaN(job.match_score)
   const scoreTier =
     showScore && job.match_score != null
       ? getMatchScoreTier(job.match_score)
       : null
-  const showNoteList = showHighlights && notes.length > 0
+  const showNoteList = showHighlights && highlights.length > 0
+  const showWarnings = showHighlights && warnings.length > 0
   const showApply = showApplyLink && hasApplyUrl(job)
 
   return (
     <article
-      className={cn(
-        "rounded-xl border border-border bg-card px-4 py-3 shadow-sm ring-1 ring-primary/20",
-        scoreTier && "border-l-[3px]",
-        scoreTier && matchScoreAccentClass(scoreTier),
-        className
-      )}
-    >
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
-        <header className="min-w-0 flex-1 space-y-1">
-          <div className="flex flex-wrap items-start justify-between gap-2">
-            <h2 className="text-sm leading-snug font-semibold tracking-tight text-foreground">
-              {job.title}
-            </h2>
-            <div className="flex shrink-0 items-center gap-2">
-              {headerAddon}
-              {showScore && scoreTier ? (
-                <Badge
-                  variant="secondary"
-                  className={cn(
-                    "font-medium",
-                    matchScoreBadgeClass(scoreTier)
-                  )}
-                >
-                  {formatMatchScore(job.match_score!)}
-                </Badge>
-              ) : null}
+        className={cn(
+          "rounded-xl border border-border bg-card px-4 py-3 shadow-sm ring-1 ring-primary/20",
+          scoreTier && "border-l-[3px]",
+          scoreTier && matchScoreAccentClass(scoreTier),
+          className
+        )}
+      >
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
+          <header className="min-w-0 flex-1 space-y-1">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <h2 className="text-sm leading-snug font-semibold tracking-tight text-foreground">
+                {job.title}
+              </h2>
+              <div className="flex shrink-0 items-center gap-2">
+                {headerAddon}
+                {showScore && scoreTier ? (
+                  <Badge
+                    variant="secondary"
+                    className={cn(
+                      "font-medium",
+                      matchScoreBadgeClass(scoreTier)
+                    )}
+                  >
+                    {formatMatchScore(job.match_score!)}
+                  </Badge>
+                ) : null}
+              </div>
             </div>
-          </div>
-          <p className="text-sm text-muted-foreground">{job.company}</p>
-          {job.location ? (
-            <p className="text-xs text-muted-foreground/90">{job.location}</p>
-          ) : null}
-          <FitSignals job={job} />
-          {showNoteList ? (
-            <MatchNotesList notes={notes} />
-          ) : null}
-        </header>
+            <p className="text-sm text-muted-foreground">{job.company}</p>
+            {job.location ? (
+              <p className="text-xs text-muted-foreground/90">{job.location}</p>
+            ) : null}
+            <FitSignals job={job} />
+            {showNoteList ? <MatchNotesList notes={highlights} /> : null}
+            {showWarnings ? (
+              <MatchWarningsAccordion warnings={warnings} />
+            ) : null}
+          </header>
 
-        {showTags && tags.length > 0 ? (
-          <div className="flex shrink-0 flex-wrap gap-1.5 sm:max-w-[40%] sm:justify-end">
-            {tags.map((tag) => (
-              <Badge key={tag} variant="outline" className="font-normal">
-                {tag}
-              </Badge>
-            ))}
-          </div>
-        ) : null}
-      </div>
+          {showTags && (job.tags ?? []).length > 0 ? (
+            <div className="flex shrink-0 flex-wrap gap-1.5 sm:max-w-[40%] sm:justify-end">
+              {(job.tags ?? []).map((tag) => (
+                <Badge key={tag} variant="outline" className="font-normal">
+                  {tag}
+                </Badge>
+              ))}
+            </div>
+          ) : null}
+        </div>
 
-      {showApply ? (
-        <div className="mt-3 flex justify-end border-t border-border/60 pt-2.5">
-          {onApplyClick ? (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-8 gap-1.5 text-xs font-medium"
-              onClick={() => {
-                window.open(job.apply_url!, "_blank", "noopener,noreferrer")
-                onApplyClick(job)
-              }}
-            >
-              Apply
-              <ExternalLink className="size-3.5" aria-hidden="true" />
-            </Button>
-          ) : (
-            <Button
-              asChild
-              variant="outline"
-              size="sm"
-              className="h-8 gap-1.5 text-xs font-medium"
-            >
-              <a
-                href={job.apply_url}
-                target="_blank"
-                rel="noopener noreferrer"
+        {showApply ? (
+          <div className="mt-3 flex flex-wrap items-center justify-end gap-2 border-t border-border/60 pt-2.5">
+            {onApplyClick ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-8 gap-1.5 text-xs font-medium"
+                onClick={() => {
+                  window.open(job.apply_url!, "_blank", "noopener,noreferrer")
+                  onApplyClick(job)
+                }}
               >
                 Apply
                 <ExternalLink className="size-3.5" aria-hidden="true" />
-              </a>
-            </Button>
-          )}
-        </div>
-      ) : null}
+              </Button>
+            ) : (
+              <Button
+                asChild
+                variant="outline"
+                size="sm"
+                className="h-8 gap-1.5 text-xs font-medium"
+              >
+                <a
+                  href={job.apply_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  Apply
+                  <ExternalLink className="size-3.5" aria-hidden="true" />
+                </a>
+              </Button>
+            )}
+          </div>
+        ) : null}
     </article>
   )
 }
