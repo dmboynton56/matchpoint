@@ -24,7 +24,7 @@ Built during our apprenticeship in [Flatiron School's Accelerated AI Engineering
 
 - **Frontend:** React, TypeScript, Vite, Tailwind CSS, shadcn/ui, Supabase Auth
 - **Backend:** FastAPI, Python, OpenAI (embeddings & match scoring), Supabase (Postgres, storage, RLS)
-- **Infrastructure:** Vercel (frontend & backend), Supabase, GitHub Actions (daily job pipeline)
+- **Infrastructure:** Vercel (frontend & backend), Supabase, GitHub Actions (daily job pipeline), Turso DB
 
 ## Features
 

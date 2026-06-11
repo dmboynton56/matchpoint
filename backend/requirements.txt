@@ -21,6 +21,7 @@ httpx==0.28.1
 hyperframe==6.1.0
 idna==3.14
 jiter==0.15.0
+libsql==0.1.11
 markdown-it-py==4.2.0
 mdurl==0.1.2
 mmh3==5.2.1

@@ -1,5 +1,6 @@
 from openai import APITimeoutError
 from fastapi import APIRouter, Depends, HTTPException
+from app.db import turso
 from app.db.database import supabase
 from app.routes.auth import get_current_user
 from app.routes.resumes import recalculate_job_matches_for_user
@@ -13,16 +14,18 @@ def _get_user_matches(
     favorited: bool | None,
     applied: bool | None,
 ) -> list[dict]:
+    # `job_matches` lives in Supabase; `jobs` lives in Turso now, so we
+    # can't do the join in SQL anymore. Pull matches first, then hydrate
+    # the embedded job from Turso.
     query = (
         supabase.table("job_matches")
         .select(
-            "id, match_score, is_viewed, is_favorited, is_applied, created_at, "
-            "match_notes, match_highlights, match_concerns, interview_likelihood, "
-            "skills_fit, experience_fit, seniority_fit, location_fit, "
-            "pay_fit, role_fit, preference_fit, location_reason, "
+            "id, job_id, match_score, is_viewed, is_favorited, is_applied, "
+            "created_at, match_notes, match_highlights, match_concerns, "
+            "interview_likelihood, skills_fit, experience_fit, seniority_fit, "
+            "location_fit, pay_fit, role_fit, preference_fit, location_reason, "
             "location_evidence, pay_reason, pay_evidence, role_reason, "
-            "role_evidence, job_facts, "
-            "jobs(id, title, company, location, apply_url, description, posted_at)"
+            "role_evidence, job_facts"
         )
         .eq("user_id", user_id)
         .order("match_score", desc=True)
@@ -36,7 +39,37 @@ def _get_user_matches(
         query = query.eq("is_applied", applied)
 
     response = query.execute()
-    return response.data or []
+    matches = response.data or []
+
+    job_ids = sorted({str(m["job_id"]) for m in matches if m.get("job_id") is not None})
+    jobs_by_id = turso.fetch_full_jobs(job_ids)
+
+    hydrated_matches = []
+    orphan_job_ids: set[str] = set()
+    for match in matches:
+        job_id = str(match.get("job_id")) if match.get("job_id") is not None else None
+        job = jobs_by_id.get(job_id) if job_id else None
+        if not job:
+            if job_id:
+                orphan_job_ids.add(job_id)
+            continue
+        match["jobs"] = job
+        hydrated_matches.append(match)
+
+    # Best-effort cleanup: drop this user's job_matches rows pointing at jobs
+    # that no longer exist in Turso. Single batched Supabase DELETE, scoped to
+    # the caller — Supabase (not Turso) is the write side here, so we don't
+    # add write load to the read-DB. Failures are logged, never propagated:
+    # the read result above is already correct.
+    if orphan_job_ids:
+        try:
+            supabase.table("job_matches").delete().eq(
+                "user_id", user_id
+            ).in_("job_id", list(orphan_job_ids)).execute()
+        except Exception as cleanup_err:
+            print(f"Orphan job_matches cleanup failed: {cleanup_err}")
+
+    return hydrated_matches
 
 
 def _format_match(match: dict) -> dict:
