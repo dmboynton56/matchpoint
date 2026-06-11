@@ -3,13 +3,24 @@ from bs4 import BeautifulSoup
 import time
 
 COMPANIES = [
-    "stripe", "airbnb",
-    "robinhood", "datadog", "figma", "discord", "dropbox",
-    "asana", "hubspotjobs", "vercel", "crunchyroll",
-    "reddit", "brex", "cloudflare"
+    "stripe", "airbnb", "robinhood", "datadog", "figma",
+    "discord", "dropbox", "asana", "hubspotjobs", "vercel",
+    "crunchyroll", "reddit", "brex", "cloudflare", "canonical",
+    "spacex", "flexport", "gusto", "netlify", "contentful",
+    "mercury", "fivetran", "lattice", "cultureamp", "checkr",
+    "dashlane", "intercom", "elastic", "webflow", "twitch",
+    "cockroachlabs", "databricks", "postman", "braze",
+    "okta", "block", "andurilindustries", "chime", "algolia",
+    "trustpilot", "wizinc", "aurorainnovation", "tebra", "rithum",
+    "coinbase", "linkedin", "tripadvisor", "pinterest", "affirm",
+    "instacart", "boxinc", "mongodb", "samsara", "planetlabs",
+    "scaleai", "anthropic", "coursera", "duolingo", "udemy",
+    "nuro", "wayve", "epirus", "astranis", "ginkgobioworks",
+    "fireblocks", "carta", "remote", "newrelic", "tanium",
+    "gitlab"
 ]
 
-MAX_JOBS_PER_COMPANY = 10
+MAX_JOBS_PER_COMPANY = 100
 
 
 def scrape_all() -> list[dict]:
