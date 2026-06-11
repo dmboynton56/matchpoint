@@ -1,4 +1,4 @@
-import type { MatchNote } from "@/types/job"
+import type { JobMatch, MatchNote } from "@/types/job"
 
 import { apiFetch } from "./client"
 
@@ -54,6 +54,11 @@ export interface MatchUpdateResponse {
   deleted?: boolean
 }
 
+export interface RecalculateMatchesResponse {
+  message: string
+  jobs: JobMatch[]
+}
+
 export async function getMyMatches(filters?: {
   viewed?: boolean
   favorited?: boolean
@@ -69,6 +74,12 @@ export async function getMyMatches(filters?: {
 
   const qs = params.size ? `?${params}` : ""
   return apiFetch<MatchesResponse>(`/matches/me${qs}`)
+}
+
+export async function recalculateMyMatches(): Promise<RecalculateMatchesResponse> {
+  return apiFetch<RecalculateMatchesResponse>("/matches/recalculate", {
+    method: "POST",
+  })
 }
 
 // Mark a match as viewed

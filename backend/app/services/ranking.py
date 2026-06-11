@@ -10,6 +10,7 @@ from app.schemas.ranking import (
     validate_scores,
 )
 from app.services.embedding import client
+from app.services.match_notes import normalize_match_notes
 
 SCORING_MODEL = os.getenv("OPENAI_SCORING_MODEL", "gpt-5.4-nano")
 SCORING_TIMEOUT_SECONDS = float(os.getenv("OPENAI_SCORING_TIMEOUT_SECONDS", "75"))
@@ -46,12 +47,30 @@ preference_fit from 0-1. If a preference or job fact is unknown, use a neutral f
 near 0.75 and explain that the evidence is missing. Use vector_similarity only as
 weak context, not as the score.
 
-For each job, return exactly three match_notes total. Notes may be positive,
-negative, or mixed. They should explain the most decision-useful reasons behind
-the scores, including location, pay, or role only when materially relevant. Set
-is_warning=true only for a meaningful drawback the candidate should notice.
-Do not add separate warning lists, evidence fields, or duplicate chip values.
-Never invent facts or omit job IDs.
+Return exactly three match_notes with is_warning=false plus zero or more
+match_notes with is_warning=true. Regular comments and warnings serve different
+purposes and must not duplicate the same point.
+
+Regular comments (is_warning=false, exactly three):
+- Explain why the job is worth considering: skills overlap, role alignment,
+  relevant experience, partial preference fit, or neutral score context.
+- Prefer positive or balanced framing. Do not use regular comments for
+  dealbreakers, relocation requirements, pay shortfalls, or seniority gaps.
+
+Warnings (is_warning=true, zero or more):
+- Required when any material drawback applies, including:
+  onsite/relocation mismatch vs candidate location or stated preferences,
+  pay below the candidate's stated minimum, seniority gap (e.g. apprentice to
+  manager), or missing critical requirements.
+- If a note describes a drawback the candidate should actively weigh before
+  applying, it MUST be is_warning=true and MUST NOT appear as a regular comment.
+- Example regular: "Strong React/TypeScript overlap with the stack."
+- Example warning: "Role is SF on-site; resume shows Denver with no relocation
+  or onsite preference stated."
+
+Warnings must not replace regular comments. Omit warnings only when no material
+drawbacks apply. Do not add separate warning lists, evidence fields, or duplicate
+chip values. Never invent facts or omit job IDs.
 """.strip()
 
 
@@ -103,6 +122,15 @@ def _build_user_message(
 _SCORING_RETRY_CORRECTION = (
     "The scoring request failed. Return a valid scoring response for every input job."
 )
+
+
+def _normalize_scoring_response(response: ScoringResponse) -> ScoringResponse:
+    return ScoringResponse(
+        scores=[
+            score.model_copy(update={"match_notes": normalize_match_notes(score)})
+            for score in response.scores
+        ]
+    )
 
 
 def _request_scores(
@@ -209,7 +237,7 @@ def score_jobs_with_llm(
             continue
 
         try:
-            return validate_scores(parsed, jobs)
+            return validate_scores(_normalize_scoring_response(parsed), jobs)
         except ValueError as exc:
             last_error = exc
             correction = _build_validation_correction(exc, jobs, parsed)
@@ -235,7 +263,9 @@ def score_jobs_with_llm(
                 continue
 
             try:
-                scores.append(validate_scores(parsed, [job]).scores[0])
+                scores.append(
+                    validate_scores(_normalize_scoring_response(parsed), [job]).scores[0]
+                )
                 break
             except ValueError as exc:
                 last_error = exc

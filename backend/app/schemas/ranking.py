@@ -49,7 +49,7 @@ class JobScore(BaseModel):
     pay_fit: float = Field(ge=0, le=1)
     role_fit: float = Field(ge=0, le=1)
     preference_fit: float = Field(ge=0, le=1)
-    match_notes: list[MatchNote] = Field(min_length=3, max_length=3)
+    match_notes: list[MatchNote] = Field(min_length=3, max_length=6)
 
 
 class ScoringResponse(BaseModel):
@@ -75,5 +75,11 @@ def validate_scores(
         for note in score.match_notes:
             if not note.text.strip():
                 raise ValueError("Match notes cannot be blank.")
+
+        regular_notes = [note for note in score.match_notes if not note.is_warning]
+        if len(regular_notes) != 3:
+            raise ValueError(
+                "Each job must include exactly three non-warning match notes."
+            )
 
     return response

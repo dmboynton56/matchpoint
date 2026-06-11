@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom"
 import { ExternalLink, FileText, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
+import { recalculateMyMatches } from "@/apis/matches"
 import {
   deleteResume,
   getResumeDetails,
@@ -36,6 +37,14 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useAuth } from "@/hooks/useAuth"
@@ -65,6 +74,9 @@ export function ProfilePage() {
   const [savedPreferenceKey, setSavedPreferenceKey] = useState("")
   const [profileLoading, setProfileLoading] = useState(true)
   const [preferencesSaving, setPreferencesSaving] = useState(false)
+  const [preferenceRecalcDialogOpen, setPreferenceRecalcDialogOpen] =
+    useState(false)
+  const [matchesRecalculating, setMatchesRecalculating] = useState(false)
 
   const [newEmail, setNewEmail] = useState("")
   const [emailPassword, setEmailPassword] = useState("")
@@ -168,9 +180,31 @@ export function ProfilePage() {
           minimumBaseSalary: salary,
         })
       )
-      toast.success("Preferences saved.", { position: "top-center" })
+      if (resume?.has_resume) {
+        setPreferenceRecalcDialogOpen(true)
+      } else {
+        toast.success("Preferences saved.", { position: "top-center" })
+      }
     } finally {
       setPreferencesSaving(false)
+    }
+  }
+
+  const handleRecalculateMatches = async () => {
+    setMatchesRecalculating(true)
+    try {
+      const response = await recalculateMyMatches()
+      setPreferenceRecalcDialogOpen(false)
+      toast.success("Matches recalculated.", { position: "top-center" })
+      navigate("/jobs", { state: { jobs: response.jobs } })
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Match recalculation failed."
+      toast.error(message, { position: "top-center" })
+    } finally {
+      setMatchesRecalculating(false)
     }
   }
 
@@ -541,6 +575,40 @@ export function ProfilePage() {
           </Card>
         </div>
       </div>
+
+      <Dialog
+        open={preferenceRecalcDialogOpen}
+        onOpenChange={(open) => {
+          if (!matchesRecalculating) setPreferenceRecalcDialogOpen(open)
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Recalculate matches?</DialogTitle>
+            <DialogDescription>
+              Your preferences were saved. Recalculate matches now, or wait
+              until the next scheduled refresh?
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={matchesRecalculating}
+              onClick={() => setPreferenceRecalcDialogOpen(false)}
+            >
+              Wait until refresh
+            </Button>
+            <Button
+              type="button"
+              disabled={matchesRecalculating}
+              onClick={() => void handleRecalculateMatches()}
+            >
+              {matchesRecalculating ? "Recalculating..." : "Recalculate now"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </AppShell>
   )
 }

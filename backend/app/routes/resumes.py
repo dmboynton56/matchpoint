@@ -82,6 +82,24 @@ def fetch_user_preferences(user_id: str) -> UserPreferences:
     )
 
 
+def fetch_user_resume_text(user_id: str) -> str:
+    response = (
+        supabase.table("profiles")
+        .select("resume_text")
+        .eq("id", user_id)
+        .maybe_single()
+        .execute()
+    )
+    data = _response_data(response, stage="fetch_user_resume_text") or {}
+    resume_text = data.get("resume_text")
+    if not isinstance(resume_text, str) or not resume_text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Upload a resume before recalculating matches.",
+        )
+    return resume_text
+
+
 def build_match_query_text(resume_text: str, preferences: UserPreferences | None) -> str:
     if not preferences:
         return resume_text
@@ -202,6 +220,37 @@ def _log_upload_stage(stage: str, started_at: float) -> float:
         finished_at - started_at,
     )
     return finished_at
+
+
+def recalculate_job_matches_for_user(
+    user_id: str,
+    resume_text: str | None = None,
+    *,
+    stage_prefix: str = "recalculate",
+) -> list[dict]:
+    started_at = perf_counter()
+    if resume_text is None:
+        resume_text = fetch_user_resume_text(user_id)
+        started_at = _log_upload_stage(f"{stage_prefix}_fetch_resume", started_at)
+
+    preferences = fetch_user_preferences(user_id)
+    started_at = _log_upload_stage(f"{stage_prefix}_fetch_preferences", started_at)
+    match_query_embedding = generateEmbedding(
+        build_match_query_text(resume_text, preferences)
+    )
+    started_at = _log_upload_stage(f"{stage_prefix}_match_query_embedding", started_at)
+
+    jobs = score_job_matches(
+        resume_text,
+        match_query_embedding,
+        return_limit=AUTHENTICATED_JOB_LIMIT,
+        preferences=preferences,
+    )
+    started_at = _log_upload_stage(f"{stage_prefix}_job_scoring", started_at)
+
+    _persist_job_matches(user_id, jobs)
+    _log_upload_stage(f"{stage_prefix}_persist_job_matches", started_at)
+    return jobs
 
 
 def score_job_matches(
@@ -352,14 +401,8 @@ async def handle_authenticated_upload(
         file_options={"content-type": "application/pdf", "upsert": "true"},
     )
     started_at = _log_upload_stage("storage_upload", started_at)
-    preferences = fetch_user_preferences(user_id)
-    started_at = _log_upload_stage("fetch_preferences", started_at)
     embedding = generateEmbedding(extracted_text)
     started_at = _log_upload_stage("resume_embedding", started_at)
-    match_query_embedding = generateEmbedding(
-        build_match_query_text(extracted_text, preferences)
-    )
-    started_at = _log_upload_stage("match_query_embedding", started_at)
     supabase.table("profiles").update(
         {
             "resume_text": extracted_text,
@@ -368,16 +411,11 @@ async def handle_authenticated_upload(
     ).eq("id", user_id).execute()
     started_at = _log_upload_stage("profile_update", started_at)
 
-    jobs = score_job_matches(
+    jobs = recalculate_job_matches_for_user(
+        user_id,
         extracted_text,
-        match_query_embedding,
-        return_limit=AUTHENTICATED_JOB_LIMIT,
-        preferences=preferences,
+        stage_prefix="upload",
     )
-    started_at = _log_upload_stage("job_scoring", started_at)
-
-    _persist_job_matches(user_id, jobs)
-    _log_upload_stage("persist_job_matches", started_at)
 
     return {
         "message": "Resume uploaded and successfully parsed.",

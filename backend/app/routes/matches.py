@@ -1,6 +1,8 @@
+from openai import APITimeoutError
 from fastapi import APIRouter, Depends, HTTPException
 from app.db.database import supabase
 from app.routes.auth import get_current_user
+from app.routes.resumes import recalculate_job_matches_for_user
 from app.services.cleaning import resolve_job_location
 
 router = APIRouter()
@@ -101,6 +103,33 @@ async def get_my_matches(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch matches: {str(e)}") from e
+
+
+@router.post("/matches/recalculate")
+async def recalculate_my_matches(
+    current_user=Depends(get_current_user),
+):
+    """
+    Re-runs matching from the stored resume text and current profile preferences.
+    """
+    try:
+        jobs = recalculate_job_matches_for_user(current_user.id)
+        return {
+            "message": "Matches recalculated.",
+            "jobs": jobs,
+        }
+    except HTTPException:
+        raise
+    except APITimeoutError as e:
+        raise HTTPException(
+            status_code=504,
+            detail="Match recalculation timed out. Try again in a moment.",
+        ) from e
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error recalculating matches",
+        ) from e
 
 
 @router.patch("/matches/{match_id}/viewed")
