@@ -83,7 +83,7 @@ def run_pipeline():
     if existing_jobs:
         total_refreshed = 0
         for batch in chunk(existing_jobs, BATCH_SIZE):
-            ids = [j["external_id"] for j in batch]
+            ids = [str(j["external_id"]) for j in batch]
             total_refreshed += turso.update_last_seen(ids, now)
         print(f"  Refreshed last_seen_at for {total_refreshed} existing jobs")
 

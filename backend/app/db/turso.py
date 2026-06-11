@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY DEFAULT (
     lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-' || '4' || substr(lower(hex(randomblob(2))), 2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))), 2) || '-' || lower(hex(randomblob(6)))
   ),
-  external_id TEXT UNIQUE,
+  external_id TEXT NOT NULL UNIQUE,
   company TEXT NOT NULL,
   title TEXT NOT NULL,
   description TEXT,
@@ -170,13 +170,72 @@ def _split_statements(sql: str) -> list[str]:
 
 
 def init_schema(client: "libsql.Connection | None" = None) -> None:  # type: ignore[type-arg]
-    """Apply JOBS_SCHEMA_SQL idempotently. Safe to call repeatedly."""
+    """Apply JOBS_SCHEMA_SQL idempotently. Safe to call repeatedly.
+
+    On a warm connection (table already present and external_id already NOT
+    NULL) this is a single sqlite_master probe — no DDL, no migration. The
+    cold path applies the schema and the one-shot external_id NOT NULL
+    migration, both best-effort and idempotent.
+    """
     conn = client or get_client()
+    try:
+        warm = _schema_is_warm(conn)
+    except Exception:
+        # If the probe itself fails (e.g. :memory: race during smoke tests),
+        # fall back to the legacy always-apply path.
+        warm = False
+    if warm:
+        return
     # libsql's HTTP transport (Hrana) rejects multi-statement payloads, so
     # apply each DDL statement individually.
     for stmt in _split_statements(JOBS_SCHEMA_SQL):
         conn.execute(stmt)
+    # One-shot migration: external_id is now NOT NULL (it is the upsert
+    # conflict key and dedupe key, so NULLs bypass ON CONFLICT). Pre-migration
+    # rows that already have external_id IS NULL are orphans — they bypass
+    # the dedupe path and would block the constraint. Drop them, then enforce.
+    # Both statements are idempotent: re-running on a clean schema is a no-op.
+    # Skip the ALTER if the column is already NOT NULL on the live table —
+    # `ALTER ... SET NOT NULL` is not supported on every libSQL build, and
+    # `try/except` would silently swallow that as "already enforced". Probe
+    # PRAGMA table_info so we know which case we're in.
+    try:
+        conn.execute("DELETE FROM jobs WHERE external_id IS NULL")
+    except Exception:
+        pass
+    if not _external_id_is_not_null(conn):
+        try:
+            conn.execute(
+                "ALTER TABLE jobs ALTER COLUMN external_id SET NOT NULL"
+            )
+        except Exception:
+            # libsql < 3.35, or column is already NOT NULL by another path —
+            # both are fine. The Python-side `upsert_jobs` validation is the
+            # real safety net.
+            pass
     conn.commit()
+
+
+def _schema_is_warm(conn) -> bool:
+    """True iff `jobs` exists and `external_id` is already NOT NULL.
+
+    Lets warm `get_client()` calls skip the DDL+migration cost.
+    """
+    cursor = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='jobs'"
+    )
+    if not cursor.fetchone():
+        return False
+    return _external_id_is_not_null(conn)
+
+
+def _external_id_is_not_null(conn) -> bool:
+    cursor = conn.execute("PRAGMA table_info(jobs)")
+    for row in cursor.fetchall():
+        # PRAGMA table_info columns: cid, name, type, notnull, dflt_value, pk
+        if row[1] == "external_id" and int(row[3] or 0) == 1:
+            return True
+    return False
 
 
 # -----------------------------------------------------------------------------
@@ -185,10 +244,18 @@ def init_schema(client: "libsql.Connection | None" = None) -> None:  # type: ign
 def _embedding_to_text(value: Any) -> str | None:
     if value is None:
         return None
-    if isinstance(value, str):
-        return value
     if isinstance(value, (list, tuple)):
         return json.dumps([float(x) for x in value], separators=(",", ":"))
+    if isinstance(value, str):
+        # Accept a pre-serialized JSON array string and re-canonicalize it so
+        # what hits the DB is always a tight, validated JSON list. Anything
+        # else (a bare number, an object, malformed JSON) raises — the call
+        # site is the write boundary, so we'd rather fail loudly here than
+        # store garbage that crashes vector_search later.
+        loaded = json.loads(value)
+        if not isinstance(loaded, (list, tuple)):
+            raise TypeError("Embedding string must decode to a JSON array")
+        return json.dumps([float(x) for x in loaded], separators=(",", ":"))
     raise TypeError(f"Unsupported embedding type: {type(value).__name__}")
 
 
@@ -239,10 +306,13 @@ def upsert_jobs(jobs: list[dict]) -> int:
         "last_seen_at=excluded.last_seen_at"
     )
     for job in jobs:
+        external_id = job.get("external_id")
+        if external_id in (None, ""):
+            raise ValueError("upsert_jobs requires non-empty external_id")
         conn.execute(
             sql,
             [
-                job.get("external_id"),
+                external_id,
                 job.get("company"),
                 job.get("title"),
                 job.get("description"),
@@ -322,7 +392,13 @@ def vector_search(
     )
     scored: list[tuple[float, tuple]] = []
     for row in cursor.fetchall():
-        embedding = _embedding_from_text(row[5])
+        try:
+            embedding = _embedding_from_text(row[5])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            # A malformed embedding row would otherwise take the whole
+            # request path down. Skip it; the next upsert (or manual
+            # cleanup) will overwrite it.
+            continue
         if not embedding:
             continue
         sim = _cosine_similarity(query_embedding, embedding)

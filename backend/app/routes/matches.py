@@ -39,14 +39,35 @@ def _get_user_matches(
     response = query.execute()
     matches = response.data or []
 
-    job_ids = sorted({str(m["job_id"]) for m in matches if m.get("job_id")})
+    job_ids = sorted({str(m["job_id"]) for m in matches if m.get("job_id") is not None})
     jobs_by_id = turso.fetch_full_jobs(job_ids)
 
+    hydrated_matches = []
+    orphan_job_ids: set[str] = set()
     for match in matches:
         job_id = str(match.get("job_id")) if match.get("job_id") is not None else None
-        match["jobs"] = jobs_by_id.get(job_id) if job_id else None
+        job = jobs_by_id.get(job_id) if job_id else None
+        if not job:
+            if job_id:
+                orphan_job_ids.add(job_id)
+            continue
+        match["jobs"] = job
+        hydrated_matches.append(match)
 
-    return matches
+    # Best-effort cleanup: drop this user's job_matches rows pointing at jobs
+    # that no longer exist in Turso. Single batched Supabase DELETE, scoped to
+    # the caller — Supabase (not Turso) is the write side here, so we don't
+    # add write load to the read-DB. Failures are logged, never propagated:
+    # the read result above is already correct.
+    if orphan_job_ids:
+        try:
+            supabase.table("job_matches").delete().eq(
+                "user_id", user_id
+            ).in_("job_id", list(orphan_job_ids)).execute()
+        except Exception as cleanup_err:
+            print(f"Orphan job_matches cleanup failed: {cleanup_err}")
+
+    return hydrated_matches
 
 
 def _format_match(match: dict) -> dict:
