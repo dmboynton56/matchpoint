@@ -6,6 +6,7 @@ from openai import APITimeoutError
 import pypdf
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
+from app.db import turso
 from app.db.database import supabase
 from app.routes.auth import get_optional_user, get_current_user
 from app.schemas.ranking import JobRankInput, UserPreferences
@@ -126,29 +127,16 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
 
 
 def fetch_vector_job_matches(query_embedding: list[float], *, limit: int) -> list[dict]:
-    response = supabase.rpc(
-        "match_jobs",
-        {
-            "query_embedding": query_embedding,
-            "match_limit": limit,
-        },
-    ).execute()
-
-    return _response_data(response, stage="fetch_vector_job_matches") or []
+    # Jobs live on Turso now; similarity is computed in Python over the
+    # JSON-array TEXT embedding column (no pgvector in libSQL).
+    return turso.vector_search(query_embedding, limit=limit)
 
 
 def fetch_full_jobs(job_ids: list[str]) -> dict[str, dict]:
     if not job_ids:
         return {}
-
-    response = (
-        supabase.table("jobs")
-        .select("id, title, company, location, apply_url, description")
-        .in_("id", job_ids)
-        .execute()
-    )
-    jobs = _response_data(response, stage="fetch_full_jobs") or []
-    return {str(job["id"]): job for job in jobs}
+    # Pull the full job records (with description) from Turso.
+    return turso.fetch_full_jobs(job_ids)
 
 
 def _job_match_payload(job: dict) -> dict:

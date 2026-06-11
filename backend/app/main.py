@@ -14,9 +14,7 @@ from app.services.cleaning import (
 from app.services.embedding import (
     generateEmbedding
 )
-from app.db.database import (
-    supabase
-)
+from app.db import turso
 app = FastAPI()
 
 cors_origins = [
@@ -60,7 +58,7 @@ def insert_jobs_into_database():
         "title",
         "location"
     ]
-    
+
     for _, job in df.iterrows():
         missing = False
         for field in required_fields:
@@ -81,22 +79,25 @@ def insert_jobs_into_database():
         except Exception as e:
             print(e)
             continue
-        
-        data = {
-            "external_id": str(job["external_id"]),
-            "company": str(job["company"]),
-            "title": str(job["title"]),
-            "description": str(cleanedPost),
-            "location": resolved_location,
-            "posted_at": job.get("posted_at"),
-            "apply_url": job.get("apply_url"),
-            "embedding": embedding
-        }
-        response = supabase.table("jobs").upsert(data, on_conflict = "external_id").execute()
-        
-        jobs.append(response.data)
+
+        jobs.append(
+            {
+                "external_id": str(job["external_id"]),
+                "company": str(job["company"]),
+                "title": str(job["title"]),
+                "description": str(cleanedPost),
+                "location": resolved_location,
+                "posted_at": job.get("posted_at"),
+                "apply_url": job.get("apply_url"),
+                "embedding": embedding,
+            }
+        )
+
+    # Ensure the Turso schema is in place, then upsert as a single batch.
+    turso.init_schema()
+    turso.upsert_jobs(jobs)
 
     return {
         "message": "Jobs inserted successfully",
-        "data": jobs
+        "data": jobs,
     }
