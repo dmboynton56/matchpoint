@@ -1,0 +1,23 @@
+-- Drop the FK from public.job_matches.job_id to public.jobs(id).
+--
+-- Background:
+--   The `jobs` table now lives on Turso (libSQL) and is the source of truth
+--   for job data. The Postgres `public.jobs` table is mid-retirement (see
+--   the upcoming source-side drop migration). Because Turso-generated `id`
+--   values never get inserted into the Postgres `public.jobs` table,
+--   `replace_job_matches` has been failing with 23503 (foreign_key_violation)
+--   on every resume upload that tries to persist matches.
+--
+--   The read path (`backend/app/routes/matches.py`) no longer joins
+--   `job_matches` to `public.jobs` — it hydrates `jobs` from Turso in
+--   Python via `turso.fetch_full_jobs(job_ids)`. A `job_matches.job_id`
+--   that doesn't resolve in Turso is filtered out of the response and
+--   cleaned up via a batched, caller-scoped Supabase DELETE in
+--   `matches._get_user_matches`. So this FK is not load-bearing for
+--   read-path correctness; it is only load-bearing for blocking writes.
+--
+-- This migration is idempotent w.r.t. the source-side drop of
+-- `public.jobs`: when that migration runs, the constraint is already
+-- gone, so there is nothing for it to depend on.
+alter table public.job_matches
+  drop constraint job_matches_job_id_fkey;

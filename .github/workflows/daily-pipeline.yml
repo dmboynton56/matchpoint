@@ -9,7 +9,7 @@ on:
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 180 # 3 hours to ensure everything works
 
     steps:
       - name: Checkout repository
