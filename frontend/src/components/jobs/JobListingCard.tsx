@@ -47,9 +47,9 @@ function MatchNotesList({ notes }: { notes: MatchNote[] }) {
   return (
     <ul className="mt-2 space-y-1 text-xs leading-relaxed text-muted-foreground">
       {notes.map((note) => (
-        <li key={note.text} className="flex min-w-0 items-start gap-1.5">
-          <span className="mt-[0.45em] size-1.5 shrink-0 rounded-full bg-current opacity-65" />
-          <span className="min-w-0 whitespace-normal break-words">
+        <li key={note.text} className="flex min-w-0 items-center gap-1.5">
+          <span className="size-1.5 shrink-0 rounded-full bg-current opacity-65" />
+          <span className="min-w-0 flex-1 truncate" title={note.text}>
             {note.text}
           </span>
         </li>
@@ -84,12 +84,9 @@ function MatchWarningsAccordion({ warnings }: { warnings: MatchNote[] }) {
       <CollapsibleContent>
         <ul className="mt-2 space-y-1 border-t border-amber-500/20 pt-2 text-xs leading-relaxed text-amber-800 dark:text-amber-300">
           {warnings.map((warning) => (
-            <li key={warning.text} className="flex min-w-0 items-start gap-1.5">
-              <AlertTriangle
-                className="mt-0.5 size-3 shrink-0"
-                aria-hidden="true"
-              />
-              <span className="min-w-0 whitespace-normal break-words">
+            <li key={warning.text} className="flex min-w-0 items-center gap-1.5">
+              <AlertTriangle className="size-3 shrink-0" aria-hidden="true" />
+              <span className="min-w-0 flex-1 truncate" title={warning.text}>
                 {warning.text}
               </span>
             </li>

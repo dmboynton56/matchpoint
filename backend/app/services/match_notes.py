@@ -1,6 +1,6 @@
 import re
 
-from app.schemas.ranking import JobScore, MatchNote
+from app.schemas.ranking import MATCH_NOTE_MAX_CHARS, JobScore, MatchNote
 
 LOW_FIT_THRESHOLD = 0.5
 REGULAR_NOTE_COUNT = 3
@@ -101,6 +101,13 @@ def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip())
 
 
+def _clip_note_text(text: str) -> str:
+    normalized = _normalize_text(text)
+    if len(normalized) <= MATCH_NOTE_MAX_CHARS:
+        return normalized
+    return normalized[: MATCH_NOTE_MAX_CHARS - 3].rstrip(" .,;:") + "..."
+
+
 def _note_mentions_topic(text: str, keywords: tuple[str, ...]) -> bool:
     lower = text.lower()
     return any(keyword in lower for keyword in keywords)
@@ -165,7 +172,7 @@ def _replacement_regular_note(
             continue
         if text.lower() in existing_blob:
             continue
-        return MatchNote(text=_normalize_text(text)[:150], is_warning=False)
+        return MatchNote(text=_clip_note_text(text), is_warning=False)
 
     fallback_pct = round(
         (
@@ -177,9 +184,9 @@ def _replacement_regular_note(
         * 100
     )
     return MatchNote(
-        text=_normalize_text(
+        text=_clip_note_text(
             f"Core fit signals average {fallback_pct}% across skills, role, and experience."
-        )[:150],
+        ),
         is_warning=False,
     )
 
@@ -209,15 +216,22 @@ def normalize_match_notes(score: JobScore) -> list[MatchNote]:
 
     for note in regular_notes:
         normalized = _normalize_text(note.text)
-        candidate = MatchNote(text=normalized[:150], is_warning=False)
+        clipped = _clip_note_text(normalized)
+        candidate = MatchNote(text=clipped, is_warning=False)
         if _looks_like_drawback(normalized, score):
             promoted_warnings.append(
-                MatchNote(text=normalized[:150], is_warning=True)
+                MatchNote(text=clipped, is_warning=True)
             )
         else:
             kept_regular.append(candidate)
 
-    warnings = _dedupe_notes(warning_notes + promoted_warnings)
+    warnings = _dedupe_notes(
+        [
+            MatchNote(text=_clip_note_text(note.text), is_warning=True)
+            for note in warning_notes
+        ]
+        + promoted_warnings
+    )
 
     while len(kept_regular) < REGULAR_NOTE_COUNT:
         kept_regular.append(_replacement_regular_note(score, kept_regular))

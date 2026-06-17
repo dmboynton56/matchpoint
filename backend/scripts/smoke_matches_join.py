@@ -23,11 +23,23 @@ class _FakeQuery:
     def eq(self, col, val):
         self._filters[col] = val
         return self
+    def in_(self, col, vals):
+        self._filters[col] = set(vals)
+        return self
     def order(self, col, desc=False):
         self._order_desc = desc
         return self
     def execute(self):
-        rows = [r for r in self._rows if all(r.get(k) == v for k, v in self._filters.items())]
+        def matches_filters(row):
+            for key, value in self._filters.items():
+                if isinstance(value, set):
+                    if row.get(key) not in value:
+                        return False
+                elif row.get(key) != value:
+                    return False
+            return True
+
+        rows = [r for r in self._rows if matches_filters(r)]
         if self._order_desc:
             rows = sorted(rows, key=lambda r: r.get("match_score") or 0, reverse=True)
         return type("R", (), {"data": rows})()
@@ -155,7 +167,10 @@ import app.db.database as db_module
 import app.routes.matches as matches_route
 # The matches route did `from app.db.database import supabase` at import
 # time, so its module-level `supabase` is its OWN binding. Patch both.
-db_module.supabase = _FakeSupabaseClient({"job_matches": SYNTH_MATCHES})
+db_module.supabase = _FakeSupabaseClient({
+    "job_matches": SYNTH_MATCHES,
+    "user_saved_jobs": [],
+})
 matches_route.supabase = db_module.supabase
 
 raw = matches_route._get_user_matches(

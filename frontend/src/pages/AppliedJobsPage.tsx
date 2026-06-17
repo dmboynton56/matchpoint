@@ -52,10 +52,8 @@ export function AppliedJobsPage() {
 
   const hasAppliedJobs = appliedJobs.length > 0
 
-  const handleUnapplied = (matchId: string) => {
-    setAppliedJobs((current) =>
-      current.filter((job) => job.match_id !== matchId)
-    )
+  const handleUnapplied = (jobId: string) => {
+    setAppliedJobs((current) => current.filter((job) => job.id !== jobId))
   }
 
   return (
@@ -85,10 +83,10 @@ export function AppliedJobsPage() {
                   job={job}
                   showApplyLink={hasApplyUrl(job)}
                   headerAddon={
-                    job.match_id ? (
+                    job.id ? (
                       <AppliedJobButton
-                        matchId={job.match_id}
-                        onUnapplied={() => handleUnapplied(job.match_id!)}
+                        jobId={job.id}
+                        onUnapplied={() => handleUnapplied(job.id)}
                       />
                     ) : null
                   }

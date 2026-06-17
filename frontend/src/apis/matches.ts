@@ -47,7 +47,8 @@ export interface MatchesResponse {
 
 export interface MatchUpdateResponse {
   success: boolean
-  match_id: string
+  match_id?: string
+  job_id?: string
   is_viewed?: boolean
   is_favorited?: boolean
   is_applied?: boolean
@@ -100,11 +101,29 @@ export async function toggleMatchFavorite(
   })
 }
 
+// Toggle the favorited state of a durable saved job
+export async function toggleSavedJobFavorite(
+  jobId: string
+): Promise<MatchUpdateResponse> {
+  return apiFetch<MatchUpdateResponse>(`/saved-jobs/${jobId}/favorite`, {
+    method: "PATCH",
+  })
+}
+
 // Toggle the applied state of a match
 export async function toggleMatchApplied(
   matchId: string
 ): Promise<MatchUpdateResponse> {
   return apiFetch<MatchUpdateResponse>(`/matches/${matchId}/applied`, {
+    method: "PATCH",
+  })
+}
+
+// Toggle the applied state of a durable saved job
+export async function toggleSavedJobApplied(
+  jobId: string
+): Promise<MatchUpdateResponse> {
+  return apiFetch<MatchUpdateResponse>(`/saved-jobs/${jobId}/applied`, {
     method: "PATCH",
   })
 }

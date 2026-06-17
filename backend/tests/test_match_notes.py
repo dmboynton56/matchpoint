@@ -1,4 +1,4 @@
-from app.schemas.ranking import JobScore, MatchNote
+from app.schemas.ranking import MATCH_NOTE_MAX_CHARS, JobScore, MatchNote
 from app.services.match_notes import normalize_match_notes
 
 
@@ -25,10 +25,7 @@ def test_promotes_location_drawback_from_regular_to_warning():
             MatchNote(text="Strong React overlap with the stack.", is_warning=False),
             MatchNote(text="API work maps to backend responsibilities.", is_warning=False),
             MatchNote(
-                text=(
-                    "Job requires San Francisco on-site; candidate is in Denver, CO "
-                    "with no relocation/onsite preference stated, lowering location fit."
-                ),
+                text="SF on-site; candidate is in Denver with no relocation, lowering location fit.",
                 is_warning=False,
             ),
         ]
@@ -42,6 +39,7 @@ def test_promotes_location_drawback_from_regular_to_warning():
     assert len(warnings) == 1
     assert "Denver" in warnings[0].text
     assert all("Denver" not in note.text for note in regular)
+    assert all(len(note.text) <= MATCH_NOTE_MAX_CHARS for note in notes)
 
 
 def test_keeps_existing_warnings_and_regular_notes():
@@ -64,6 +62,7 @@ def test_keeps_existing_warnings_and_regular_notes():
     assert len(regular) == 3
     assert len(warnings) == 1
     assert "salary band" in warnings[0].text.lower()
+    assert all(len(note.text) <= MATCH_NOTE_MAX_CHARS for note in notes)
 
 
 def test_backfills_regular_note_after_reclassification():
@@ -86,3 +85,4 @@ def test_backfills_regular_note_after_reclassification():
     assert len(regular) == 3
     assert len(warnings) == 1
     assert any("scores" in note.text.lower() for note in regular)
+    assert all(len(note.text) <= MATCH_NOTE_MAX_CHARS for note in notes)
