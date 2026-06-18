@@ -52,10 +52,8 @@ export function FavoritesPage() {
 
   const hasFavorites = favorites.length > 0
 
-  const handleUnfavorited = (matchId: string) => {
-    setFavorites((current) =>
-      current.filter((job) => job.match_id !== matchId)
-    )
+  const handleUnfavorited = (jobId: string) => {
+    setFavorites((current) => current.filter((job) => job.id !== jobId))
   }
 
   return (
@@ -85,10 +83,10 @@ export function FavoritesPage() {
                   job={job}
                   showApplyLink={hasApplyUrl(job)}
                   headerAddon={
-                    job.match_id ? (
+                    job.id ? (
                       <FavoriteJobHeartButton
-                        matchId={job.match_id}
-                        onUnfavorited={() => handleUnfavorited(job.match_id!)}
+                        jobId={job.id}
+                        onUnfavorited={() => handleUnfavorited(job.id)}
                       />
                     ) : null
                   }

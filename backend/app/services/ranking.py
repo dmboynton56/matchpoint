@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from app.schemas.ranking import (
     JobRankInput,
     JobScore,
+    MATCH_NOTE_MAX_CHARS,
     ScoringResponse,
     UserPreferences,
     validate_scores,
@@ -22,6 +23,16 @@ SCORING_JOB_DESCRIPTION_CHAR_LIMIT = int(
 SCORING_BATCH_SIZE = int(os.getenv("SCORING_BATCH_SIZE", "5"))
 SCORING_PARALLELISM = int(os.getenv("SCORING_PARALLELISM", "2"))
 SCORING_REASONING_EFFORT = os.getenv("SCORING_REASONING_EFFORT", "none")
+MATCH_SCORE_WEIGHTS = {
+    "skills_fit": 0.25,
+    "experience_fit": 0.18,
+    "role_fit": 0.17,
+    "seniority_fit": 0.10,
+    "location_fit": 0.10,
+    "pay_fit": 0.075,
+    "preference_fit": 0.075,
+    "interview_likelihood": 0.05,
+}
 
 scoring_client = client.with_options(
     timeout=SCORING_TIMEOUT_SECONDS,
@@ -29,7 +40,7 @@ scoring_client = client.with_options(
 )
 
 
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT = f"""
 Score each job independently for this resume.
 
 Return compact, grounded structured data only. Do not compare jobs to each other,
@@ -40,16 +51,18 @@ Use JOB facts as grounded truth when they are present. Use USER_PREFERENCES only
 for preference scoring; do not invent location, pay, or position preferences from
 the resume unless they are explicitly present in USER_PREFERENCES.
 
-Estimate interview_likelihood as the realistic chance this candidate would get
-an interview from the job evidence and resume evidence. Score skills_fit,
-experience_fit, seniority_fit, location_fit, pay_fit, role_fit, and
-preference_fit from 0-1. If a preference or job fact is unknown, use a neutral fit
-near 0.75 and explain that the evidence is missing. Use vector_similarity only as
-weak context, not as the score.
+Estimate interview_likelihood as a separate realistic chance this candidate
+would get an interview from the job evidence and resume evidence. It is not the
+overall match score. Score skills_fit, experience_fit, seniority_fit,
+location_fit, pay_fit, role_fit, and preference_fit from 0-1 as match-quality
+signals. If a preference or job fact is unknown, use a neutral fit near 0.75 and
+explain that the evidence is missing. Use vector_similarity only as weak
+context, not as the score.
 
 Return exactly three match_notes with is_warning=false plus zero or more
 match_notes with is_warning=true. Regular comments and warnings serve different
-purposes and must not duplicate the same point.
+purposes and must not duplicate the same point. Every match note must be
+{MATCH_NOTE_MAX_CHARS} characters or fewer so it fits on one UI line.
 
 Regular comments (is_warning=false, exactly three):
 - Explain why the job is worth considering: skills overlap, role alignment,
@@ -279,14 +292,8 @@ def score_jobs_with_llm(
 
 
 def compute_match_score(score: JobScore) -> float:
-    weighted_score = (
-        score.interview_likelihood * 0.40
-        + score.skills_fit * 0.20
-        + score.experience_fit * 0.10
-        + score.seniority_fit * 0.05
-        + score.role_fit * 0.10
-        + score.location_fit * 0.075
-        + score.pay_fit * 0.05
-        + score.preference_fit * 0.025
+    weighted_score = sum(
+        getattr(score, field) * weight
+        for field, weight in MATCH_SCORE_WEIGHTS.items()
     )
     return round(max(0, min(1, weighted_score)), 4)

@@ -1,5 +1,7 @@
 from pydantic import BaseModel, Field
 
+MATCH_NOTE_MAX_CHARS = 90
+
 
 class SalaryFacts(BaseModel):
     minimum: int | None = Field(default=None, ge=0)
@@ -35,7 +37,7 @@ class JobRankInput(BaseModel):
 
 
 class MatchNote(BaseModel):
-    text: str = Field(max_length=150)
+    text: str = Field(max_length=MATCH_NOTE_MAX_CHARS)
     is_warning: bool = False
 
 
