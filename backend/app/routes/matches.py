@@ -511,8 +511,9 @@ async def get_my_matches(
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("Failed to fetch matches")
         raise HTTPException(
-            status_code=500, detail=f"Failed to fetch matches: {str(e)}"
+            status_code=500, detail="Failed to fetch matches."
         ) from e
 
 
@@ -568,8 +569,9 @@ async def mark_match_viewed(
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("Failed to mark match viewed")
         raise HTTPException(
-            status_code=500, detail=f"Failed to update match: {str(e)}"
+            status_code=500, detail="Failed to update match."
         ) from e
 
 
@@ -610,8 +612,9 @@ async def toggle_favorite(
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("Failed to toggle match favorite")
         raise HTTPException(
-            status_code=500, detail=f"Failed to update match: {str(e)}"
+            status_code=500, detail="Failed to update match."
         ) from e
 
 
@@ -652,8 +655,9 @@ async def toggle_applied(
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("Failed to toggle match applied")
         raise HTTPException(
-            status_code=500, detail=f"Failed to update match: {str(e)}"
+            status_code=500, detail="Failed to update match."
         ) from e
 
 
@@ -678,8 +682,9 @@ async def toggle_saved_job_favorite(
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("Failed to toggle saved job favorite")
         raise HTTPException(
-            status_code=500, detail=f"Failed to update saved job: {str(e)}"
+            status_code=500, detail="Failed to update saved job."
         ) from e
 
 
@@ -704,8 +709,9 @@ async def toggle_saved_job_applied(
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("Failed to toggle saved job applied")
         raise HTTPException(
-            status_code=500, detail=f"Failed to update saved job: {str(e)}"
+            status_code=500, detail="Failed to update saved job."
         ) from e
 
 
@@ -732,6 +738,7 @@ async def delete_match(
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("Failed to delete match")
         raise HTTPException(
-            status_code=500, detail=f"Failed to delete match: {str(e)}"
+            status_code=500, detail="Failed to delete match."
         ) from e

@@ -295,6 +295,8 @@ def reset_turso():
 
 @pytest.fixture
 def fake_supabase():
+    original_db_supabase = db_module.supabase
+    original_route_supabase = matches_route.supabase
     store = FakeSupabaseStore(
         {
             "job_matches": [_sample_match()],
@@ -303,7 +305,9 @@ def fake_supabase():
     )
     db_module.supabase = store
     matches_route.supabase = store
-    return store
+    yield store
+    db_module.supabase = original_db_supabase
+    matches_route.supabase = original_route_supabase
 
 
 def test_is_missing_saved_jobs_table_error():
