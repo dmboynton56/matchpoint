@@ -40,6 +40,8 @@ type JobListingCardProps = {
   showTags?: boolean
   /** Shown in the card header row (e.g. favorite control). */
   headerAddon?: ReactNode
+  /** Shown in the card footer row (e.g. favorite/applied toggles). */
+  footerAddon?: ReactNode
   className?: string
 }
 
@@ -151,6 +153,7 @@ export function JobListingCard({
   onApplyClick,
   showTags = false,
   headerAddon,
+  footerAddon,
   className,
 }: JobListingCardProps) {
   const { highlights, warnings } = splitMatchNotes(job)
@@ -163,6 +166,7 @@ export function JobListingCard({
   const showNoteList = showHighlights && highlights.length > 0
   const showWarnings = showHighlights && warnings.length > 0
   const showApply = showApplyLink && hasApplyUrl(job)
+  const showFooter = showApply || footerAddon
 
   return (
     <article
@@ -216,39 +220,42 @@ export function JobListingCard({
           ) : null}
         </div>
 
-        {showApply ? (
+        {showFooter ? (
           <div className="mt-3 flex flex-wrap items-center justify-end gap-2 border-t border-border/60 pt-2.5">
-            {onApplyClick ? (
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-8 gap-1.5 text-xs font-medium"
-                onClick={() => {
-                  window.open(job.apply_url!, "_blank", "noopener,noreferrer")
-                  onApplyClick(job)
-                }}
-              >
-                Apply
-                <ExternalLink className="size-3.5" aria-hidden="true" />
-              </Button>
-            ) : (
-              <Button
-                asChild
-                variant="outline"
-                size="sm"
-                className="h-8 gap-1.5 text-xs font-medium"
-              >
-                <a
-                  href={job.apply_url}
-                  target="_blank"
-                  rel="noopener noreferrer"
+            {footerAddon}
+            {showApply ? (
+              onApplyClick ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-8 gap-1.5 text-xs font-medium"
+                  onClick={() => {
+                    window.open(job.apply_url!, "_blank", "noopener,noreferrer")
+                    onApplyClick(job)
+                  }}
                 >
                   Apply
                   <ExternalLink className="size-3.5" aria-hidden="true" />
-                </a>
-              </Button>
-            )}
+                </Button>
+              ) : (
+                <Button
+                  asChild
+                  variant="outline"
+                  size="sm"
+                  className="h-8 gap-1.5 text-xs font-medium"
+                >
+                  <a
+                    href={job.apply_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Apply
+                    <ExternalLink className="size-3.5" aria-hidden="true" />
+                  </a>
+                </Button>
+              )
+            ) : null}
           </div>
         ) : null}
     </article>

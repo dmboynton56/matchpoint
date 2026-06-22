@@ -1,4 +1,4 @@
-import { Briefcase, ClipboardCheck, Heart, LogOut, Settings, User } from "lucide-react"
+import { Briefcase, ClipboardCheck, Heart, LogOut, User } from "lucide-react"
 import { useNavigate } from "react-router-dom"
 import { toast } from "sonner"
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
@@ -114,16 +114,6 @@ export function AccountNav({ className }: { className?: string }) {
           >
             <User className="size-4" aria-hidden="true" />
             Profile
-          </Button>
-          <Button
-            type="button"
-            variant="ghost"
-            role="menuitem"
-            className="h-9 w-full justify-start gap-2 rounded-none px-3 font-normal"
-            onClick={() => toast.message("Settings — coming soon")}
-          >
-            <Settings className="size-4" aria-hidden="true" />
-            Settings
           </Button>
           <Button
             type="button"

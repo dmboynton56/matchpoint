@@ -320,12 +320,12 @@ export function ProfilePage() {
             Profile
           </h1>
           <p className="max-w-2xl text-sm leading-relaxed text-muted-foreground sm:text-base">
-            Update your email, target role, and resume settings.
+            Update your email, match preferences, and resume.
           </p>
         </section>
 
-        <div className="flex flex-col items-center gap-6">
-          <Card className="h-fit min-w-100 md:min-w-150 lg:min-w-200">
+        <div className="grid gap-6 md:grid-cols-2">
+          <Card className="h-fit">
             <CardHeader>
               <CardTitle>Email</CardTitle>
               <CardDescription>
@@ -377,7 +377,7 @@ export function ProfilePage() {
             </form>
           </Card>
 
-          <Card className="h-fit min-w-100 md:min-w-150 lg:min-w-200">
+          <Card className="h-fit">
             <CardHeader>
               <CardTitle>Match preferences</CardTitle>
               <CardDescription>
@@ -451,7 +451,7 @@ export function ProfilePage() {
             </CardFooter>
           </Card>
 
-          <Card className="h-fit min-w-100 md:min-w-150 lg:min-w-200">
+          <Card className="h-fit md:col-start-1">
             <CardHeader>
               <CardTitle>Resume</CardTitle>
               <CardDescription>
