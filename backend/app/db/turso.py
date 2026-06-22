@@ -388,9 +388,15 @@ GITHUB_REPO_OWNER = os.getenv("GITHUB_REPO_OWNER", "").strip()
 GITHUB_REPO_NAME = os.getenv("GITHUB_REPO_NAME", "").strip()
 EMBEDDINGS_BRANCH_REF = os.getenv("EMBEDDINGS_BRANCH_REF", "data-cache").strip()
 EMBEDDINGS_LOCAL_PATH = os.getenv("EMBEDDINGS_LOCAL_PATH", "").strip()
-EMBEDDINGS_FETCH_TIMEOUT_SECONDS = float(
-    os.getenv("EMBEDDINGS_FETCH_TIMEOUT_SECONDS", "10")
-)
+_timeout_raw = os.getenv("EMBEDDINGS_FETCH_TIMEOUT_SECONDS", "10")
+try:
+    EMBEDDINGS_FETCH_TIMEOUT_SECONDS = float(_timeout_raw)
+except ValueError:
+    EMBEDDINGS_FETCH_TIMEOUT_SECONDS = 10.0
+    print(
+        f"[embeddings] invalid EMBEDDINGS_FETCH_TIMEOUT_SECONDS={_timeout_raw!r}; "
+        f"defaulting to 10.0"
+    )
 
 _matrix_cache: "np.ndarray | None" = None  # type: ignore[type-arg]
 _ids_cache: "list[str] | None" = None
@@ -415,6 +421,10 @@ def _get_matrix_and_ids() -> tuple["np.ndarray", "list[str]"] | None:  # type: i
             if _matrix_cache is None or _ids_cache is None:
                 return None
             return _matrix_cache, _ids_cache
+        # Import the codec in its own try block so that a failed import
+        # (e.g., syntax error in embedding_matrix.py) doesn't leave
+        # `EmbeddingMatrixError` unbound and crash the except clause with
+        # UnboundLocalError before the fallback can run.
         try:
             from app.services.embedding_matrix import (
                 EmbeddingMatrixError,
@@ -422,6 +432,17 @@ def _get_matrix_and_ids() -> tuple["np.ndarray", "list[str]"] | None:  # type: i
                 IDS_FILENAME,
                 decode as decode_matrix,
             )
+        except Exception as import_exc:
+            _matrix_load_error = f"import: {type(import_exc).__name__}: {import_exc}"
+            print(
+                f"[embeddings] failed to import embedding_matrix module, "
+                f"falling back to Turso: {type(import_exc).__name__}: {import_exc}"
+            )
+            # Do NOT set _matrix_loaded = True here. A transient import
+            # error (e.g., the module was edited mid-deploy) should not
+            # permanently disable the cache for this process.
+            return None
+        try:
             if EMBEDDINGS_SOURCE == "local":
                 matrix, ids = _load_matrix_from_local(
                     decode_matrix, MATRIX_FILENAME, IDS_FILENAME
@@ -450,16 +471,15 @@ def _get_matrix_and_ids() -> tuple["np.ndarray", "list[str]"] | None:  # type: i
             )
             return matrix, ids
         except EmbeddingMatrixError as e:
-            _matrix_loaded = True
-            _matrix_cache = None
-            _ids_cache = None
+            # Do NOT set _matrix_loaded = True. A transient bad-matrix
+            # condition (e.g., a force-push that the SHA lookup raced
+            # against) should not disable the cache for the process
+            # lifetime. The next call will retry.
             _matrix_load_error = f"validation: {e}"
             print(f"[embeddings] matrix validation failed, falling back to Turso: {e}")
             return None
         except Exception as e:
-            _matrix_loaded = True
-            _matrix_cache = None
-            _ids_cache = None
+            # Same reasoning: transient fetch/load errors should retry.
             _matrix_load_error = f"load: {type(e).__name__}: {e}"
             print(
                 f"[embeddings] failed to load matrix from {EMBEDDINGS_SOURCE}, "

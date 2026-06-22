@@ -116,7 +116,7 @@ def push_matrix_to_branch(
         existing = _run(
             ["git", "worktree", "list", "--porcelain"], repo_root
         )
-        if "wt" in existing.stdout:
+        if str(worktree) in existing.stdout:
             _run(["git", "worktree", "remove", "--force", str(worktree)], repo_root)
 
         # Check if the branch exists locally

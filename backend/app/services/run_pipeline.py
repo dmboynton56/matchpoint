@@ -85,12 +85,17 @@ def _fetch_all_job_embeddings() -> tuple[list[str], list[list[float]]]:
             continue
         try:
             embedding = json.loads(raw_embedding)
+            if not isinstance(embedding, list) or len(embedding) == 0:
+                continue
+            # Build the float vector first; if it raises, the job_id
+            # has not been appended yet so the lists stay in sync.
+            floats = [float(x) for x in embedding]
         except (TypeError, ValueError, json.JSONDecodeError):
-            continue
-        if not isinstance(embedding, list) or len(embedding) == 0:
+            # Skip rows with malformed JSON or non-numeric embedding
+            # values rather than aborting the entire matrix build.
             continue
         job_ids.append(str(row[0]))
-        embeddings.append([float(x) for x in embedding])
+        embeddings.append(floats)
     return job_ids, embeddings
 
 
