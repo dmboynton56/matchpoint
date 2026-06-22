@@ -21,9 +21,12 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import threading
 from typing import Any, Iterable
 
+import httpx
+import numpy as np
 from dotenv import load_dotenv
 
 try:
@@ -361,6 +364,187 @@ def purge_older_than(cutoff_iso: str) -> int:
 # -----------------------------------------------------------------------------
 # Vector search (client-side cosine similarity, no pgvector in libSQL)
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Embedding matrix cache (data-cache branch on GitHub, local file, or Turso)
+# -----------------------------------------------------------------------------
+# Read path for vector_search can source the precomputed (matrix, ids) artifact
+# from three places, controlled by EMBEDDINGS_SOURCE env var:
+#
+#   "github"  — fetch the latest commit SHA from the GitHub API, then pull
+#                matrix.npy + matrix_ids.json from raw.githubusercontent.com.
+#                This is the default in production. ~1–3s on cold start, sub-10ms
+#                warm. Repo must be public.
+#   "local"   — read from a local file path. Used for testing the codec and
+#                matmul without touching GitHub. Set EMBEDDINGS_LOCAL_PATH.
+#   "turso"   — disable the cache entirely. Falls back to the legacy
+#                SELECT-embedding path below. This is the rollback mode.
+#
+# If EMBEDDINGS_SOURCE is unset, default to "github".
+# Any failure during fetch/load/validate falls back to the Turso path with a
+# logged warning. This is intentional: the cache must never break the request.
+# -----------------------------------------------------------------------------
+EMBEDDINGS_SOURCE = os.getenv("EMBEDDINGS_SOURCE", "github").strip().lower()
+GITHUB_REPO_OWNER = os.getenv("GITHUB_REPO_OWNER", "").strip()
+GITHUB_REPO_NAME = os.getenv("GITHUB_REPO_NAME", "").strip()
+EMBEDDINGS_BRANCH_REF = os.getenv("EMBEDDINGS_BRANCH_REF", "data-cache").strip()
+EMBEDDINGS_LOCAL_PATH = os.getenv("EMBEDDINGS_LOCAL_PATH", "").strip()
+_timeout_raw = os.getenv("EMBEDDINGS_FETCH_TIMEOUT_SECONDS", "10")
+try:
+    EMBEDDINGS_FETCH_TIMEOUT_SECONDS = float(_timeout_raw)
+except ValueError:
+    EMBEDDINGS_FETCH_TIMEOUT_SECONDS = 10.0
+    print(
+        f"[embeddings] invalid EMBEDDINGS_FETCH_TIMEOUT_SECONDS={_timeout_raw!r}; "
+        f"defaulting to 10.0"
+    )
+
+_matrix_cache: "np.ndarray | None" = None  # type: ignore[type-arg]
+_ids_cache: "list[str] | None" = None
+_matrix_lock = threading.Lock()
+_matrix_loaded: bool = False
+_matrix_load_error: str | None = None
+
+
+def _get_matrix_and_ids() -> tuple["np.ndarray", "list[str]"] | None:  # type: ignore[type-arg]
+    """Return (matrix, ids) from the configured source, or None if the
+    source is disabled or the load failed (in which case the caller falls
+    back to the Turso SELECT path)."""
+    global _matrix_cache, _ids_cache, _matrix_loaded, _matrix_load_error
+    if EMBEDDINGS_SOURCE == "turso":
+        return None
+    if _matrix_loaded:
+        if _matrix_cache is None or _ids_cache is None:
+            return None
+        return _matrix_cache, _ids_cache
+    with _matrix_lock:
+        if _matrix_loaded:
+            if _matrix_cache is None or _ids_cache is None:
+                return None
+            return _matrix_cache, _ids_cache
+        # Import the codec in its own try block so that a failed import
+        # (e.g., syntax error in embedding_matrix.py) doesn't leave
+        # `EmbeddingMatrixError` unbound and crash the except clause with
+        # UnboundLocalError before the fallback can run.
+        try:
+            from app.services.embedding_matrix import (
+                EmbeddingMatrixError,
+                MATRIX_FILENAME,
+                IDS_FILENAME,
+                decode as decode_matrix,
+            )
+        except Exception as import_exc:
+            _matrix_load_error = f"import: {type(import_exc).__name__}: {import_exc}"
+            print(
+                f"[embeddings] failed to import embedding_matrix module, "
+                f"falling back to Turso: {type(import_exc).__name__}: {import_exc}"
+            )
+            # Do NOT set _matrix_loaded = True here. A transient import
+            # error (e.g., the module was edited mid-deploy) should not
+            # permanently disable the cache for this process.
+            return None
+        try:
+            if EMBEDDINGS_SOURCE == "local":
+                matrix, ids = _load_matrix_from_local(
+                    decode_matrix, MATRIX_FILENAME, IDS_FILENAME
+                )
+            elif EMBEDDINGS_SOURCE == "github":
+                matrix, ids = _load_matrix_from_github(
+                    decode_matrix, MATRIX_FILENAME, IDS_FILENAME
+                )
+            else:
+                print(
+                    f"[embeddings] Unknown EMBEDDINGS_SOURCE={EMBEDDINGS_SOURCE!r}; "
+                    f"valid values are 'github', 'local', 'turso'. Falling back to Turso."
+                )
+                _matrix_loaded = True
+                _matrix_cache = None
+                _ids_cache = None
+                _matrix_load_error = f"unknown source: {EMBEDDINGS_SOURCE}"
+                return None
+            _matrix_cache = matrix
+            _ids_cache = ids
+            _matrix_loaded = True
+            _matrix_load_error = None
+            print(
+                f"[embeddings] loaded matrix from {EMBEDDINGS_SOURCE}: "
+                f"shape={matrix.shape} dtype={matrix.dtype} ids={len(ids)}"
+            )
+            return matrix, ids
+        except EmbeddingMatrixError as e:
+            # Do NOT set _matrix_loaded = True. A transient bad-matrix
+            # condition (e.g., a force-push that the SHA lookup raced
+            # against) should not disable the cache for the process
+            # lifetime. The next call will retry.
+            _matrix_load_error = f"validation: {e}"
+            print(f"[embeddings] matrix validation failed, falling back to Turso: {e}")
+            return None
+        except Exception as e:
+            # Same reasoning: transient fetch/load errors should retry.
+            _matrix_load_error = f"load: {type(e).__name__}: {e}"
+            print(
+                f"[embeddings] failed to load matrix from {EMBEDDINGS_SOURCE}, "
+                f"falling back to Turso: {type(e).__name__}: {e}"
+            )
+            return None
+
+
+def _load_matrix_from_local(decode, matrix_filename: str, ids_filename: str):
+    if not EMBEDDINGS_LOCAL_PATH:
+        raise RuntimeError(
+            "EMBEDDINGS_SOURCE=local requires EMBEDDINGS_LOCAL_PATH to be set"
+        )
+    base = pathlib.Path(EMBEDDINGS_LOCAL_PATH)
+    matrix_path = base / matrix_filename
+    ids_path = base / ids_filename
+    if not matrix_path.exists() or not ids_path.exists():
+        raise RuntimeError(
+            f"local matrix files not found at {base} "
+            f"(expected {matrix_filename} and {ids_filename})"
+        )
+    return decode(matrix_path.read_bytes(), ids_path.read_bytes())
+
+
+def _load_matrix_from_github(decode, matrix_filename: str, ids_filename: str):
+    if not GITHUB_REPO_OWNER or not GITHUB_REPO_NAME:
+        raise RuntimeError(
+            "EMBEDDINGS_SOURCE=github requires GITHUB_REPO_OWNER and "
+            "GITHUB_REPO_NAME env vars"
+        )
+    api_url = (
+        f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}"
+        f"/git/ref/heads/{EMBEDDINGS_BRANCH_REF}"
+    )
+    timeout = EMBEDDINGS_FETCH_TIMEOUT_SECONDS
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        # 1. Resolve the commit SHA so we never see a stale CDN-cached file.
+        resp = client.get(
+            api_url,
+            headers={"Accept": "application/vnd.github+json"},
+        )
+        if resp.status_code == 404:
+            raise RuntimeError(
+                f"branch {EMBEDDINGS_BRANCH_REF!r} not found on "
+                f"{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME} (404). "
+                f"Has the pipeline pushed to it yet?"
+            )
+        resp.raise_for_status()
+        sha = resp.json()["object"]["sha"]
+
+        # 2. Fetch the matrix + ids at the resolved SHA. raw.githubusercontent.com
+        #    serves the file with the SHA in the path, bypassing any CDN cache
+        #    of the branch ref.
+        base = (
+            f"https://raw.githubusercontent.com/{GITHUB_REPO_OWNER}/"
+            f"{GITHUB_REPO_NAME}/{sha}/data/embeddings"
+        )
+        matrix_resp = client.get(f"{base}/{matrix_filename}")
+        matrix_resp.raise_for_status()
+        ids_resp = client.get(f"{base}/{ids_filename}")
+        ids_resp.raise_for_status()
+
+    return decode(matrix_resp.content, ids_resp.content)
+
+
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     if len(a) != len(b):
         return 0.0
@@ -384,7 +568,78 @@ def vector_search(
     Mirrors the shape that the old `supabase.rpc("match_jobs")` returned so
     the call sites in `routes/resumes.py` don't need to change:
         {id, title, company, location, apply_url, similarity}
+
+    Fast path: a precomputed (matrix, ids) artifact is loaded once per
+    process from EMBEDDINGS_SOURCE (github | local). The artifact is
+    L2-normalized so cosine sim is a single matmul.
+
+    Slow path: if the artifact is unavailable, missing, or fails validation,
+    fall back to the legacy per-row Turso SELECT. This path is correct but
+    ~100× slower; it exists as a safety net, not a primary route.
     """
+    cached = _get_matrix_and_ids()
+    if cached is not None:
+        matrix, ids = cached
+        # Need metadata for the top-k. Two options:
+        #   (a) Pull it from the matrix's ids and let the caller fetch_full_jobs
+        #   (b) Pull title/company/location/apply_url here via a single SELECT
+        # We do (b) so the call site doesn't need to know whether the fast or
+        # slow path was taken. The SELECT is keyed on the matched ids only,
+        # not the whole table.
+        from app.services.embedding_matrix import top_k_ids
+        top = top_k_ids(matrix, ids, query_embedding, limit)
+        if not top:
+            return []
+        top_ids = [job_id for job_id, _ in top]
+        meta_by_id = _fetch_metadata_for_ids(top_ids)
+        out: list[dict] = []
+        for job_id, sim in top:
+            meta = meta_by_id.get(job_id)
+            if not meta:
+                # Race: matrix has the id but Turso no longer does. Skip.
+                continue
+            out.append(
+                {
+                    "id": job_id,
+                    "title": meta["title"],
+                    "company": meta["company"],
+                    "location": meta["location"],
+                    "apply_url": meta["apply_url"],
+                    "similarity": sim,
+                }
+            )
+        return out
+
+    # Slow path: legacy behavior. Full table scan + per-row Python cosine.
+    return _vector_search_legacy(query_embedding, limit=limit)
+
+
+def _fetch_metadata_for_ids(job_ids: list[str]) -> dict[str, dict]:
+    """Cheap SELECT for title/company/location/apply_url keyed on the
+    matched ids. No embedding column — small payload, fast round-trip."""
+    if not job_ids:
+        return {}
+    conn = get_client()
+    placeholders = ",".join(["?"] * len(job_ids))
+    sql = (
+        "SELECT id, title, company, location, apply_url "
+        f"FROM jobs WHERE id IN ({placeholders})"
+    )
+    cursor = conn.execute(sql, list(job_ids))
+    return {
+        str(row[0]): {
+            "title": row[1],
+            "company": row[2],
+            "location": row[3],
+            "apply_url": row[4],
+        }
+        for row in cursor.fetchall()
+    }
+
+
+def _vector_search_legacy(
+    query_embedding: list[float], *, limit: int
+) -> list[dict]:
     conn = get_client()
     cursor = conn.execute(
         "SELECT id, title, company, location, apply_url, embedding "

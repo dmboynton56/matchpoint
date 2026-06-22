@@ -21,11 +21,21 @@ try:
     from .scraper100 import scrape_all
     from .cleaning import buildCleanedText
     from .embedding import generate_embeddings_batch
+    from .embedding_matrix import (
+        EmbeddingMatrixError,
+        encode as encode_embedding_matrix,
+    )
+    from .git_data_cache import GitDataCacheError, push_matrix_to_branch
     from ..db import turso
 except ImportError:
     from scraper100 import scrape_all
     from cleaning import buildCleanedText
     from embedding import generate_embeddings_batch
+    from embedding_matrix import (
+        EmbeddingMatrixError,
+        encode as encode_embedding_matrix,
+    )
+    from git_data_cache import GitDataCacheError, push_matrix_to_branch
     from db import turso
 
 
@@ -53,6 +63,84 @@ def purge_stale_jobs():
     except Exception as e:
         print(f"Purge failed: {e}")
         raise
+
+
+def _fetch_all_job_embeddings() -> tuple[list[str], list[list[float]]]:
+    """Read every (id, embedding) from Turso. Used once at the end of the
+    pipeline to build the in-memory matrix artifact for the read path.
+
+    Done as a single SELECT so we don't pay 5k round-trips. JSON-parse
+    errors are skipped (matching the read path's tolerance for bad rows).
+    """
+    conn = turso.get_client()
+    cursor = conn.execute(
+        "SELECT id, embedding FROM jobs WHERE embedding IS NOT NULL"
+    )
+    import json
+    job_ids: list[str] = []
+    embeddings: list[list[float]] = []
+    for row in cursor.fetchall():
+        raw_embedding = row[1]
+        if raw_embedding is None or raw_embedding == "":
+            continue
+        try:
+            embedding = json.loads(raw_embedding)
+            if not isinstance(embedding, list) or len(embedding) == 0:
+                continue
+            # Build the float vector first; if it raises, the job_id
+            # has not been appended yet so the lists stay in sync.
+            floats = [float(x) for x in embedding]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            # Skip rows with malformed JSON or non-numeric embedding
+            # values rather than aborting the entire matrix build.
+            continue
+        job_ids.append(str(row[0]))
+        embeddings.append(floats)
+    return job_ids, embeddings
+
+
+def write_and_publish_matrix() -> None:
+    """Step 7: build the (matrix, ids) artifact and push it to the
+    data-cache branch so the Vercel read path can use it.
+
+    Non-fatal: any failure here is logged but does not raise. The Turso
+    read path will continue to work as a fallback.
+    """
+    print("\n=== STEP 7: Building embedding matrix artifact ===")
+    try:
+        job_ids, embeddings = _fetch_all_job_embeddings()
+    except Exception as e:
+        print(f"[step7] Failed to read jobs from Turso: {e}")
+        return
+
+    if not job_ids:
+        print("[step7] No jobs with embeddings — skipping matrix build")
+        return
+
+    print(f"  Read {len(job_ids)} jobs with embeddings from Turso")
+
+    try:
+        matrix_bytes, ids_bytes = encode_embedding_matrix(job_ids, embeddings)
+    except EmbeddingMatrixError as e:
+        print(f"[step7] Matrix validation failed: {e}")
+        return
+
+    size_mb = (len(matrix_bytes) + len(ids_bytes)) / 1e6
+    print(
+        f"  Built matrix artifact: {size_mb:.1f} MB total "
+        f"({len(matrix_bytes) / 1e6:.1f} MB matrix + "
+        f"{len(ids_bytes) / 1e3:.1f} KB ids)"
+    )
+
+    try:
+        push_matrix_to_branch(matrix_bytes, ids_bytes)
+    except GitDataCacheError as e:
+        print(f"[step7] Push to data-cache branch failed: {e}")
+        print(
+            "[step7] The matrix was NOT published. The Vercel read path will "
+            "fall back to Turso until the next successful pipeline run."
+        )
+        return
 
 
 def run_pipeline():
@@ -90,6 +178,7 @@ def run_pipeline():
     if not new_jobs:
         print("No new jobs to insert — running purge and exiting.")
         purge_stale_jobs()
+        write_and_publish_matrix()
         sys.exit(0)
 
     print("\n=== STEP 3: Building embedding texts ===")
@@ -126,6 +215,9 @@ def run_pipeline():
 
     print("\n=== STEP 6: Purging stale jobs ===")
     purge_stale_jobs()
+
+    print("\n=== STEP 7: Publishing embedding matrix ===")
+    write_and_publish_matrix()
 
     elapsed = time.perf_counter() - start
     print(f"\nPipeline complete — {total_inserted} new jobs inserted in {elapsed:.1f}s")
