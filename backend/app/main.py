@@ -4,6 +4,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routes.matches import router as matches_router
 from app.routes.resumes import router as resumes_router
+from app.routes.suggestions import router as suggestions_router
+from app.db.database import (
+    supabase
+)
 app = FastAPI()
 
 cors_origins = [
@@ -23,7 +27,7 @@ app.add_middleware(
 
 app.include_router(matches_router)
 app.include_router(resumes_router)
-
+app.include_router(suggestions_router)
 
 @app.get("/")
 def root():

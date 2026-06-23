@@ -1,0 +1,554 @@
+"""LLM-facing functions for the bullet-coach flow.
+
+Two calls to OpenAI:
+
+  1. `start_coach_session(...)` — combined "identify weak bullets + ask
+     targeted questions + return SKILL suggestions" in a single
+     structured response. Returns (skills, bullets) that the route
+     layer packages into a CoachStartResponse.
+
+  2. `rewrite_bullet(...)` — takes the original bullet + user's
+     answers + the cited quote, returns a rewritten bullet grounded
+     only in those facts. The validator (see
+     schemas/suggestions.py:validate_coach_rewrite_grounding) confirms
+     no fabricated tokens survive before the response goes out.
+
+Why these are separate files
+---------------------------
+- services/bullet_coach.py — in-memory session store (pure Python, no
+  LLM, no I/O). This file is easy to unit-test in isolation.
+- services/bullet_coach_llm.py — the OpenAI prompts + parsing. Mocked
+  in tests the same way services/suggestions.py is.
+
+Prompts
+-------
+The start-coach prompt is intentionally conservative: when in doubt,
+return fewer bullets (rather than weak ones). The user can always run
+it again. Better to ship 2 high-quality bullets than 5 with one
+hallucinated weakness reason.
+
+The rewrite prompt tells the LLM to use ONLY the user-supplied
+answers as factual material. The validator's job is to enforce that
+structurally — the prompt is encouragement, not the guard.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+from app.schemas.suggestions import (
+    Citation,
+    CoachBullet,
+    CoachQuestion,
+    CoachQuestionType,
+    MAX_COACH_QUESTIONS,
+    MAX_SUGGESTIONS,
+    Suggestion,
+    SuggestionsResponse,
+    validate_coach_start_request,
+)
+from app.services.embedding import client
+from app.services.learning_links import canonical_keys
+
+
+# ---------------------------------------------------------------------------
+# Configuration (env-tunable, mirrors services/suggestions.py style)
+# ---------------------------------------------------------------------------
+
+COACH_MODEL = os.getenv("OPENAI_COACH_MODEL", "gpt-4o-mini")
+# 45s upper bound. The structured-outputs call to gpt-4o-mini
+# can be slow under load; better to wait than to fail.
+COACH_TIMEOUT_SECONDS = float(os.getenv("OPENAI_COACH_TIMEOUT_SECONDS", "45"))
+COACH_MAX_RETRIES = int(os.getenv("OPENAI_COACH_MAX_RETRIES", "1"))
+COACH_TEMPERATURE = float(os.getenv("OPENAI_COACH_TEMPERATURE", "0.2"))
+
+coach_client = client.with_options(
+    timeout=COACH_TIMEOUT_SECONDS,
+    max_retries=COACH_MAX_RETRIES,
+)
+
+
+# ---------------------------------------------------------------------------
+# Structured response shapes (separate from the API-level CoachStartResponse
+# because we want internal-only fields, like per-bullet weakness reason
+# length, to be more permissive than what ships to the client)
+# ---------------------------------------------------------------------------
+
+
+class _CoachStartLLMResponse(BaseModel):
+    """Internal response shape from the LLM. Validated + trimmed before
+    being packaged as CoachStartResponse for the client.
+    """
+
+    skills: list[Suggestion] = Field(default_factory=list)
+    bullets: list[CoachBullet] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+
+COACH_START_SYSTEM_PROMPT = """
+You are a resume coach. Your job is to:
+
+  1. Look at the candidate's resume + their top job matches.
+  2. Identify up to 4 weak bullets in the resume -- bullets that
+     lack measurable impact (no numbers, no %, no scale, no
+     latency, no team size). Example: "Built a job matching
+     platform" with no scale or technology detail.
+  3. For each weak bullet, return:
+     - the original text (verbatim, the user can Ctrl-F to find)
+     - a short "weakness reason" -- one sentence
+     - 2-4 targeted questions the candidate would need to answer
+       before the bullet could be rewritten with measurable impact
+     - a "location" pointing to the section / entry this bullet
+       came from in the parsed resume
+  4. ALSO return 2-5 SKILL suggestions (a single tool/technology
+     name with a citation quote from one of the top jobs). This is
+     the same shape as the one-shot resume-suggestions flow.
+
+Hallucination guard (structural -- these are not optional):
+
+  - Every citation quote MUST be a verbatim substring of the cited
+    job's description. A quote the user could Ctrl-F to find.
+  - `original_text` MUST be a verbatim substring of the entry the
+    LLM points to in the `location` field. The validator drops
+    the bullet if it isn't.
+  - Every question for a bullet must be answerable with concrete
+    facts the candidate actually knows (technologies used, scale,
+    team size, latency, time period, key features, business
+    impact).
+  - Question keys must be ASCII identifiers (letters, digits,
+    underscore) -- they're used as map keys in the response.
+    Examples: "scale", "tech_stack", "team_size", "latency",
+    "user_count".
+  - Never invent skill names. If a top job mentions a category
+    like "AI integration", surface the specific tool the job
+    names (e.g. "OpenAI API"). Prefer specific tool names over
+    category phrases.
+
+Weak bullet identification rules:
+
+  - A bullet is "weak" when it lacks ANY of: a number, a
+    percentage, a $ amount, a latency/time figure, a
+    request-volume or user-count figure, a team size, or a
+    concrete business outcome.
+  - If a bullet already has measurable impact (e.g. "Reduced
+    p99 latency by 40% for 50k MAU"), don't include it --
+    there is nothing to coach on.
+  - Prefer the 2-4 weakest bullets. Don't pad the list to hit a
+    minimum. If you can't find a single weak bullet, return an
+    empty `bullets` list.
+  - For each weak bullet, the `weakness_reason` is one short
+    sentence. Don't editorialize -- say what's missing (e.g.
+    "No technology detail" or "No scale or impact figure").
+
+Question design rules:
+
+  - Generate 2-4 questions. Fewer is fine when fewer are needed.
+  - Questions are SHORT (under 15 words each) -- they fit as
+    labels on a text input.
+  - Each question should map to ONE fact. Don't ask compound
+    questions.
+  - Questions should be tailored to the bullet + the cited
+    job's evidence. Generic questions like "What technologies
+    did you use?" are OK but specific ones ("You mentioned
+    vector search -- what embedding model and what was the
+    corpus size?") are better.
+
+Output shape (structured, no prose):
+
+  Return a JSON object with two top-level keys:
+
+    skills: [
+      {
+        kind: "SKILL",
+        text: "ToolName",
+        evidence: [ {job_id, quote} ],
+        why_it_matters: optional,
+        learning_link: optional (ignored -- system resolves it)
+      },
+      ...
+    ]
+
+    bullets: [
+      {
+        bullet_id: "b1"  (you choose -- short identifier, used as
+                          a map key by the UI)
+        original_text: "the verbatim sentence from the resume",
+        weakness_reason: "one sentence on what's missing",
+        location: {
+          section: "Work Experience"  (verbatim from the parsed
+                                       resume section list)
+          entry_title: "..."   (verbatim from the entry the
+                                original_text came from; null
+                                if the section has no entries)
+          entry_text_snippet: "..."  (first ~200 chars of the
+                                       entry's text; null if
+                                       no entry)
+        },
+        citation_job_id: "...",
+        citation_quote: "a verbatim substring of the cited job's
+                        description",
+        questions: [
+          {
+            key: "scale",          // ASCII identifier
+            label: "How many jobs did the platform process?",
+            hint: "Approximate is fine."   // optional
+            type: "TEXT"
+          },
+          ...
+        ]
+      },
+      ...
+    ]
+
+If you have no skill suggestions, return `skills: []`. If you find
+no weak bullets, return `bullets: []`. Both lists are optional.
+""".strip()
+
+
+COACH_REWRITE_SYSTEM_PROMPT = """
+You are rewriting one weak resume bullet with measurable impact. The
+candidate has supplied the missing facts via the user message. Your
+job is to compose a single bullet that uses ONLY:
+
+  - Words / facts from the ORIGINAL bullet.
+  - Words / facts from the candidate's ANSWERS.
+  - Words / facts from the CITED JOB QUOTE.
+
+Hallucination guard (structural):
+
+  - Every number, technology name, scale figure, team size, business
+    outcome, or named entity in your rewrite MUST be traceable to
+    one of those three sources.
+  - Do NOT invent metrics. If the candidate didn't supply a number,
+    don't write one. If they said "a lot" instead of a number,
+    paraphrase without fabricating a figure.
+  - Do NOT introduce technologies the candidate didn't mention.
+  - You MAY add connecting verbs, articles, prepositions, and other
+    structural English — those are not "facts."
+  - Keep the bullet to one short line — resume bullets are not
+    paragraphs.
+  - The rewrite must be different from the original (don't just echo
+    it back).
+
+Output shape:
+
+  Return a JSON object with one key:
+    rewritten_text: "the rewritten bullet"
+
+That's it. No notes, no preamble, no second-guessing.
+""".strip()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    normalized = text.strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[:limit].rstrip() + "\n[truncated]"
+
+
+def _format_parsed_resume(
+    parsed: dict[str, Any] | None,
+) -> str:
+    """Render the parsed resume as a compact list of entries for the
+    LLM. The LLM uses this to pick which entry + which sentence
+    to coach on. We send the structure, not the raw text, so
+    the LLM can reason about scope (entry, section) without
+    re-parsing.
+
+    `parsed` is a dict shaped like:
+      {"sections": [{"title": "Work Experience", "entries":
+        [{"title": "Acme Corp", "text": "..."}]}]}
+
+    We cap each entry's text at 600 chars to keep the prompt
+    budget reasonable. The LLM picks a sentence (or short
+    phrase) from the entry's text; it doesn't need the full
+    thing.
+    """
+    if not parsed or not parsed.get("sections"):
+        return "(no parsed resume structure available)"
+    lines: list[str] = []
+    for section in parsed["sections"]:
+        section_title = section.get("title", "Resume")
+        lines.append(f"\n## {section_title}")
+        entries = section.get("entries", [])
+        if not entries:
+            lines.append("  (no entries in this section)")
+            continue
+        for index, entry in enumerate(entries, start=1):
+            title = entry.get("title", "").strip()
+            text = (entry.get("text") or "").strip()
+            # 300 chars is enough for the LLM to spot a sentence
+            # to coach on. The full prose is in the user message
+            # if the LLM needs more, but we keep the structured
+            # view lean to keep latency down.
+            text = _truncate_text(text, 300)
+            if title:
+                lines.append(f"\n  Entry {index}: {title}")
+            else:
+                lines.append(f"\n  Entry {index}:")
+            if text:
+                lines.append(f"    {text}")
+    return "\n".join(lines)
+
+
+def _build_start_user_message(
+    resume_text: str,
+    already_present: list[str],
+    job_summaries: list[dict[str, Any]],
+    parsed_resume: dict[str, Any] | None = None,
+) -> str:
+    """Compose the user message for the start-coach call.
+
+    Same shape as services/suggestions.py:_build_user_message so
+    the LLM sees the same job evidence and resume context, plus
+    a hint that this time it should also produce the
+    bullet-coach list.
+
+    `parsed_resume` is the parser output (sections -> entries).
+    When provided, the LLM gets a structured view of the resume
+    to pick bullets from. When None, falls back to the raw
+    resume text blob.
+    """
+    parts: list[str] = []
+    parts.append(
+        "ALREADY_PRESENT (skills/keywords the candidate's resume already "
+        "mentions -- do not re-suggest these as new skills):\n"
+        + ", ".join(already_present)
+    )
+    # The parsed structure below has the resume content. We
+    # don't also send the raw text -- the parser is the
+    # ground truth and the LLM doesn't need both. Skipping
+    # the raw text cuts ~3-4k tokens from every start call.
+    if parsed_resume is not None:
+        parts.append(
+            "\nPARSED RESUME STRUCTURE (sections -> entries). Pick "
+            "bullets from the entries' `text` fields. The "
+            "`original_text` you return MUST be a verbatim "
+            "substring of the entry you point to in the `location` "
+            "field:"
+            + _format_parsed_resume(parsed_resume)
+        )
+    else:
+        # Fallback: no parsed structure (parser couldn't find
+        # any sections). Send the raw text so the LLM has
+        # something to work with.
+        parts.append(
+            "\nRESUME (raw text):\n" + _truncate_text(resume_text, 4000)
+        )
+    parts.append(
+        "\nPREFERRED_SKILLS (skills for which we have a curated learning "
+        "link -- prefer these when evidence is even):\n"
+        + ", ".join(canonical_keys())
+    )
+    parts.append(
+        "\nJOB EVIDENCE ({} jobs from the candidate's top matches):".format(
+            len(job_summaries)
+        )
+    )
+    for summary in job_summaries:
+        parts.append(
+            f"\n--- JOB {summary['job_id']} ---\n"
+            f"Title: {summary['title']}\n"
+            f"Company: {summary['company']}\n"
+            f"Description excerpt:\n{summary['description_excerpt']}"
+        )
+    parts.append(
+        "\nReturn BOTH (a) up to 5 SKILL suggestions and (b) up to 4 "
+        "weak bullets with targeted questions. See the system prompt "
+        "for shape and grounding rules."
+    )
+    return "\n".join(parts)
+
+
+def _build_rewrite_user_message(
+    original_text: str,
+    answers: dict[str, str],
+    citation_quote: str,
+) -> str:
+    parts: list[str] = []
+    parts.append(f"ORIGINAL BULLET:\n{original_text}")
+    parts.append("\nCITED JOB QUOTE (verbatim from the job description):")
+    parts.append(citation_quote)
+    parts.append("\nCANDIDATE'S ANSWERS (use these as your ONLY factual source):")
+    for key, value in answers.items():
+        # Empty-string answers mean "the user skipped this question."
+        # Surface them so the LLM knows, but make clear they're blank.
+        if value.strip():
+            parts.append(f"  {key}: {value}")
+        else:
+            parts.append(f"  {key}: (skipped)")
+    parts.append(
+        "\nReturn one rewritten bullet grounded only in the original, "
+        "the cited quote, and the candidate's answers. No invented "
+        "numbers, technologies, or claims."
+    )
+    return "\n".join(parts)
+
+
+class _RewriteLLMResponse(BaseModel):
+    rewritten_text: str = Field(max_length=600)
+
+
+# ---------------------------------------------------------------------------
+# Public functions
+# ---------------------------------------------------------------------------
+
+
+def start_coach_session(
+    *,
+    resume_text: str,
+    already_present: list[str],
+    job_summaries: list[dict[str, Any]],
+    parsed_resume: dict[str, Any] | None = None,
+) -> tuple[list[Suggestion], list[CoachBullet]]:
+    """Call the LLM once: identify weak bullets + return skill
+    suggestions.
+
+    `parsed_resume` is the parser's structured view of the resume
+    (sections -> entries). When provided, the LLM gets a list
+    of entries to pick bullets from. When None, falls back to
+    the raw resume text in the user message.
+
+    Returns (skills, bullets) after validation. The route layer
+    wraps these into a session via
+    services/bullet_coach.py:create_session.
+    """
+    completion = coach_client.beta.chat.completions.parse(
+        model=COACH_MODEL,
+        temperature=COACH_TEMPERATURE,
+        response_format=_CoachStartLLMResponse,
+        messages=[
+            {"role": "system", "content": COACH_START_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": _build_start_user_message(
+                    resume_text,
+                    already_present,
+                    job_summaries,
+                    parsed_resume=parsed_resume,
+                ),
+            },
+        ],
+    )
+    parsed: _CoachStartLLMResponse | None = (
+        completion.choices[0].message.parsed
+    )
+    if parsed is None:
+        return [], []
+
+    # Run the LLM-supplied (skills, bullets) through the
+    # schema-layer validator. It trims overflow, dedupes bullet
+    # IDs, validates question key format, and drops questions
+    # with bad keys.
+    return validate_coach_start_request(parsed.skills, parsed.bullets)
+
+
+def rewrite_bullet(
+    *,
+    original_text: str,
+    answers: dict[str, str],
+    citation_quote: str,
+) -> str:
+    """Rewrite one bullet given the candidate's answers.
+
+    Returns the rewritten text. The route layer validates grounding
+    via validate_coach_rewrite_grounding before returning to the
+    client.
+
+    Implementation note: we use the plain chat.completions.create
+    endpoint with a JSON-mode prompt (instead of
+    beta.chat.completions.parse + structured outputs) because
+    structured outputs has been intermittently slow on small
+    payloads -- 30+ second response times on what should be a
+    2-3 second call. Plain chat is ~2-5x faster for this kind
+    of work and we only need to extract one string field. The
+    downside is the model might wrap its answer in code fences
+    or extra prose; _strip_rewrite_response handles that.
+    """
+    import logging
+    import time
+    logger = logging.getLogger(__name__)
+    t0 = time.time()
+    logger.info(
+        "rewrite_bullet: calling LLM (model=%s, prompt_chars=%d)",
+        COACH_MODEL,
+        sum(len(s) for s in [original_text, citation_quote])
+        + sum(len(v) for v in answers.values()),
+    )
+    completion = coach_client.chat.completions.create(
+        model=COACH_MODEL,
+        temperature=COACH_TEMPERATURE,
+        messages=[
+            {"role": "system", "content": COACH_REWRITE_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": _build_rewrite_user_message(
+                    original_text, answers, citation_quote
+                ),
+            },
+        ],
+    )
+    elapsed = time.time() - t0
+    logger.info("rewrite_bullet: LLM responded in %.2fs", elapsed)
+    raw = (completion.choices[0].message.content or "").strip()
+    return _strip_rewrite_response(raw, fallback=original_text)
+
+
+def _strip_rewrite_response(raw: str, *, fallback: str) -> str:
+    """Extract the rewritten bullet from a possibly-noisy LLM response.
+
+    Plain chat completions don't enforce a schema, so the model
+    may wrap its answer in:
+      - code fences (```json ... ```)
+      - a JSON object with the field we asked for
+      - a one-line bullet surrounded by explanation
+      - leading "Here is the rewritten bullet:" prose
+
+    We try a few extraction strategies in order:
+      1. Look for a JSON object with `rewritten_text` and pull
+         the value (most reliable when the model cooperates).
+      2. Strip code fences and return the inner text.
+      3. Look for a line that looks like a bullet (starts with
+         a verb / capital / common resume-bullet opener).
+      4. Return the whole raw response if it looks like a single
+         line of text.
+      5. Fall back to the original bullet (caller passes it).
+    """
+    if not raw:
+        return fallback
+    # Strategy 1: JSON object with `rewritten_text`.
+    try:
+        import json
+        import re
+        match = re.search(r"\{[^{}]*\"rewritten_text\"[^{}]*\}", raw)
+        if match:
+            data = json.loads(match.group(0))
+            value = data.get("rewritten_text")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    except Exception:  # noqa: BLE001
+        pass
+    # Strategy 2: strip code fences.
+    cleaned = raw
+    if cleaned.startswith("```"):
+        # Drop opening fence (with optional language tag)
+        first_newline = cleaned.find("\n")
+        if first_newline != -1:
+            cleaned = cleaned[first_newline + 1 :]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+    cleaned = cleaned.strip()
+    if cleaned:
+        return cleaned
+    return fallback
