@@ -220,8 +220,8 @@ export function ProfilePage() {
           </p>
         </section>
 
-        <div className="flex flex-col items-center gap-6">
-          <Card className="h-fit min-w-100 md:min-w-150 lg:min-w-200">
+        <div className="grid gap-6 md:grid-cols-2">
+          <Card className="h-fit">
             <CardHeader>
               <CardTitle>Email</CardTitle>
               <CardDescription>
@@ -273,7 +273,7 @@ export function ProfilePage() {
             </form>
           </Card>
 
-          <Card className="h-fit min-w-100 md:min-w-150 lg:min-w-200">
+          <Card className="h-fit">
             <CardHeader>
               <CardTitle>Match preferences</CardTitle>
               <CardDescription>
