@@ -112,18 +112,18 @@ function CitationJobHeader({
  */
 function BulletCoachItem({
   bullet,
-  answers,
-  onAnswerChange,
   rewrite,
-  pending,
-  onRequestRewrite,
 }: {
   bullet: CoachBullet
-  answers: Record<string, string>
-  onAnswerChange: (key: string, value: string) => void
   rewrite: CoachRewriteResponse | undefined
-  pending: boolean
-  onRequestRewrite: () => void
+  // NOTE: The rewrite input UI was temporarily hidden while we
+  // investigate a /coach/rewrite slowness issue (see comment in the
+  // JSX below). The props `answers`, `onAnswerChange`, `pending`,
+  // and `onRequestRewrite` were removed from the signature
+  // because they were unused. To re-enable the rewrite UI, restore
+  // them here and at the call site (search for `<BulletCoachItem`
+  // in this file), and uncomment the JSX block marked
+  // "REWRITE UI TEMPORARILY HIDDEN" below.
 }) {
   const [copied, setCopied] = useState(false)
 
@@ -730,9 +730,10 @@ function CoachFlowView({
       {state.kind === "coach_ready" ? (
         <CoachSection
           session={state.session}
-          answers={state.answers}
+          // `answers`, `rewrites`, and `pending` were unused after
+          // the rewrite input UI was hidden. When re-enabling,
+          // restore them here and in CoachSection's signature.
           rewrites={state.rewrites}
-          pending={state.pending}
         />
       ) : null}
     </div>
@@ -741,14 +742,14 @@ function CoachFlowView({
 
 function CoachSection({
   session,
-  answers,
   rewrites,
-  pending,
 }: {
   session: CoachStartResponse
-  answers: Record<string, Record<string, string>>
+  // NOTE: `answers` and `pending` were dropped from this signature
+  // along with the rewrite input UI. When re-enabling, restore
+  // them here and at the call site (search for `<CoachSection` in
+  // this file).
   rewrites: Record<string, CoachRewriteResponse>
-  pending: Record<string, boolean>
 }) {
   return (
     <div className="space-y-4">
@@ -763,30 +764,12 @@ function CoachSection({
             <BulletCoachItem
               key={bullet.bullet_id}
               bullet={bullet}
-              answers={answers[bullet.bullet_id] ?? {}}
-              onAnswerChange={(key, value) => {
-                // Use a custom event so the parent can update its
-                // `answers` state. (Setting state from a child via
-                // a callback prop is the standard pattern; we just
-                // need a tiny wrapper to keep the type signature
-                // clean here.)
-                const event = new CustomEvent("coach-answer", {
-                  detail: {
-                    bulletId: bullet.bullet_id,
-                    key,
-                    value,
-                  },
-                })
-                window.dispatchEvent(event)
-              }}
               rewrite={rewrites[bullet.bullet_id]}
-              pending={Boolean(pending[bullet.bullet_id])}
-              onRequestRewrite={() => {
-                const event = new CustomEvent("coach-rewrite", {
-                  detail: { bulletId: bullet.bullet_id },
-                })
-                window.dispatchEvent(event)
-              }}
+              // `answers`, `onAnswerChange`, `pending`, and
+              // `onRequestRewrite` were dropped from the
+              // BulletCoachItem signature while the rewrite UI
+              // is hidden. See the NOTE in BulletCoachItem's
+              // definition for how to restore them.
             />
           ))}
         </ul>
