@@ -705,249 +705,273 @@ class StripRewriteResponseTests(unittest.TestCase):
         )
 
     def test_falls_back_to_original_on_empty(self):
-            from app.services.bullet_coach_llm import _strip_rewrite_response
-            self.assertEqual(
-                _strip_rewrite_response("", fallback="orig bullet"),
-                "orig bullet",
-            )
-            self.assertEqual(
-                _strip_rewrite_response("   \n  ", fallback="orig bullet"),
-                "orig bullet",
-            )
+        from app.services.bullet_coach_llm import _strip_rewrite_response
+        self.assertEqual(
+            _strip_rewrite_response("", fallback="orig bullet"),
+            "orig bullet",
+        )
+        self.assertEqual(
+            _strip_rewrite_response("   \n  ", fallback="orig bullet"),
+            "orig bullet",
+        )
 
 
-    class ExtractAlreadyPresentTests(unittest.TestCase):
-        """extract_already_present() builds the prompt's ALREADY_PRESENT
-        list. Bugs here cause the LLM to re-suggest skills the candidate
-        already has — the original Next.js bug. These tests pin the
-        normalizer's behavior so the prompt-side and post-process-side
-        check agree on the same tokens."""
+class ExtractAlreadyPresentTests(unittest.TestCase):
+    """extract_already_present() builds the prompt's ALREADY_PRESENT
+    list. Bugs here cause the LLM to re-suggest skills the candidate
+    already has — the original Next.js bug. These tests pin the
+    normalizer's behavior so the prompt-side and post-process-side
+    check agree on the same tokens."""
 
-        def test_strips_trailing_sentence_period(self):
-            # The original bug: "Built apps in Next.js." produced the token
-            # "next.js." (with the trailing period from sentence-end glued
-            # on). The LLM's filter then failed to match "Next.js" against
-            # "next.js." and re-suggested Next.js.
-            out = extract_already_present("Built apps in Next.js.")
-            self.assertIn("next.js", out)
-            self.assertNotIn("next.js.", out)
+    def test_strips_trailing_sentence_period(self):
+        # The original bug: "Built apps in Next.js." produced the token
+        # "next.js." (with the trailing period from sentence-end glued
+        # on). The LLM's filter then failed to match "Next.js" against
+        # "next.js." and re-suggested Next.js.
+        out = extract_already_present("Built apps in Next.js.")
+        self.assertIn("next.js", out)
+        self.assertNotIn("next.js.", out)
 
-        def test_strips_trailing_punctuation_variants(self):
-            # Periods, commas, semicolons, colons, exclamation, and
-            # question marks at the end of a sentence should all be
-            # stripped. (Comma is rare at sentence-end but it does happen
-            # in resume lines like "Skills: Python, TypeScript, React,".)
-            for punct in ".,;:!?":
-                with self.subTest(punct=punct):
-                    token = f"postgresql{punct}"
-                    text = f"Built apps in {token}"
-                    out = extract_already_present(text)
-                    self.assertIn("postgresql", out, f"failed to strip {punct!r}")
-                    self.assertNotIn(
-                        f"postgresql{punct}",
-                        out,
-                        f"trailing {punct!r} not stripped",
+    def test_strips_trailing_punctuation_variants(self):
+        # Periods, commas, semicolons, colons, exclamation, and
+        # question marks at the end of a sentence should all be
+        # stripped. (Comma is rare at sentence-end but it does happen
+        # in resume lines like "Skills: Python, TypeScript, React,".)
+        for punct in ".,;:!?":
+            with self.subTest(punct=punct):
+                token = f"postgresql{punct}"
+                text = f"Built apps in {token}"
+                out = extract_already_present(text)
+                self.assertIn("postgresql", out, f"failed to strip {punct!r}")
+                self.assertNotIn(
+                    f"postgresql{punct}",
+                    out,
+                    f"trailing {punct!r} not stripped",
+                )
+
+    def test_preserves_internal_dots(self):
+        # The word regex `[a-zA-Z][a-zA-Z0-9+#.-]{1,}` matches internal
+        # dots, so "next.js" comes through as a single token. The
+        # normalizer must NOT collapse internal dots — only strip
+        # trailing sentence punctuation.
+        out = extract_already_present(
+            "Built apps in Next.js, Vue.js, and React.js."
+        )
+        self.assertIn("next.js", out)
+        self.assertIn("vue.js", out)
+        self.assertIn("react.js", out)
+
+    def test_handles_repeated_dotted_skill(self):
+        # Repetition must not break the dedup.
+        out = extract_already_present("Next.js, Next.js, and Next.js again.")
+        self.assertEqual(out.count("next.js"), 1)  # set-based dedup
+
+    def test_drops_short_tokens(self):
+        # Length filter is still in place — "js" from "Next.js" should
+        # not leak in on its own. (Actually the regex captures "next.js"
+        # whole, not "next" + "js" — verify both behaviors.)
+        out = extract_already_present("Next.js expert")
+        # The whole token "next.js" passes; "js" alone would be filtered
+        # by length but isn't actually captured by the regex here
+        # because the regex is greedy and matches "next.js" first.
+        self.assertIn("next.js", out)
+        self.assertNotIn("js", out)  # would-be standalone "js" is < 4 chars
+
+    def test_drops_stopwords(self):
+        # Generic resume boilerplate like "team" / "work" / "skill"
+        # must stay filtered out — the prompt has limited tokens.
+        out = extract_already_present(
+            "Strong team player with work experience and skill in Python."
+        )
+        for stop in ["team", "work", "skill", "strong"]:
+            self.assertNotIn(stop, out)
+        self.assertIn("python", out)
+
+
+class AlreadyInResumeDefenseTests(unittest.TestCase):
+    """End-to-end check: even if the LLM emits a skill that's
+    already in the resume (e.g. the prompt-side filter slipped,
+    or the LLM is being creative), the post-process in
+    generate_resume_suggestions drops it. This is defense-in-depth
+    against the Next.js class of bug.
+
+    We mock the OpenAI client to send a fixed suggestion list and
+    assert that suggestions overlapping with the resume are dropped
+    while non-overlapping ones survive.
+    """
+
+    def _mock_openai(self, suggestions):
+        """Return a context manager that mocks the LLM to return
+        the given suggestions list."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _patch():
+            with patch(
+                "app.services.suggestions.suggestions_client"
+                ".beta.chat.completions.parse"
+            ) as mocked:
+                from app.schemas.suggestions import (
+                    SuggestionsResponse as SR,
+                )
+
+                mocked.return_value.choices = [
+                    type(
+                        "Choice",
+                        (),
+                        {"message": type("Msg", (), {"parsed": SR(suggestions=suggestions)})()},
+                    )()
+                ]
+                yield mocked
+
+        return _patch()
+
+    def test_drops_skill_already_in_resume(self):
+        # The classic Next.js bug. Resume says "Next.js."; LLM
+        # somehow suggests Next.js anyway. The post-process drops it.
+        from app.schemas.suggestions import Citation, Suggestion
+
+        resume = "Built dashboards in Next.js and TypeScript."
+        job = {
+            "job_id": "job-x",
+            "title": "Frontend Engineer",
+            "company": "Acme",
+            "apply_url": "https://acme.example/jobs/x",
+            "description_excerpt": (
+                "We use Next.js, React, and Tailwind CSS for styling."
+            ),
+            "description_full": (
+                "We use Next.js, React, and Tailwind CSS for styling."
+            ),
+        }
+        # LLM suggests Next.js (already in resume) plus Tailwind CSS
+        # (NOT in resume — should survive). Each suggestion's quote
+        # is a substring of the job description, and the quote
+        # shares tokens with the suggestion text so the single-cite
+        # token-overlap fallback accepts it.
+        suggestions = [
+            Suggestion(
+                kind=SuggestionKind.SKILL,
+                text="Next.js",
+                evidence=[
+                    Citation(
+                        job_id="job-x",
+                        quote="We use Next.js, React, and Tailwind CSS for styling.",
                     )
-
-        def test_preserves_internal_dots(self):
-            # The word regex `[a-zA-Z][a-zA-Z0-9+#.-]{1,}` matches internal
-            # dots, so "next.js" comes through as a single token. The
-            # normalizer must NOT collapse internal dots — only strip
-            # trailing sentence punctuation.
-            out = extract_already_present(
-                "Built apps in Next.js, Vue.js, and React.js."
-            )
-            self.assertIn("next.js", out)
-            self.assertIn("vue.js", out)
-            self.assertIn("react.js", out)
-
-        def test_handles_repeated_dotted_skill(self):
-            # Repetition must not break the dedup.
-            out = extract_already_present("Next.js, Next.js, and Next.js again.")
-            self.assertEqual(out.count("next.js"), 1)  # set-based dedup
-
-        def test_drops_short_tokens(self):
-            # Length filter is still in place — "js" from "Next.js" should
-            # not leak in on its own. (Actually the regex captures "next.js"
-            # whole, not "next" + "js" — verify both behaviors.)
-            out = extract_already_present("Next.js expert")
-            # The whole token "next.js" passes; "js" alone would be filtered
-            # by length but isn't actually captured by the regex here
-            # because the regex is greedy and matches "next.js" first.
-            self.assertIn("next.js", out)
-            self.assertNotIn("js", out)  # would-be standalone "js" is < 4 chars
-
-        def test_drops_stopwords(self):
-            # Generic resume boilerplate like "team" / "work" / "skill"
-            # must stay filtered out — the prompt has limited tokens.
-            out = extract_already_present(
-                "Strong team player with work experience and skill in Python."
-            )
-            for stop in ["team", "work", "skill", "strong"]:
-                self.assertNotIn(stop, out)
-            self.assertIn("python", out)
-
-
-    class AlreadyInResumeDefenseTests(unittest.TestCase):
-        """End-to-end check: even if the LLM emits a skill that's
-        already in the resume (e.g. the prompt-side filter slipped,
-        or the LLM is being creative), the post-process in
-        generate_resume_suggestions drops it. This is defense-in-depth
-        against the Next.js class of bug.
-
-        We mock the OpenAI client to send a fixed suggestion list and
-        assert that suggestions overlapping with the resume are dropped
-        while non-overlapping ones survive.
-        """
-
-        def _mock_openai(self, suggestions):
-            """Return a context manager that mocks the LLM to return
-            the given suggestions list."""
-            from contextlib import contextmanager
-
-            @contextmanager
-            def _patch():
-                with patch(
-                    "app.services.suggestions.suggestions_client"
-                    ".beta.chat.completions.parse"
-                ) as mocked:
-                    from app.schemas.suggestions import (
-                        SuggestionsResponse as SR,
+                ],
+            ),
+            Suggestion(
+                kind=SuggestionKind.SKILL,
+                text="Tailwind CSS",
+                evidence=[
+                    Citation(
+                        job_id="job-x",
+                        quote="Tailwind CSS for styling.",
                     )
+                ],
+            ),
+        ]
 
-                    mocked.return_value.choices = [
-                        type(
-                            "Choice",
-                            (),
-                            {"message": type("Msg", (), {"parsed": SR(suggestions=suggestions)})()},
-                        )()
-                    ]
-                    yield mocked
-
-            return _patch()
-
-        def test_drops_skill_already_in_resume(self):
-            # The classic Next.js bug. Resume says "Next.js."; LLM
-            # somehow suggests Next.js anyway. The post-process drops it.
-            from app.schemas.suggestions import Citation, Suggestion
-
-            resume = "Built dashboards in Next.js and TypeScript."
-            job = {
-                "job_id": "job-x",
-                "title": "Frontend Engineer",
-                "company": "Acme",
-                "apply_url": "https://acme.example/jobs/x",
-                "description_excerpt": "We use Next.js and React.",
-                "description_full": "We use Next.js and React.",
-            }
-            # LLM suggests Next.js (already in resume) plus Tailwind CSS
-            # (NOT in resume — should survive).
-            suggestion_texts = ["Next.js", "Tailwind CSS"]
-            suggestions = []
-            for s in suggestion_texts:
-                suggestions.append(
-                    Suggestion(
-                        kind=SuggestionKind.SKILL,
-                        text=s,
-                        evidence=[
-                            Citation(
-                                job_id="job-x",
-                                quote="We use Next.js and React.",
-                            )
-                        ],
-                    )
-                )
-
-            with self._mock_openai(suggestions):
-                out = generate_resume_suggestions(
-                    resume_text=resume,
-                    job_summaries=[job],
-                )
-
-            surviving = [s.text for s in out]
-            self.assertNotIn("Next.js", surviving, "Next.js slipped through despite being in resume")
-            self.assertIn("Tailwind CSS", surviving, "Tailwind CSS should have survived")
-
-        def test_keeps_near_duplicates_that_are_not_subsets(self):
-            # Java in resume, JavaScript suggested. "javascript" is NOT
-            # in the resume's ALREADY_PRESENT set, so we MUST keep it.
-            # Subset matching is per-token, not per-string.
-            from app.schemas.suggestions import Citation, Suggestion
-
-            resume = "Senior engineer with 10 years of Java and Spring Boot."
-            job = {
-                "job_id": "job-x",
-                "title": "Backend Engineer",
-                "company": "Acme",
-                "apply_url": "https://acme.example/jobs/x",
-                "description_excerpt": "We use JavaScript, Java, and Spring.",
-                "description_full": "We use JavaScript, Java, and Spring.",
-            }
-            suggestions = [
-                Suggestion(
-                    kind=SuggestionKind.SKILL,
-                    text="JavaScript",
-                    evidence=[
-                        Citation(job_id="job-x", quote="We use JavaScript, Java, and Spring.")
-                    ],
-                ),
-                Suggestion(
-                    kind=SuggestionKind.SKILL,
-                    text="Kotlin",
-                    evidence=[
-                        Citation(job_id="job-x", quote="Kotlin experience is a plus.")
-                    ],
-                ),
-            ]
-
-            with self._mock_openai(suggestions):
-                out = generate_resume_suggestions(
-                    resume_text=resume,
-                    job_summaries=[job],
-                )
-
-            surviving = [s.text for s in out]
-            self.assertIn("JavaScript", surviving, "JavaScript should survive even when Java is in resume")
-            self.assertIn("Kotlin", surviving)
-
-        def test_drops_sentence_end_dotted_skill(self):
-            # Direct test of the trailing-period bug. Resume ends a
-            # sentence with "Next.js."; LLM suggests "Next.js"; the
-            # post-process must catch it because extract_already_present
-            # now normalizes "Next.js." to "next.js".
-            from app.schemas.suggestions import Citation, Suggestion
-
-            resume = "Senior frontend engineer. Built apps in Next.js."
-            job = {
-                "job_id": "job-x",
-                "title": "Frontend Engineer",
-                "company": "Acme",
-                "apply_url": "https://acme.example/jobs/x",
-                "description_excerpt": "We use Next.js and React.",
-                "description_full": "We use Next.js and React.",
-            }
-            suggestions = [
-                Suggestion(
-                    kind=SuggestionKind.SKILL,
-                    text="Next.js",
-                    evidence=[
-                        Citation(job_id="job-x", quote="We use Next.js and React.")
-                    ],
-                ),
-            ]
-
-            with self._mock_openai(suggestions):
-                out = generate_resume_suggestions(
-                    resume_text=resume,
-                    job_summaries=[job],
-                )
-
-            self.assertEqual(
-                [s.text for s in out],
-                [],
-                "Next.js (already in resume ending with '.') should have been dropped",
+        with self._mock_openai(suggestions):
+            out = generate_resume_suggestions(
+                resume_text=resume,
+                job_summaries=[job],
             )
 
+        surviving = [s.text for s in out]
+        self.assertNotIn("Next.js", surviving, "Next.js slipped through despite being in resume")
+        self.assertIn("Tailwind CSS", surviving, "Tailwind CSS should have survived")
 
-    if __name__ == "__main__":
-        unittest.main()
+    def test_keeps_near_duplicates_that_are_not_subsets(self):
+        # Java in resume, JavaScript suggested. "javascript" is NOT
+        # in the resume's ALREADY_PRESENT set, so we MUST keep it.
+        # Subset matching is per-token, not per-string.
+        from app.schemas.suggestions import Citation, Suggestion
+
+        resume = "Senior engineer with 10 years of Java and Spring Boot."
+        job = {
+        "job_id": "job-x",
+        "title": "Backend Engineer",
+        "company": "Acme",
+        "apply_url": "https://acme.example/jobs/x",
+        "description_excerpt": (
+            "We use JavaScript, Java, and Kotlin."
+        ),
+        "description_full": (
+            "We use JavaScript, Java, and Kotlin."
+        ),
+        }
+        suggestions = [
+        Suggestion(
+            kind=SuggestionKind.SKILL,
+            text="JavaScript",
+            evidence=[
+                Citation(
+                    job_id="job-x",
+                    quote="We use JavaScript, Java, and Kotlin.",
+                )
+            ],
+        ),
+        Suggestion(
+            kind=SuggestionKind.SKILL,
+            text="Kotlin",
+            evidence=[
+                Citation(
+                    job_id="job-x",
+                    quote="We use JavaScript, Java, and Kotlin.",
+                )
+            ],
+        ),
+        ]
+
+        with self._mock_openai(suggestions):
+            out = generate_resume_suggestions(
+                resume_text=resume,
+                job_summaries=[job],
+            )
+
+        surviving = [s.text for s in out]
+        self.assertIn("JavaScript", surviving, "JavaScript should survive even when Java is in resume")
+        self.assertIn("Kotlin", surviving)
+
+    def test_drops_sentence_end_dotted_skill(self):
+        # Direct test of the trailing-period bug. Resume ends a
+        # sentence with "Next.js."; LLM suggests "Next.js"; the
+        # post-process must catch it because extract_already_present
+        # now normalizes "Next.js." to "next.js".
+        from app.schemas.suggestions import Citation, Suggestion
+
+        resume = "Senior frontend engineer. Built apps in Next.js."
+        job = {
+            "job_id": "job-x",
+            "title": "Frontend Engineer",
+            "company": "Acme",
+            "apply_url": "https://acme.example/jobs/x",
+            "description_excerpt": "We use Next.js and React.",
+            "description_full": "We use Next.js and React.",
+        }
+        suggestions = [
+            Suggestion(
+                kind=SuggestionKind.SKILL,
+                text="Next.js",
+                evidence=[
+                    Citation(job_id="job-x", quote="We use Next.js and React.")
+                ],
+            ),
+        ]
+
+        with self._mock_openai(suggestions):
+            out = generate_resume_suggestions(
+                resume_text=resume,
+                job_summaries=[job],
+            )
+
+        self.assertEqual(
+            [s.text for s in out],
+            [],
+            "Next.js (already in resume ending with '.') should have been dropped",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

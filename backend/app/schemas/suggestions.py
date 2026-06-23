@@ -198,7 +198,16 @@ def _normalize(text: str) -> str:
 def _tokens(text: str) -> set[str]:
     """Loose tokenization: lowercase, alphanumerics + a few separators only.
     Good enough for "does this suggestion's text appear in this quote".
+
+    Trailing sentence punctuation (`.`, `,`, `;`, `:`, `!`, `?`) is
+    stripped from each token. Without this, a quote like "We use Kotlin."
+    produces a `kotlin.` token that fails to match the suggestion
+    token `kotlin` — token-overlap returns False and a perfectly-cited
+    "Kotlin" suggestion gets dropped at validation. Internal dots are
+    preserved (e.g. `next.js` stays `next.js`), since the separator
+    check below only triggers on word-boundary punctuation.
     """
+    SENTENCE_PUNCT = ".,;:!?"
     normalized = _normalize(text)
     out: set[str] = set()
     current: list[str] = []
@@ -211,7 +220,15 @@ def _tokens(text: str) -> set[str]:
                 current = []
     if current:
         out.add("".join(current))
-    return {t for t in out if len(t) >= 2}
+    # Strip trailing sentence punctuation from each token. Don't
+    # touch internal dots — those stay as part of the token.
+    cleaned = set()
+    for tok in out:
+        while tok and tok[-1] in SENTENCE_PUNCT:
+            tok = tok[:-1]
+        if tok:
+            cleaned.add(tok)
+    return {t for t in cleaned if len(t) >= 2}
 
 
 def _quote_is_substring(quote: str, source_text: str) -> bool:
