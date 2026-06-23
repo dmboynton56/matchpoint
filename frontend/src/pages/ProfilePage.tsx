@@ -1,32 +1,14 @@
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useEffect, useState } from "react"
 import { useNavigate } from "react-router-dom"
-import { ExternalLink, FileText, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { recalculateMyMatches } from "@/apis/matches"
-import {
-  deleteResume,
-  getResumeDetails,
-  type ResumeDetailsResponse,
-  uploadResume,
-} from "@/apis/resumes"
 import {
   changeEmailWithPassword,
   getProfilePreferences,
   updateProfilePreferences,
 } from "@/auth/supabaseAuth"
 import { AppShell } from "@/components/layout/AppShell"
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from "@/components/ui/alert-dialog"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
 import {
@@ -65,7 +47,6 @@ function parseCommaList(value: string): string[] {
 export function ProfilePage() {
   const { user } = useAuth()
   const navigate = useNavigate()
-  const resumeInputRef = useRef<HTMLInputElement>(null)
 
   const [targetRole, setTargetRole] = useState("")
   const [preferredLocations, setPreferredLocations] = useState("")
@@ -81,26 +62,6 @@ export function ProfilePage() {
   const [newEmail, setNewEmail] = useState("")
   const [emailPassword, setEmailPassword] = useState("")
   const [emailSaving, setEmailSaving] = useState(false)
-  const [resume, setResume] = useState<ResumeDetailsResponse | null>(null)
-  const [resumeLoading, setResumeLoading] = useState(true)
-  const [resumeUploading, setResumeUploading] = useState(false)
-  const [resumeDeleting, setResumeDeleting] = useState(false)
-  const [resumeMutationPending, setResumeMutationPending] = useState(false)
-
-  const refreshResume = useCallback(async (showLoading = true) => {
-    if (showLoading) {
-      setResumeLoading(true)
-    }
-    try {
-      setResume(await getResumeDetails())
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Could not load resume."
-      toast.error(message, { position: "top-center" })
-    } finally {
-      setResumeLoading(false)
-    }
-  }, [])
 
   useEffect(() => {
     if (!user) return
@@ -139,13 +100,6 @@ export function ProfilePage() {
     }
   }, [user])
 
-  useEffect(() => {
-    if (!user) return
-
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    void refreshResume(false)
-  }, [refreshResume, user])
-
   const handleSavePreferences = async () => {
     if (!user) return
 
@@ -180,11 +134,10 @@ export function ProfilePage() {
           minimumBaseSalary: salary,
         })
       )
-      if (resume?.has_resume) {
-        setPreferenceRecalcDialogOpen(true)
-      } else {
-        toast.success("Preferences saved.", { position: "top-center" })
-      }
+      // Always offer to recalc — preference changes affect what
+      // gets matched, regardless of whether the user has a resume
+      // on file (the resume state lives on the /resume page now).
+      setPreferenceRecalcDialogOpen(true)
     } finally {
       setPreferencesSaving(false)
     }
@@ -239,56 +192,6 @@ export function ProfilePage() {
     }
   }
 
-  const handleViewResume = () => {
-    if (!resume?.signed_url) return
-
-    window.open(resume.signed_url, "_blank", "noopener,noreferrer")
-  }
-
-  const handleResumeUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    e.target.value = ""
-
-    if (!file) return
-    if (file.type !== "application/pdf") {
-      toast.error("Only PDF files are supported.", { position: "top-center" })
-      return
-    }
-
-    setResumeMutationPending(true)
-    setResumeUploading(true)
-    try {
-      const response = await uploadResume(file)
-      await refreshResume()
-      toast.success("Resume updated.", { position: "top-center" })
-      navigate("/jobs", { state: { jobs: response.jobs } })
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Resume upload failed."
-      toast.error(message, { position: "top-center" })
-    } finally {
-      setResumeUploading(false)
-      setResumeMutationPending(false)
-    }
-  }
-
-  const handleDeleteResume = async () => {
-    setResumeMutationPending(true)
-    setResumeDeleting(true)
-    try {
-      await deleteResume()
-      await refreshResume()
-      toast.success("Resume deleted.", { position: "top-center" })
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Resume delete failed."
-      toast.error(message, { position: "top-center" })
-    } finally {
-      setResumeDeleting(false)
-      setResumeMutationPending(false)
-    }
-  }
-
   if (!user) {
     return null
   }
@@ -300,14 +203,6 @@ export function ProfilePage() {
     minimumBaseSalary: minimumBaseSalary.trim(),
   })
   const preferencesChanged = currentPreferenceKey !== savedPreferenceKey
-  const resumeUploadedAt =
-    resume?.uploaded_at === null || resume?.uploaded_at === undefined
-      ? null
-      : new Intl.DateTimeFormat(undefined, {
-          month: "short",
-          day: "numeric",
-          year: "numeric",
-        }).format(new Date(resume.uploaded_at))
 
   return (
     <AppShell>
@@ -320,7 +215,8 @@ export function ProfilePage() {
             Profile
           </h1>
           <p className="max-w-2xl text-sm leading-relaxed text-muted-foreground sm:text-base">
-            Update your email, match preferences, and resume.
+            Update your email and match preferences. Manage your resume and
+            tailored suggestions on the Resume page.
           </p>
         </section>
 
@@ -448,129 +344,6 @@ export function ProfilePage() {
               >
                 {preferencesSaving ? "Saving…" : "Save preferences"}
               </Button>
-            </CardFooter>
-          </Card>
-
-          <Card className="h-fit md:col-start-1">
-            <CardHeader>
-              <CardTitle>Resume</CardTitle>
-              <CardDescription>
-                View your resume, re-upload it, or delete it.
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              {resumeLoading ? (
-                <div className="flex h-72 items-center justify-center rounded-lg border border-dashed border-border bg-muted/30 text-sm text-muted-foreground">
-                  Loading resume…
-                </div>
-              ) : resume?.has_resume && resume.signed_url ? (
-                <div className="space-y-3">
-                  <div
-                    role="button"
-                    tabIndex={0}
-                    className="group relative h-72 w-full overflow-hidden rounded-lg border border-border bg-muted/30 text-left"
-                    onClick={handleViewResume}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" || e.key === " ") {
-                        e.preventDefault()
-                        handleViewResume()
-                      }
-                    }}
-                    aria-label="Open uploaded resume"
-                  >
-                    <iframe
-                      title="Uploaded resume preview"
-                      src={`${resume.signed_url}#page=1&toolbar=0&navpanes=0&scrollbar=0`}
-                      className="pointer-events-none h-full w-full bg-white"
-                    />
-                    <span className="absolute inset-0 bg-transparent transition-colors group-hover:bg-background/10" />
-                  </div>
-                  <div className="flex items-center gap-3 text-sm">
-                    <FileText
-                      className="size-4 shrink-0 text-muted-foreground"
-                      aria-hidden="true"
-                    />
-                    <div className="min-w-0">
-                      <p className="truncate font-medium text-foreground">
-                        {resume.file_name ?? "resume.pdf"}
-                      </p>
-                      <p className="text-xs text-muted-foreground">
-                        {resumeUploadedAt
-                          ? `Uploaded ${resumeUploadedAt}`
-                          : "Uploaded resume on file"}
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <div className="flex h-72 flex-col items-center justify-center gap-3 rounded-lg border border-dashed border-border bg-muted/30 px-4 text-center text-sm text-muted-foreground">
-                  <FileText className="size-8" aria-hidden="true" />
-                  No resume on file
-                </div>
-              )}
-              <input
-                ref={resumeInputRef}
-                type="file"
-                accept="application/pdf"
-                className="hidden"
-                disabled={resumeMutationPending}
-                onChange={(e) => void handleResumeUpload(e)}
-              />
-            </CardContent>
-            <CardFooter className="flex flex-wrap gap-2">
-              <Button
-                type="button"
-                variant="outline"
-                disabled={!resume?.has_resume || !resume.signed_url}
-                onClick={handleViewResume}
-              >
-                <ExternalLink className="size-4" aria-hidden="true" />
-                View
-              </Button>
-              <Button
-                type="button"
-                variant="outline"
-                disabled={resumeUploading || resumeMutationPending}
-                onClick={() => resumeInputRef.current?.click()}
-              >
-                <Upload className="size-4" aria-hidden="true" />
-                {resume?.has_resume ? "Re-upload" : "Upload"}
-              </Button>
-              <AlertDialog>
-                <AlertDialogTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="destructive"
-                    disabled={
-                      !resume?.has_resume ||
-                      resumeDeleting ||
-                      resumeMutationPending
-                    }
-                  >
-                    <Trash2 className="size-4" aria-hidden="true" />
-                    Delete
-                  </Button>
-                </AlertDialogTrigger>
-                <AlertDialogContent>
-                  <AlertDialogHeader>
-                    <AlertDialogTitle>Delete resume?</AlertDialogTitle>
-                    <AlertDialogDescription>
-                      This removes your uploaded resume from your profile. You
-                      can upload a new one anytime.
-                    </AlertDialogDescription>
-                  </AlertDialogHeader>
-                  <AlertDialogFooter>
-                    <AlertDialogCancel>Cancel</AlertDialogCancel>
-                    <AlertDialogAction
-                      variant="destructive"
-                      disabled={resumeDeleting || resumeMutationPending}
-                      onClick={() => void handleDeleteResume()}
-                    >
-                      Confirm
-                    </AlertDialogAction>
-                  </AlertDialogFooter>
-                </AlertDialogContent>
-              </AlertDialog>
             </CardFooter>
           </Card>
         </div>
