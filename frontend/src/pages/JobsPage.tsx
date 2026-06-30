@@ -10,6 +10,7 @@ import {
 } from "@/auth/supabaseAuth"
 import { JobApplyFollowUpDrawer } from "@/components/jobs/JobApplyFollowUpDrawer"
 import { JobListingCard } from "@/components/jobs/JobListingCard"
+import { JobMatchToggleButtons } from "@/components/jobs/JobMatchToggleButtons"
 import { AppShell } from "@/components/layout/AppShell"
 import { RouteLoading } from "@/components/routing/RouteLoading"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -115,6 +116,17 @@ export function JobsPage() {
   const showProfilePreferencesAlert =
     !!user && !profilePreferencesLoading && missingPreferenceLabels.length > 0
 
+  const updateJobFlags = (
+    matchId: string,
+    patch: Partial<Pick<JobMatch, "is_favorited" | "is_applied">>
+  ) => {
+    setJobs((current) =>
+      current.map((job) =>
+        job.match_id === matchId ? { ...job, ...patch } : job
+      )
+    )
+  }
+
   return (
     <AppShell>
       <div className="mx-auto w-full max-w-5xl space-y-6">
@@ -160,6 +172,33 @@ export function JobsPage() {
                 <JobListingCard
                   job={job}
                   onApplyClick={(selected) => setApplyFollowUpJob(selected)}
+                  footerAddon={
+                    user && job.match_id ? (
+                      <JobMatchToggleButtons
+                        matchId={job.match_id}
+                        isFavorited={!!job.is_favorited}
+                        isApplied={!!job.is_applied}
+                        onFavorited={(isFavorited) => {
+                          updateJobFlags(job.match_id!, { is_favorited: isFavorited })
+                          setApplyFollowUpJob((current) => {
+                            if (!current || current.match_id !== job.match_id) {
+                              return current
+                            }
+                            return { ...current, is_favorited: isFavorited }
+                          })
+                        }}
+                        onApplied={(isApplied) => {
+                          updateJobFlags(job.match_id!, { is_applied: isApplied })
+                          setApplyFollowUpJob((current) => {
+                            if (!current || current.match_id !== job.match_id) {
+                              return current
+                            }
+                            return { ...current, is_applied: isApplied }
+                          })
+                        }}
+                      />
+                    ) : null
+                  }
                 />
               </li>
             ))}

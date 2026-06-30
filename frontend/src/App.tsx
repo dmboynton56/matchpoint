@@ -23,6 +23,10 @@ const AppliedJobsPage = lazy(() =>
   import("@/pages/AppliedJobsPage").then((m) => ({ default: m.AppliedJobsPage }))
 )
 
+const ResumePage = lazy(() =>
+  import("@/pages/ResumePage").then((m) => ({ default: m.ResumePage }))
+)
+
 export function App() {
   return (
     <Suspense fallback={<RouteLoading />}>
@@ -50,6 +54,14 @@ export function App() {
           element={
             <ProtectedRoute>
               <AppliedJobsPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/resume"
+          element={
+            <ProtectedRoute>
+              <ResumePage />
             </ProtectedRoute>
           }
         />

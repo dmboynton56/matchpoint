@@ -110,7 +110,7 @@ def push_matrix_to_branch(
                 f"{fetch.returncode} (likely first run, branch not on remote yet)"
             )
 
-        # Clean up any stale worktree on this branch from a previous run.
+# Clean up any stale worktree on this branch from a previous run.
         # We can't just look for our current tmpdir path (a random suffix
         # is involved), and we can't do a substring check (per CodeRabbit).
         # So: parse `git worktree list --porcelain`, find any worktree
