@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   location TEXT,
   posted_at TEXT,
   apply_url TEXT,
+  source TEXT NOT NULL DEFAULT 'greenhouse',
   embedding TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -71,6 +72,12 @@ CREATE INDEX IF NOT EXISTS idx_jobs_external_id ON jobs (external_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs (created_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_last_seen_at ON jobs (last_seen_at);
 """
+# NOTE: idx_jobs_source is intentionally NOT in JOBS_SCHEMA_SQL. On a fresh
+# install CREATE TABLE above creates the `source` column, but on a migration
+# run the table already exists without it — running CREATE INDEX against a
+# missing column raises "no such column: source". The idx_jobs_source index
+# is created by init_schema() after the column-add migration step below,
+# so it always runs against a table that has the column it indexes.
 
 
 # -----------------------------------------------------------------------------
@@ -190,9 +197,23 @@ def init_schema(client: "libsql.Connection | None" = None) -> None:  # type: ign
     if warm:
         return
     # libsql's HTTP transport (Hrana) rejects multi-statement payloads, so
-    # apply each DDL statement individually.
+    # apply each DDL statement individually. Wrap each in try/except so a
+    # statement that references a column missing on a pre-migration table
+    # (e.g. the idx_jobs_source CREATE INDEX when `source` hasn't been ADDed
+    # yet) doesn't abort the whole migration. Indexes are best-effort — the
+    # app works without them, just slower. The column-ADD step below runs
+    # unconditionally afterward, and CREATE INDEX IF NOT EXISTS is a no-op
+    # if it landed successfully the first time.
     for stmt in _split_statements(JOBS_SCHEMA_SQL):
-        conn.execute(stmt)
+        try:
+            conn.execute(stmt)
+        except Exception as e:
+            # Surface the failure in the pipeline log but don't abort —
+            # init_schema() is idempotent and we want every migration step
+            # to have a chance to apply. The most common cause here is
+            # CREATE INDEX against a column that doesn't exist on this
+            # schema version; the ADD COLUMN below will provide it.
+            print(f"[init_schema] skipped DDL ({type(e).__name__}): {e}")
     # One-shot migration: external_id is now NOT NULL (it is the upsert
     # conflict key and dedupe key, so NULLs bypass ON CONFLICT). Pre-migration
     # rows that already have external_id IS NULL are orphans — they bypass
@@ -216,20 +237,78 @@ def init_schema(client: "libsql.Connection | None" = None) -> None:  # type: ign
             # both are fine. The Python-side `upsert_jobs` validation is the
             # real safety net.
             pass
+    # Add the `source` column on tables that predate it. The CREATE TABLE
+    # above already includes it for fresh installs; this branch only runs
+    # when init_schema() is called against an existing prod table.
+    source_added = False
+    if not _column_exists(conn, "jobs", "source"):
+        try:
+            conn.execute(
+                "ALTER TABLE jobs ADD COLUMN source TEXT NOT NULL "
+                "DEFAULT 'greenhouse'"
+            )
+            source_added = True
+        except Exception:
+            # Older libsql without ADD COLUMN DEFAULT support — fall back to
+            # a plain ADD COLUMN and backfill. Both are best-effort; existing
+            # upsert calls default missing 'source' to 'greenhouse' in Python.
+            try:
+                conn.execute("ALTER TABLE jobs ADD COLUMN source TEXT")
+                # Backfill any existing rows so future NOT NULL would work
+                # if a future migration tightens the constraint.
+                conn.execute(
+                    "UPDATE jobs SET source = 'greenhouse' WHERE source IS NULL"
+                )
+                source_added = True
+            except Exception:
+                pass
+    # Index the source column for fast per-source filtering. Always run
+    # idempotently — fresh installs hit this after CREATE TABLE above,
+    # migration installs hit it after the ALTER ADD COLUMN above. Either
+    # way the column exists by the time we get here.
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_source ON jobs (source)"
+        )
+    except Exception as e:
+        # Index creation is best-effort. The app works without it, just
+        # slower on per-source queries. Don't fail init_schema over an
+        # index problem.
+        print(f"[init_schema] could not create idx_jobs_source: {e}")
+    if source_added:
+        print(
+            "[init_schema] migration: added `source` column to existing jobs "
+            "table (defaulted to 'greenhouse' for legacy rows)"
+        )
     conn.commit()
 
 
 def _schema_is_warm(conn) -> bool:
-    """True iff `jobs` exists and `external_id` is already NOT NULL.
+    """True iff `jobs` exists, `external_id` is NOT NULL, and `source` exists.
 
-    Lets warm `get_client()` calls skip the DDL+migration cost.
+    Lets warm `get_client()` calls skip the DDL+migration cost. We require
+    `source` to exist so the column-add migration runs on cold path for any
+    pre-2026-07-13 tables.
     """
     cursor = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='jobs'"
     )
     if not cursor.fetchone():
         return False
-    return _external_id_is_not_null(conn)
+    if not _external_id_is_not_null(conn):
+        return False
+    if not _column_exists(conn, "jobs", "source"):
+        return False
+    return True
+
+
+def _column_exists(conn, table: str, column: str) -> bool:
+    cursor = conn.execute(f"PRAGMA table_info({table})")
+    for row in cursor.fetchall():
+        # PRAGMA table_info columns: cid, name, type, notnull, dflt_value, pk
+        if row[1] == column:
+            return True
+    return False
 
 
 def _external_id_is_not_null(conn) -> bool:
@@ -296,8 +375,8 @@ def upsert_jobs(jobs: list[dict]) -> int:
     sql = (
         "INSERT INTO jobs "
         "(external_id, company, title, description, location, posted_at, "
-        "apply_url, embedding, last_seen_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "apply_url, source, embedding, last_seen_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(external_id) DO UPDATE SET "
         "company=excluded.company, "
         "title=excluded.title, "
@@ -305,6 +384,7 @@ def upsert_jobs(jobs: list[dict]) -> int:
         "location=excluded.location, "
         "posted_at=excluded.posted_at, "
         "apply_url=excluded.apply_url, "
+        "source=excluded.source, "
         "embedding=excluded.embedding, "
         "last_seen_at=excluded.last_seen_at"
     )
@@ -312,6 +392,9 @@ def upsert_jobs(jobs: list[dict]) -> int:
         external_id = job.get("external_id")
         if external_id in (None, ""):
             raise ValueError("upsert_jobs requires non-empty external_id")
+        # Default to 'greenhouse' so older rows pre-dating the column stay
+        # valid even if a future code path forgets to pass source.
+        source = job.get("source") or "greenhouse"
         conn.execute(
             sql,
             [
@@ -322,6 +405,7 @@ def upsert_jobs(jobs: list[dict]) -> int:
                 job.get("location"),
                 job.get("posted_at"),
                 job.get("apply_url"),
+                source,
                 _embedding_to_text(job.get("embedding")),
                 job.get("last_seen_at"),
             ],
