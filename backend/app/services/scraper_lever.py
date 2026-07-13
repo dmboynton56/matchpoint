@@ -16,6 +16,7 @@ to LEVER_COMPANIES below. You can verify a slug with:
     curl https://api.lever.co/v0/postings/<slug>?mode=json
 A 200 with a JSON list means it's a real Lever customer.
 """
+import re
 import requests
 import time
 
@@ -88,7 +89,11 @@ def _is_us(job: dict) -> bool:
         return True
     haystack_lower = haystack.lower()
     for bad in NON_US_KEYWORDS:
-        if bad.lower().strip() in haystack_lower:
+        # Word-boundary match so substring overlap (e.g. "India" inside
+        # "Indianapolis") doesn't drop valid US jobs. `re.escape` handles
+        # entries with regex metacharacters like "EMEA" (no special
+        # chars here but cheap insurance).
+        if re.search(rf"\b{re.escape(bad.strip())}\b", haystack, re.IGNORECASE):
             return False
     # If any US state abbreviation shows up, it's US.
     tokens = {t.strip(",.()").upper() for t in haystack.split()}
@@ -125,14 +130,26 @@ def _scrape_company(session, company: str) -> list[dict]:
     for job in payload:
         if not isinstance(job, dict):
             continue
+        # Reject postings with no provider id — otherwise multiple
+        # postings would collide on the synthetic `lever:` prefix and
+        # corrupt downstream dedupe. (CodeRabbit flagged this.)
+        job_id = job.get("id")
+        if not job_id:
+            continue
         if not _is_us(job):
             continue
         cats = job.get("categories") or {}
         # Prefer the most-specific location string. Lever's `categories.location`
         # is the canonical "where" string ("San Francisco, CA").
         location = cats.get("location") or ""
-        if not location and cats.get("allLocations"):
-            location = cats["allLocations"][0]
+        all_locations = cats.get("allLocations")
+        if not location and isinstance(all_locations, list) and all_locations:
+            location = all_locations[0]
+        elif not location and isinstance(all_locations, str) and all_locations:
+            # Older Lever postings occasionally expose `allLocations` as a
+            # single string rather than a list. Use it as-is rather than
+            # indexing into it (which would yield just the first character).
+            location = all_locations
         # Combine description with `lists` (Lever's section content) so the
         # matcher has the full posting text.
         description_parts = [job.get("descriptionPlain") or ""]

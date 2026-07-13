@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import html
 import os
+from html.parser import HTMLParser
 from typing import Any
 
 
@@ -39,26 +40,35 @@ def _env_or_warn(name: str) -> str | None:
 
 
 def strip_html(text: str) -> str:
-    """Cheap HTML stripper for Adzuna descriptions which occasionally ship
-    with <p>/<br>/<strong>. Avoids pulling in BeautifulSoup per-row."""
+    """Strip HTML tags while preserving plain-text comparison operators.
+
+    Naive char-by-char scanning flips on every `<` and stays there until
+    the next `>`, which silently drops plain text like "experience < 2 years"
+    or "ratio > 1.5". Real HTMLParser only treats syntactically plausible
+    tags as markup, so standalone `<` / `>` in plain text pass through
+    untouched. We use stdlib `html.parser` so we don't pull in BeautifulSoup
+    per-row (the existing pipeline already uses BS elsewhere; this keeps
+    the source modules dependency-light).
+    """
     if not text:
         return ""
-    # Unescape first so we don't double-decode entities BeautifulSoup would
-    # otherwise handle. Then drop tags.
-    unescaped = html.unescape(text)
-    out: list[str] = []
-    in_tag = False
-    for ch in unescaped:
-        if ch == "<":
-            in_tag = True
-            continue
-        if ch == ">":
-            in_tag = False
-            out.append(" ")
-            continue
-        if not in_tag:
-            out.append(ch)
-    return " ".join("".join(out).split())
+
+    class _TextExtractor(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self._chunks: list[str] = []
+
+        def handle_data(self, data: str) -> None:
+            self._chunks.append(data)
+
+        def get_text(self) -> str:
+            return " ".join(" ".join(self._chunks).split())
+
+    # Unescape entities before parsing so `&amp;` doesn't trip the parser.
+    parser = _TextExtractor()
+    parser.feed(html.unescape(text))
+    parser.close()
+    return parser.get_text()
 
 
 def iso_or_none(value: Any) -> str | None:

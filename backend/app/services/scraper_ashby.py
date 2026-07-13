@@ -151,6 +151,12 @@ def _scrape_company(session, company: str) -> list[dict]:
     for job in raw_jobs:
         if not isinstance(job, dict):
             continue
+        job_id = job.get("id")
+        if not job_id:
+            # Reject postings with no provider id — otherwise multiple
+            # postings would collide on the synthetic `ashby:` prefix and
+            # corrupt downstream dedupe. (CodeRabbit flagged this.)
+            continue
         if not job.get("isListed", True):
             # Ashby supports draft / unlisted postings; skip those.
             continue

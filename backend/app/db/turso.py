@@ -260,8 +260,15 @@ def init_schema(client: "libsql.Connection | None" = None) -> None:  # type: ign
                     "UPDATE jobs SET source = 'greenhouse' WHERE source IS NULL"
                 )
                 source_added = True
-            except Exception:
-                pass
+            except Exception as inner_exc:
+                # Oldest libsql without even plain ADD COLUMN support. We
+                # can't add the column from Python — log loudly so operators
+                # see this in pipeline output rather than discovering it as
+                # a silent outage the next time `source` is queried.
+                print(
+                    f"[init_schema] fallback ADD COLUMN source also failed: "
+                    f"{type(inner_exc).__name__}: {inner_exc}"
+                )
     # Index the source column for fast per-source filtering. Always run
     # idempotently — fresh installs hit this after CREATE TABLE above,
     # migration installs hit it after the ALTER ADD COLUMN above. Either
