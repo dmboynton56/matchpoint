@@ -57,6 +57,7 @@ def scrape_all() -> list[dict]:
                     "location": (job.get("location", {}) or {}).get("name", ""),
                     "posted_at": job.get("updated_at", "") or None,
                     "apply_url": job.get("absolute_url", ""),
+                    "source": "greenhouse",
                 })
                 added += 1
 
