@@ -273,8 +273,11 @@ export function ResumePage() {
             <p className="text-sm leading-relaxed text-muted-foreground">
               Suggestions to add to your resume, based on the skills your top
               job matches are asking for. Each tip is grounded in a real job
-              description. Use the bullet coach to rewrite weak lines with
-              measurable impact.
+              description. The bullet workshop below is experimental — it
+              asks you to defend the weakest bullets (missing specifics,
+              scope, ownership, or results) and rewrites them from what
+              you say, but the output isn&apos;t guaranteed to keep every
+              measurable detail intact. Read before you paste it in.
             </p>
             <ResumeSuggestionsCard enabled={!!resume?.has_resume} />
           </div>

@@ -5,14 +5,21 @@ from app.schemas.suggestions import (
     BANNED_SUGGESTION_TEXTS,
     Citation,
     CoachBullet,
+    CoachBulletVerdict,
+    CoachCategory,
     CoachQuestion,
     CoachQuestionType,
+    CategoryChecklist,
     LearningLink,
+    MAX_COACH_BULLETS_PER_SESSION,
     MIN_SUGGESTIONS,
     Suggestion,
     SuggestionKind,
     SuggestionsResponse,
+    MIN_STRENGTH_REASON_LEN,
     validate_coach_bullet_grounding,
+    validate_coach_rewrite_category_coverage,
+    validate_coach_start_request,
     validate_suggestions,
 )
 from app.services.learning_links import lookup
@@ -600,19 +607,21 @@ class CitationLinkStitchTests(unittest.TestCase):
             ]
         }
         good = CoachBullet(
-            bullet_id="b1",
-            original_text="Built a job matching platform",
-            weakness_reason="no scale",
-            citation_job_id="j1",
-            citation_quote="Built a job matching platform",
-            questions=[
-                CoachQuestion(
-                    key="scale",
-                    label="How many?",
-                    type=CoachQuestionType.TEXT,
-                )
-            ],
-        )
+                bullet_id="b1",
+                verdict=CoachBulletVerdict.WEAK,
+                original_text="Built a job matching platform",
+                weakness_reason="no scale",
+                citation_job_id="j1",
+                citation_quote="Built a job matching platform",
+                questions=[
+                    CoachQuestion(
+                        key="scale",
+                        category=CoachCategory.SCOPE,
+                        label="How many?",
+                        type=CoachQuestionType.TEXT,
+                    )
+                ],
+            )
         bad = good.model_copy(update={
             "bullet_id": "b2",
             "original_text": "Some completely fabricated bullet",
@@ -638,19 +647,21 @@ class CitationLinkStitchTests(unittest.TestCase):
             ]
         }
         bullet = CoachBullet(
-            bullet_id="b1",
-            original_text="BUILT a job matching platform.",
-            weakness_reason="no scale",
-            citation_job_id="j1",
-            citation_quote="quote",
-            questions=[
-                CoachQuestion(
-                    key="k",
-                    label="L",
-                    type=CoachQuestionType.TEXT,
-                )
-            ],
-        )
+                bullet_id="b1",
+                verdict=CoachBulletVerdict.WEAK,
+                original_text="BUILT a job matching platform.",
+                weakness_reason="no scale",
+                citation_job_id="j1",
+                citation_quote="quote",
+                questions=[
+                    CoachQuestion(
+                        key="k",
+                        category=CoachCategory.SCOPE,
+                        label="L",
+                        type=CoachQuestionType.TEXT,
+                    )
+                ],
+            )
         accepted = validate_coach_bullet_grounding([bullet], parsed)
         self.assertEqual(len(accepted), 1)
 
@@ -971,6 +982,243 @@ class AlreadyInResumeDefenseTests(unittest.TestCase):
             [],
             "Next.js (already in resume ending with '.') should have been dropped",
         )
+
+
+
+
+
+class SubstantiveGroundingTests(unittest.TestCase):
+    """The v2 grounding contract: numbers and tech names must be
+    sourced; English glue (verbs, articles, prepositions) is free.
+
+    Before this change the validator rejected every natural rewrite
+    that used verb conjugations of sourced words ("replacing",
+    "enabling", "shipping") or capitalized tech names ("Rust",
+    "Python"). The validator now only rejects tokens that look
+    like substantive claims -- digits, CamelCase/dot-notation,
+    and titlecase tokens that didn't appear in any source.
+    """
+
+    def _check(self, rewrite, original, quote, answers, description=None):
+        from app.schemas.suggestions import validate_coach_rewrite_grounding
+        return validate_coach_rewrite_grounding(
+            rewrite,
+            original_text=original,
+            answers=answers,
+            citation_quote=quote,
+            citation_description=description or quote,
+        )
+
+    def test_verb_conjugations_pass(self):
+        ok, reasons = self._check(
+            "Owned the rewrite of the auth layer, replacing the "
+            "legacy session cookies with JWT and unblocking the "
+            "mobile team.",
+            "Owned the rewrite of the auth layer.",
+            "migrate from session cookies to JWT",
+            {
+                "replacement": "the legacy session cookies",
+                "artifact": "JWT",
+                "cause_effect": "unblocking the mobile team",
+            },
+        )
+        self.assertTrue(ok, f"verb conjugation rejected: {reasons}")
+
+    def test_invented_metric_rejected(self):
+        ok, reasons = self._check(
+            "Reduced latency by 99% across 50k users.",
+            "Reduced latency.",
+            "improve latency",
+            {"scope": "50 users"},
+        )
+        self.assertFalse(ok)
+        joined = " ".join(reasons)
+        self.assertIn("99", joined)
+        self.assertIn("50k", joined)
+
+    def test_invented_tech_name_rejected(self):
+        ok, reasons = self._check(
+            "Built the matching algorithm in Rust and Python.",
+            "Built the matching algorithm.",
+            "matching algorithm",
+            {"artifact": "the matching algorithm"},
+        )
+        self.assertFalse(ok)
+        joined = " ".join(reasons)
+        self.assertIn("rust", joined.lower())
+
+    def test_user_mentioned_tech_passes(self):
+        ok, reasons = self._check(
+            "Built the matching algorithm in Rust.",
+            "Built the matching algorithm.",
+            "matching algorithm",
+            {"artifact": "Rust"},
+        )
+        self.assertTrue(ok, f"user-mentioned tech rejected: {reasons}")
+
+    def test_camelcase_tech_passes_when_sourced(self):
+        ok, reasons = self._check(
+            "Built the API in FastAPI and PostgreSQL.",
+            "Built the API.",
+            "design a FastAPI service",
+            {
+                "artifact": "FastAPI",
+                "specificity": "PostgreSQL schema",
+            },
+        )
+        self.assertTrue(
+            ok, f"sourced CamelCase tech rejected: {reasons}"
+        )
+
+    def test_invented_camelcase_rejected(self):
+        ok, reasons = self._check(
+            "Built the API in FastAPI and Kafka.",
+            "Built the API.",
+            "design a FastAPI service",
+            {"artifact": "FastAPI"},
+        )
+        self.assertFalse(ok)
+        joined = " ".join(reasons)
+        self.assertIn("kafka", joined.lower())
+
+
+
+
+
+class CitationGroundingTests(unittest.TestCase):
+    """Drop WEAK bullets whose citation_quote isn't a substring of
+    the cited job's description. This catches the LLM's habit of
+    fabricating a quote -- typically by echoing the user's answer
+    rather than pulling from the job posting.
+
+    Without this check, the bad quote lands in the session and
+    surfaces as a confusing 502 on /coach/rewrite, AFTER the user
+    has invested time answering the questions. Better to drop the
+    bullet at /coach/start.
+    """
+
+    def _weak(self, citation_job_id, citation_quote):
+        from app.schemas.suggestions import (
+            CoachBullet, CoachBulletVerdict, CoachQuestion,
+            CoachCategory, CoachQuestionType,
+        )
+        return CoachBullet(
+            bullet_id="b1",
+            verdict=CoachBulletVerdict.WEAK,
+            original_text="Built a job matching platform for the cohort.",
+            weakness_reason="No audience detail",
+            citation_job_id=citation_job_id,
+            citation_quote=citation_quote,
+            questions=[
+                CoachQuestion(
+                    key="scope",
+                    category=CoachCategory.SCOPE,
+                    label="Who used it?",
+                    type=CoachQuestionType.TEXT,
+                )
+            ],
+        )
+
+    def _strong(self, citation_job_id, citation_quote):
+        from app.schemas.suggestions import (
+            CoachBullet, CoachBulletVerdict,
+        )
+        return CoachBullet(
+            bullet_id="b1",
+            verdict=CoachBulletVerdict.STRONG,
+            original_text="Reduced p99 latency by 40% across 50k MAU.",
+            strength_reason="Already has metric and scope.",
+            citation_job_id=citation_job_id,
+            citation_quote=citation_quote,
+        )
+
+    def test_drops_bullet_with_fabricated_quote(self):
+        # The bug from production: the LLM echoed the user's
+        # answer ("frontier AI labs to train LLMs") as the
+        # citation quote, but the cited job description is
+        # about backend APIs and doesn't mention frontier AI.
+        from app.schemas.suggestions import validate_coach_citation_grounding
+
+        bullet = self._weak(
+            citation_job_id="job-aaa",
+            citation_quote="frontier AI labs to train LLMs",
+        )
+        job_descriptions = {
+            "job-aaa": "Looking for an engineer to design REST APIs.",
+        }
+        accepted = validate_coach_citation_grounding(
+            [bullet], job_descriptions
+        )
+        self.assertEqual(accepted, [])
+
+    def test_keeps_bullet_with_real_quote(self):
+        from app.schemas.suggestions import validate_coach_citation_grounding
+
+        bullet = self._weak(
+            citation_job_id="job-aaa",
+            citation_quote="Built a job matching platform",
+        )
+        job_descriptions = {
+            "job-aaa": "Looking for someone. Built a job matching platform for internal use.",
+        }
+        accepted = validate_coach_citation_grounding(
+            [bullet], job_descriptions
+        )
+        self.assertEqual([b.bullet_id for b in accepted], ["b1"])
+
+    def test_strong_bullets_skip_the_check(self):
+        # STRONG bullets don't go through /coach/rewrite, so a
+        # bad citation_quote there is cosmetic. The validator
+        # should NOT drop STRONG bullets -- the user still sees
+        # the "✓ Already strong" positive feedback.
+        from app.schemas.suggestions import validate_coach_citation_grounding
+
+        bullet = self._strong(
+            citation_job_id="job-aaa",
+            citation_quote="some made-up quote that isn't in any job",
+        )
+        job_descriptions = {
+            "job-aaa": "Looking for a backend engineer with Python.",
+        }
+        accepted = validate_coach_citation_grounding(
+            [bullet], job_descriptions
+        )
+        self.assertEqual([b.bullet_id for b in accepted], ["b1"])
+
+    def test_missing_job_description_keeps_bullet(self):
+        # Best-effort: if we don't have the cited job's description
+        # (e.g. job purged from Turso), we can't prove fabrication
+        # either way. Keep the bullet.
+        from app.schemas.suggestions import validate_coach_citation_grounding
+
+        bullet = self._weak(
+            citation_job_id="job-missing",
+            citation_quote="any quote",
+        )
+        job_descriptions = {}  # job-missing not present
+        accepted = validate_coach_citation_grounding(
+            [bullet], job_descriptions
+        )
+        self.assertEqual([b.bullet_id for b in accepted], ["b1"])
+
+    def test_quote_matching_is_case_insensitive_and_whitespace_tolerant(self):
+        # _quote_is_substring normalizes both sides (lowercase +
+        # whitespace-collapsed). Verify the check tolerates the
+        # common case where the LLM reformatted the quote slightly.
+        from app.schemas.suggestions import validate_coach_citation_grounding
+
+        bullet = self._weak(
+            citation_job_id="job-aaa",
+            citation_quote="Built  a  JOB matching platform",  # extra spaces + caps
+        )
+        job_descriptions = {
+            "job-aaa": "Built a job matching platform for internal use.",
+        }
+        accepted = validate_coach_citation_grounding(
+            [bullet], job_descriptions
+        )
+        self.assertEqual([b.bullet_id for b in accepted], ["b1"])
+
 
 
 if __name__ == "__main__":

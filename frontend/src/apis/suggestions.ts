@@ -1,5 +1,6 @@
 import type {
   CoachBullet,
+  CoachCategory,
   CoachRewriteResponse,
   CoachStartResponse,
   Suggestion,
@@ -36,8 +37,8 @@ export async function refreshSuggestions(): Promise<ResumeSuggestionsRefreshResp
 
 /**
  * POST /suggestions/coach/start — start a coach session.
- * Returns a session_id, the skill suggestions, and up to 4 weak
- * bullets with questions. The UI sends the session_id back with
+ * Returns a session_id, the skill suggestions, and up to 5 bullets
+ * (mix of STRONG + WEAK). The UI sends the session_id back with
  * each rewrite call.
  */
 export async function startCoachSession(): Promise<CoachStartResponse> {
@@ -48,13 +49,20 @@ export async function startCoachSession(): Promise<CoachStartResponse> {
 
 /**
  * POST /suggestions/coach/rewrite — request a rewrite for one
- * bullet. The user has filled in the bullet's questions; this
- * sends their answers back and returns the rewritten bullet.
+ * WEAK bullet. The user has filled in (or skipped) the bullet's
+ * questions; this sends their answers back and returns the
+ * rewritten bullet.
+ *
+ * `skipped_categories` lists categories the user explicitly opted
+ * out of. The backend treats them as "do not invent content for
+ * these dimensions" and lets the validator skip the coverage
+ * check for them.
  */
 export async function rewriteBullet(input: {
   session_id: string
   bullet_id: string
   answers: Record<string, string>
+  skipped_categories?: CoachCategory[]
 }): Promise<CoachRewriteResponse> {
   return apiFetch<CoachRewriteResponse>("/suggestions/coach/rewrite", {
     method: "POST",

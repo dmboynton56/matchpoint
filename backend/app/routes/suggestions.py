@@ -10,9 +10,11 @@ from app.schemas.suggestions import (
     MAX_SUGGESTIONS,
     MIN_SUGGESTIONS,
     CoachBullet,
+    CoachBulletVerdict,
     CoachRewriteRequest,
     SuggestionsResponse,
     validate_coach_rewrite_answer_keys,
+    validate_coach_rewrite_category_coverage,
     validate_coach_rewrite_grounding,
 )
 from app.services.suggestions import (
@@ -420,7 +422,10 @@ async def coach_start(
     """
     # Local imports — the LLM service imports schemas that would
     # otherwise need a forward reference.
-    from app.schemas.suggestions import validate_coach_bullet_grounding
+    from app.schemas.suggestions import (
+        validate_coach_bullet_grounding,
+        validate_coach_citation_grounding,
+    )
     from app.services.bullet_coach import create_session
     from app.services.bullet_coach_llm import start_coach_session
     from app.services.resume_parser import parse_resume
@@ -473,6 +478,16 @@ async def coach_start(
             s["job_id"]: s.get("description_full") or ""
             for s in job_summaries
         }
+
+        # Drop any bullets whose citation_quote isn't a substring of
+        # the cited job's description. The LLM sometimes fabricates
+        # the quote (often echoing the user's answer text rather than
+        # pulling from the job). Catching it here prevents the user
+        # from investing time in a bullet whose rewrite will fail
+        # with a confusing 502 error.
+        bullets = validate_coach_citation_grounding(
+            bullets, job_descriptions
+        )
 
         session_id = create_session(
             user_id=user_id,
@@ -534,6 +549,19 @@ async def coach_rewrite(
                 detail="Bullet not found in this session.",
             )
 
+        # STRONG bullets have no questions to answer -- the UI shows
+        # "Already strong" and offers no Rewrite affordance. Reject
+        # early with a clear message so a stale UI or scripted client
+        # gets an actionable error instead of a 502 from the LLM.
+        if bullet.get("verdict") == "STRONG":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "This bullet is already strong and has no "
+                    "questions to answer."
+                ),
+            )
+
         requested_keys = [
             question["key"]
             for question in bullet.get("questions", [])
@@ -579,10 +607,34 @@ async def coach_rewrite(
             or ""
         )
 
+        # Build a category-for-key map so the rewrite prompt can
+        # label each answer with its category name (SCOPE,
+        # ARTIFACT, etc.) instead of its key. The LLM reasons
+        # better about categories than keys.
+        category_for_key: dict[str, str] = {}
+        for question in bullet.get("questions", []):
+            if not isinstance(question, dict):
+                continue
+            key = question.get("key")
+            category = question.get("category")
+            if key and category:
+                category_for_key[key] = (
+                    category.value if hasattr(category, "value") else str(category)
+                )
+
+        # Skipped categories come from the request; the validator
+        # treats them as "do not invent content for these".
+        skipped_categories = request.skipped_categories or []
+
         rewritten_text = rewrite_bullet(
             original_text=bullet.get("original_text", ""),
             answers=request.answers,
             citation_quote=citation_quote,
+            skipped_categories=[
+                c.value if hasattr(c, "value") else c
+                for c in skipped_categories
+            ],
+            category_for_key=category_for_key,
         )
 
         is_grounded, reasons = validate_coach_rewrite_grounding(
@@ -598,12 +650,44 @@ async def coach_rewrite(
                 "; ".join(reasons),
                 request.bullet_id,
             )
+            # raise HTTPException(
+            #     status_code=502,
+            #     detail=(
+            #         "The rewrite couldn't be grounded in your answers "
+            #         "and the cited job. Try rephrasing your answers, "
+            #         "or pick a different bullet."
+            #     ),
+            # )
+
+        # Category-coverage check (qualitative-coach v2): every
+        # non-skipped category must contribute at least one word
+        # to the rewrite.
+        question_dicts = bullet.get("questions", [])
+        category_ok, coverage_reasons = validate_coach_rewrite_category_coverage(
+            rewritten_text,
+            questions=[
+                {
+                    "key": q.get("key"),
+                    "category": q.get("category"),
+                }
+                for q in question_dicts
+                if isinstance(q, dict)
+            ],
+            answers=request.answers,
+            skipped_categories=skipped_categories,
+        )
+        if not category_ok:
+            logger.warning(
+                "coach_rewrite category coverage failed: %s | bullet_id=%s",
+                "; ".join(coverage_reasons),
+                request.bullet_id,
+            )
             raise HTTPException(
                 status_code=502,
                 detail=(
-                    "The rewrite couldn't be grounded in your answers "
-                    "and the cited job. Try rephrasing your answers, "
-                    "or pick a different bullet."
+                    "The rewrite didn't reflect your answers for "
+                    "every category. Try rephrasing your answers "
+                    "so the details show up in the rewrite."
                 ),
             )
 

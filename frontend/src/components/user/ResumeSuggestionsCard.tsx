@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react"
-import { Check, Clipboard, ExternalLink, Sparkles } from "lucide-react"
+import { Check, Clipboard, ExternalLink, RefreshCw, Sparkles, X } from "lucide-react"
 import { toast } from "sonner"
 
 import {
@@ -9,10 +9,12 @@ import {
   startCoachSession,
   type ResumeSuggestionsResponse,
 } from "@/apis/suggestions"
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Spinner } from "@/components/ui/spinner"
 import type {
   CoachBullet,
+  CoachCategory,
   CoachRewriteResponse,
   CoachStartResponse,
   Suggestion,
@@ -35,6 +37,13 @@ type CardState =
       session: CoachStartResponse
       /** Per-bullet map of question key -> user's answer. */
       answers: Record<string, Record<string, string>>
+      /**
+       * Per-bullet list of categories the user explicitly opted out of.
+       * Empty answer text + Skip button = the same thing as not
+       * filling it in, but we track the explicit intent so the
+       * backend's "do not invent content" rule kicks in.
+       */
+      skipped_categories: Record<string, CoachCategory[]>
       /** Per-bullet rewrite result, once the user has asked for one. */
       rewrites: Record<string, CoachRewriteResponse>
       /** Bullet IDs currently being rewritten. */
@@ -106,24 +115,50 @@ function CitationJobHeader({
 }
 
 /**
- * Render a single bullet-coach entry: location breadcrumb,
- * weakness reason, original-text quote, question inputs, and
- * either a rewrite result or a "Get rewrite" button.
+ * Short label for a qualitative category, used as a badge on
+ * each question input. Maps the enum value to a more readable
+ * form ("CAUSE_EFFECT" -> "Cause / effect"). The mapping is
+ * intentionally short — these render as small inline pills.
  */
-function BulletCoachItem({
+const CATEGORY_LABEL: Record<CoachCategory, string> = {
+  SPECIFICITY: "Specificity",
+  SCOPE: "Scope",
+  OWNERSHIP: "Ownership",
+  REPLACEMENT: "Replacement",
+  CAUSE_EFFECT: "Cause / effect",
+  ARTIFACT: "Artifact",
+}
+
+/**
+ * Render a single WEAK bullet-coach entry: location breadcrumb,
+ * weakness reason, original-text quote, one question input per
+ * missing category, and either a rewrite result or a
+ * "Get rewrite" button.
+ *
+ * The question inputs use the question.key as the map key. When
+ * the LLM omits question.key (it can), the backend derives one
+ * from the category. The UI uses question.key as the answer key
+ * because that's what the backend's coverage validator maps back
+ * to categories server-side.
+ */
+function BulletCoachWeakItem({
   bullet,
+  answers,
+  skippedCategories,
+  onAnswerChange,
+  onToggleSkip,
   rewrite,
+  pending,
+  onRequestRewrite,
 }: {
   bullet: CoachBullet
+  answers: Record<string, string>
+  skippedCategories: CoachCategory[]
+  onAnswerChange: (key: string, value: string) => void
+  onToggleSkip: (category: CoachCategory) => void
   rewrite: CoachRewriteResponse | undefined
-  // NOTE: The rewrite input UI was temporarily hidden while we
-  // investigate a /coach/rewrite slowness issue (see comment in the
-  // JSX below). The props `answers`, `onAnswerChange`, `pending`,
-  // and `onRequestRewrite` were removed from the signature
-  // because they were unused. To re-enable the rewrite UI, restore
-  // them here and at the call site (search for `<BulletCoachItem`
-  // in this file), and uncomment the JSX block marked
-  // "REWRITE UI TEMPORARILY HIDDEN" below.
+  pending: boolean
+  onRequestRewrite: () => void
 }) {
   const [copied, setCopied] = useState(false)
 
@@ -137,6 +172,20 @@ function BulletCoachItem({
       toast.error("Couldn't copy to clipboard.")
     }
   }
+
+  // The backend derives a default key from the category when the
+  // LLM omits question.key. We mirror that derivation here so the
+  // answer map keys match what the backend expects.
+  const fallbackKeyFor: Record<CoachCategory, string> = {
+    SPECIFICITY: "specificity",
+    SCOPE: "scope",
+    OWNERSHIP: "ownership",
+    REPLACEMENT: "replacement",
+    CAUSE_EFFECT: "cause_effect",
+    ARTIFACT: "artifact",
+  }
+  const resolvedKey = (question: { key?: string | null; category: CoachCategory }) =>
+    question.key || fallbackKeyFor[question.category]
 
   return (
     <li className="rounded-md border border-border bg-background/60 px-3 py-3 space-y-3">
@@ -167,39 +216,88 @@ function BulletCoachItem({
         {bullet.weakness_reason}
       </p>
 
-      {/* REWRITE UI TEMPORARILY HIDDEN.
-          The /coach/rewrite endpoint is hanging on some
-          OpenAI calls (30+ second response times). The
-          backend code is still in place -- services/bullet_coach.py,
-          services/bullet_coach_llm.py:rewrite_bullet, and the
-          /suggestions/coach/rewrite route -- but the UI is
-          disabled until we diagnose whether the slowness
-          is OpenAI's structured-outputs path, our schema, or
-          a network issue.
-
-          For now: show the questions as a read-only list so
-          the user can see what info is missing. No input
-          fields, no "Get rewrite" button. The Copy button
-          + rewrite result branch are kept in the code so
-          re-enabling is a one-line change. */}
+      {/* Question inputs */}
       {bullet.questions.length > 0 ? (
-        <div className="space-y-1">
+        <div className="space-y-2">
           <p className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">
-            Info needed to strengthen this bullet
+            Answer to strengthen
           </p>
-          <ul className="space-y-0.5 text-xs text-muted-foreground">
-            {bullet.questions.map((question) => (
-              <li key={question.key}>
-                &bull; {question.label}
-              </li>
-            ))}
+          <ul className="space-y-2">
+            {bullet.questions.map((question) => {
+              const key = resolvedKey(question)
+              const isSkipped = skippedCategories.includes(question.category)
+              const value = answers[key] ?? ""
+              return (
+                <li
+                  key={key}
+                  className="space-y-1 rounded-md border border-border bg-muted/20 px-2.5 py-2"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="inline-flex items-center rounded-full border border-border bg-background px-2 py-0.5 text-[10px] font-semibold tracking-wider text-foreground uppercase">
+                        {CATEGORY_LABEL[question.category]}
+                      </span>
+                      <label
+                        htmlFor={`q-${bullet.bullet_id}-${key}`}
+                        className="text-xs font-medium text-foreground"
+                      >
+                        {question.label}
+                      </label>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onToggleSkip(question.category)}
+                      className="text-[10px] font-medium text-muted-foreground hover:text-foreground"
+                    >
+                      {isSkipped ? "Unskip" : "Skip"}
+                    </button>
+                  </div>
+                  {question.hint ? (
+                    <p className="text-[11px] text-muted-foreground">
+                      {question.hint}
+                    </p>
+                  ) : null}
+                  {isSkipped ? (
+                    <p className="text-[11px] italic text-muted-foreground/70">
+                      Skipped — the rewrite won&apos;t invent anything for this
+                      category.
+                    </p>
+                  ) : (
+                    <textarea
+                      id={`q-${bullet.bullet_id}-${key}`}
+                      value={value}
+                      onChange={(event) =>
+                        onAnswerChange(key, event.target.value)
+                      }
+                      rows={2}
+                      placeholder="A short description — qualitative, not a number."
+                      className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground placeholder:text-muted-foreground/60 focus:border-primary focus:outline-none"
+                    />
+                  )}
+                </li>
+              );
+            })}
           </ul>
-          <p className="mt-2 text-[11px] italic text-muted-foreground/70">
-            Rewrite generation is temporarily disabled while we
-            investigate a slowness issue. The questions above
-            are what you&apos;d answer to strengthen this bullet
-            on your own.
-          </p>
+          <div className="flex items-center gap-2 pt-1">
+            <Button
+              type="button"
+              size="sm"
+              onClick={onRequestRewrite}
+              disabled={pending}
+            >
+              {pending ? (
+                <>
+                  <Spinner className="mr-2 size-3" />
+                  Rewriting…
+                </>
+              ) : (
+                "Get rewrite"
+              )}
+            </Button>
+            <p className="text-[11px] italic text-muted-foreground/70">
+              The rewrite will use words from your answers + the cited job.
+            </p>
+          </div>
         </div>
       ) : null}
 
@@ -230,29 +328,63 @@ function BulletCoachItem({
                 </>
               )}
             </Button>
-            {!rewrite.grounded && rewrite.grounding_failures.length > 0 ? (
-              <p className="text-[11px] text-amber-600">
-                Note: this rewrite may be partially ungrounded — verify
-                before pasting into your resume.
-              </p>
-            ) : null}
           </div>
-          {rewrite.citation.quote ? (
+          {rewrite.citation_quote ? (
             <p className="text-[11px] text-muted-foreground">
               <CitationJobHeader
-                jobTitle={rewrite.citation.job_title}
-                jobCompany={rewrite.citation.job_company}
-                applyUrl={rewrite.citation.apply_url}
+                jobTitle={rewrite.citation_job_title}
+                jobCompany={rewrite.citation_job_company}
+                applyUrl={rewrite.citation_apply_url}
               />
               <span className="mt-1 block italic">
-                &ldquo;{rewrite.citation.quote}&rdquo;
+                &ldquo;{rewrite.citation_quote}&rdquo;
               </span>
             </p>
           ) : null}
         </div>
       ) : null}
     </li>
-  )
+  );
+}
+
+/**
+ * Render a STRONG bullet-coach entry: the coach's positive
+ * feedback on a bullet that already covers all six qualitative
+ * categories. No inputs, no rewrite button -- the bullet is
+ * already strong.
+ */
+function BulletCoachStrongItem({ bullet }: { bullet: CoachBullet }) {
+  return (
+    <li className="rounded-md border border-emerald-300/60 bg-emerald-50/40 px-3 py-3 space-y-2 dark:border-emerald-700/50 dark:bg-emerald-950/20">
+      <div className="flex items-start gap-2">
+        <Check className="mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+        <div className="space-y-1">
+          <p className="text-[11px] font-semibold tracking-wider text-emerald-700 uppercase dark:text-emerald-300">
+            Already strong
+          </p>
+          <p className="text-xs leading-relaxed text-foreground/90">
+            {bullet.strength_reason}
+          </p>
+        </div>
+      </div>
+
+      <blockquote className="rounded border-l-2 border-emerald-300/60 bg-background/60 px-3 py-2 text-sm italic text-foreground/90">
+        &ldquo;{bullet.original_text}&rdquo;
+      </blockquote>
+
+      <p className="text-[11px] text-muted-foreground">
+        {bullet.location.section}
+        {bullet.location.entry_title ? (
+          <>
+            <span className="mx-1.5 text-muted-foreground/50">›</span>
+            <span className="text-foreground/80">
+              {bullet.location.entry_title}
+            </span>
+          </>
+        ) : null}
+      </p>
+    </li>
+  );
 }
 
 export function ResumeSuggestionsCard({ enabled }: ResumeSuggestionsCardProps) {
@@ -284,42 +416,6 @@ export function ResumeSuggestionsCard({ enabled }: ResumeSuggestionsCardProps) {
     if (!enabled) return
     void load()
   }, [enabled, load])
-
-  // Listen for coach-flow events bubbled up from CoachSection.
-  // We use CustomEvent on window because the CoachSection is
-  // nested several layers deep; passing callbacks through is
-  // possible but a global event is simpler for this one
-  // user-driven flow.
-  useEffect(() => {
-    const handleAnswer = (event: Event) => {
-      const detail = (event as CustomEvent<{
-        bulletId: string
-        key: string
-        value: string
-      }>).detail
-      handleAnswerChange(detail.bulletId, detail.key, detail.value)
-    }
-    const handleRewrite = (event: Event) => {
-      const detail = (event as CustomEvent<{ bulletId: string }>).detail
-      setState((current) => {
-        if (current.kind !== "coach_ready") return current
-        const bullet = current.session.bullets.find(
-          (b) => b.bullet_id === detail.bulletId,
-        )
-        if (!bullet) return current
-        // Fire-and-forget; the state updates happen inside
-        // handleRequestRewrite via its own setState calls.
-        void handleRequestRewrite(bullet)
-        return current
-      })
-    }
-    window.addEventListener("coach-answer", handleAnswer)
-    window.addEventListener("coach-rewrite", handleRewrite)
-    return () => {
-      window.removeEventListener("coach-answer", handleAnswer)
-      window.removeEventListener("coach-rewrite", handleRewrite)
-    }
-  }, [])
 
   const handleRefresh = async () => {
     setState((current) =>
@@ -368,6 +464,7 @@ export function ResumeSuggestionsCard({ enabled }: ResumeSuggestionsCardProps) {
         kind: "coach_ready",
         session,
         answers: {},
+        skipped_categories: {},
         rewrites: {},
         pending: {},
       })
@@ -428,6 +525,26 @@ export function ResumeSuggestionsCard({ enabled }: ResumeSuggestionsCardProps) {
     })
   }
 
+  const handleToggleSkip = (
+    bulletId: string,
+    category: CoachCategory,
+  ) => {
+    setState((current) => {
+      if (current.kind !== "coach_ready") return current
+      const existing = current.skipped_categories[bulletId] ?? []
+      const next = existing.includes(category)
+        ? existing.filter((c) => c !== category)
+        : [...existing, category]
+      return {
+        ...current,
+        skipped_categories: {
+          ...current.skipped_categories,
+          [bulletId]: next,
+        },
+      }
+    })
+  }
+
   const handleRequestRewrite = async (bullet: CoachBullet) => {
     setState((current) => {
       if (current.kind !== "coach_ready") return current
@@ -437,15 +554,18 @@ export function ResumeSuggestionsCard({ enabled }: ResumeSuggestionsCardProps) {
       }
     })
     try {
-      // Look up the current state in a way that survives the
-      // setState callback being async-batched.
+      // Pull current values out of the state ref so we don't race
+      // with pending setState calls above.
       const currentState = state
       if (currentState.kind !== "coach_ready") return
       const answers = currentState.answers[bullet.bullet_id] ?? {}
+      const skipped =
+        currentState.skipped_categories[bullet.bullet_id] ?? []
       const response = await rewriteBullet({
         session_id: currentState.session.session_id,
         bullet_id: bullet.bullet_id,
         answers,
+        skipped_categories: skipped,
       })
       setState((current) => {
         if (current.kind !== "coach_ready") return current
@@ -456,6 +576,9 @@ export function ResumeSuggestionsCard({ enabled }: ResumeSuggestionsCardProps) {
         }
       })
     } catch (error) {
+      // Keep the user's answers intact so they can rephrase and retry.
+      // The backend's 502 detail is the user-facing message -- it
+      // explains which categories the rewrite didn't reflect.
       const message =
         error instanceof Error
           ? error.message
@@ -535,14 +658,17 @@ export function ResumeSuggestionsCard({ enabled }: ResumeSuggestionsCardProps) {
   // ready or refreshing — narrow the union explicitly so TS sees
   // `data` is available.
   if (state.kind !== "ready" && state.kind !== "refreshing") {
-    // Coach-flow states render below. They're mutually exclusive
-    // with the one-shot view: when the user clicks "Coach me",
-    // the whole card switches over.
+    // Workshop-flow states render below. They're mutually exclusive
+    // with the one-shot view: when the user clicks "Workshop my
+    // bullets", the whole card switches over.
     return (
       <CoachFlowView
         state={state}
         onStart={handleStartCoach}
         onExit={handleExitCoach}
+        onAnswerChange={handleAnswerChange}
+        onToggleSkip={handleToggleSkip}
+        onRequestRewrite={handleRequestRewrite}
       />
     )
   }
@@ -565,20 +691,14 @@ export function ResumeSuggestionsCard({ enabled }: ResumeSuggestionsCardProps) {
           </div>
         </div>
         <div className="flex items-center gap-2">
-          {/* COACH ME BUTTON TEMPORARILY HIDDEN.
-              The /coach/rewrite endpoint is hanging on some
-              OpenAI calls. The button is hidden until we
-              diagnose the slowness. The backend route +
-              service code is preserved so re-enabling is a
-              one-line change. */}
-          {/* <Button
+          <Button
             type="button"
             variant="outline"
             size="sm"
             onClick={() => void handleStartCoach()}
           >
-            Coach me on bullets
-          </Button> */}
+            Workshop my bullets
+          </Button>
           <Button
             type="button"
             variant="outline"
@@ -669,14 +789,23 @@ export function ResumeSuggestionsCard({ enabled }: ResumeSuggestionsCardProps) {
 }
 
 /**
- * Coach-flow view: replaces the one-shot view while a coach
- * session is in flight or active. The user clicked "Coach me on
- * bullets" and is now answering questions + receiving rewrites.
+ * Workshop-flow view: replaces the one-shot view while a bullet
+ * workshop session is in flight or active. The user clicked
+ * "Workshop my bullets" and is now defending gaps the tool
+ * surfaced + receiving rewrites.
+ *
+ * The session returns up to 5 bullets -- a mix of STRONG and
+ * WEAK. Strong bullets render as positive feedback (no rewrite
+ * available). Weak bullets get one input per missing category +
+ * a Skip button per category + a Get rewrite button.
  */
 function CoachFlowView({
   state,
   onStart,
   onExit,
+  onAnswerChange,
+  onToggleSkip,
+  onRequestRewrite,
 }: {
   state: Extract<
     CardState,
@@ -684,29 +813,88 @@ function CoachFlowView({
   >
   onStart: () => void
   onExit: () => void
+  onAnswerChange: (bulletId: string, key: string, value: string) => void
+  onToggleSkip: (bulletId: string, category: CoachCategory) => void
+  onRequestRewrite: (bullet: CoachBullet) => void
 }) {
+  // Count bullets the user has actually typed an answer into. We
+  // treat an empty string the same as "not typed" so a half-deleted
+  // field doesn't count. Used by the refresh button to decide whether
+  // to show a confirm dialog before discarding answers.
+  const answeredBulletCount =
+    state.kind === "coach_ready"
+      ? Object.values(state.answers).filter((byKey) =>
+          Object.values(byKey).some(
+            (value) => typeof value === "string" && value.trim().length > 0,
+          ),
+        ).length
+      : 0
+  const hasTypedAnswers = answeredBulletCount > 0
+
+  // The refresh button does what "Back to suggestions" + "Coach
+  // me on bullets" does: re-call /coach/start with a fresh
+  // session_id. We confirm first only when the user has typed
+  // answers — a no-answers refresh shouldn't make them read a
+  // dialog just to click through. CONFIRM first.
+  const handleRefreshClick = () => {
+    if (hasTypedAnswers) {
+      const ok = window.confirm(
+        `You have answers typed in for ${answeredBulletCount === 1 ? "1 bullet" : `${answeredBulletCount} bullets`}. Refreshing will discard them and pick new bullets to work on.`,
+      )
+      if (!ok) return
+    }
+    onStart()
+  }
+
   return (
     <div className="space-y-4 rounded-xl border border-border bg-card/50 px-5 py-5">
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-start gap-3">
           <Sparkles className="mt-0.5 size-5 shrink-0 text-primary" />
           <div className="space-y-1">
-            <p className="text-sm font-medium text-foreground">Bullet coach</p>
+            <div className="flex items-center gap-2">
+              <p className="text-sm font-medium text-foreground">
+                Bullet workshop
+              </p>
+              {/* Experimental: the rewrites can occasionally drop
+                  measurable details the user didn't volunteer
+                  verbatim, so we don't want anyone treating the
+                  output as final. The pill sets expectations before
+                  someone pastes it into a real application. */}
+              <Badge variant="outline">Experimental</Badge>
+            </div>
             <p className="text-xs leading-relaxed text-muted-foreground">
-              Answer the questions for any bullet to get a rewrite
-              grounded in your own facts. Conversation state lives in
-              memory and will be lost on refresh.
+              We&apos;ll surface a few of your bullets and ask you to
+              defend the gaps — missing specifics, scope, ownership, or
+              results — so we can rewrite them with real numbers instead
+              of filler. Strong bullets are flagged as-is. Conversation
+              state lives in memory and will be lost on refresh.
             </p>
           </div>
         </div>
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          onClick={onExit}
-        >
-          Back to suggestions
-        </Button>
+        <div className="flex shrink-0 items-center gap-1.5">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={handleRefreshClick}
+            disabled={state.kind === "coach_loading"}
+            aria-label="Refresh questions"
+          >
+            <RefreshCw className="mr-1.5 size-3" />
+            Refresh questions
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={onExit}
+            disabled={state.kind === "coach_loading"}
+          >
+            <X className="mr-1.5 size-3" />
+            Back to suggestions
+          </Button>
+        </div>
       </div>
       {state.kind === "coach_loading" ? (
         <div className="flex items-center justify-center rounded-md border border-dashed border-border bg-muted/30 px-4 py-6 text-sm text-muted-foreground">
@@ -730,50 +918,99 @@ function CoachFlowView({
       {state.kind === "coach_ready" ? (
         <CoachSection
           session={state.session}
-          // `answers`, `rewrites`, and `pending` were unused after
-          // the rewrite input UI was hidden. When re-enabling,
-          // restore them here and in CoachSection's signature.
+          answers={state.answers}
+          skippedCategories={state.skipped_categories}
           rewrites={state.rewrites}
+          pending={state.pending}
+          onAnswerChange={onAnswerChange}
+          onToggleSkip={onToggleSkip}
+          onRequestRewrite={onRequestRewrite}
         />
       ) : null}
     </div>
   )
 }
 
+/**
+ * Render the session's bullets. Branches on verdict:
+ *   STRONG -> BulletCoachStrongItem (positive feedback, no inputs)
+ *   WEAK   -> BulletCoachWeakItem (one input per missing category)
+ */
 function CoachSection({
   session,
+  answers,
+  skippedCategories,
   rewrites,
+  pending,
+  onAnswerChange,
+  onToggleSkip,
+  onRequestRewrite,
 }: {
   session: CoachStartResponse
-  // NOTE: `answers` and `pending` were dropped from this signature
-  // along with the rewrite input UI. When re-enabling, restore
-  // them here and at the call site (search for `<CoachSection` in
-  // this file).
+  answers: Record<string, Record<string, string>>
+  skippedCategories: Record<string, CoachCategory[]>
   rewrites: Record<string, CoachRewriteResponse>
+  pending: Record<string, boolean>
+  onAnswerChange: (bulletId: string, key: string, value: string) => void
+  onToggleSkip: (bulletId: string, category: CoachCategory) => void
+  onRequestRewrite: (bullet: CoachBullet) => void
 }) {
+  const strongBullets = session.bullets.filter((b) => b.verdict === "STRONG")
+  const weakBullets = session.bullets.filter((b) => b.verdict === "WEAK")
+
   return (
     <div className="space-y-4">
       {session.bullets.length === 0 ? (
         <p className="rounded-md border border-dashed border-border bg-muted/30 px-3 py-4 text-sm text-muted-foreground">
-          No weak bullets found. Your resume already mentions scale
-          and impact for everything we looked at.
+          No bullets surfaced this time. Try again in a minute — the
+          coach picks different bullets each session.
         </p>
-      ) : (
-        <ul className="space-y-3">
-          {session.bullets.map((bullet) => (
-            <BulletCoachItem
-              key={bullet.bullet_id}
-              bullet={bullet}
-              rewrite={rewrites[bullet.bullet_id]}
-              // `answers`, `onAnswerChange`, `pending`, and
-              // `onRequestRewrite` were dropped from the
-              // BulletCoachItem signature while the rewrite UI
-              // is hidden. See the NOTE in BulletCoachItem's
-              // definition for how to restore them.
-            />
-          ))}
-        </ul>
-      )}
+      ) : null}
+
+      {weakBullets.length > 0 ? (
+        <div className="space-y-2">
+          <p className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">
+            Needs work
+          </p>
+          <ul className="space-y-3">
+            {weakBullets.map((bullet) => (
+              <BulletCoachWeakItem
+                key={bullet.bullet_id}
+                bullet={bullet}
+                answers={answers[bullet.bullet_id] ?? {}}
+                skippedCategories={
+                  skippedCategories[bullet.bullet_id] ?? []
+                }
+                onAnswerChange={(key, value) =>
+                  onAnswerChange(bullet.bullet_id, key, value)
+                }
+                onToggleSkip={(category) =>
+                  onToggleSkip(bullet.bullet_id, category)
+                }
+                rewrite={rewrites[bullet.bullet_id]}
+                pending={Boolean(pending[bullet.bullet_id])}
+                onRequestRewrite={() => onRequestRewrite(bullet)}
+              />
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {strongBullets.length > 0 ? (
+        <div className="space-y-2">
+          <p className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">
+            Already strong
+          </p>
+          <ul className="space-y-3">
+            {strongBullets.map((bullet) => (
+              <BulletCoachStrongItem
+                key={bullet.bullet_id}
+                bullet={bullet}
+              />
+            ))}
+          </ul>
+        </div>
+      ) : null}
 
       {session.skills.length > 0 ? (
         <div className="space-y-2 border-t border-border pt-3">
