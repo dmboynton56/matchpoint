@@ -1036,18 +1036,34 @@ class SubstantiveGroundingTests(unittest.TestCase):
         self.assertIn("99", joined)
         self.assertIn("50k", joined)
 
-    def test_invented_tech_name_rejected(self):
+    def test_invented_camelcase_tech_name_rejected(self):
+        """Fabricated CamelCase tech names (no source match) must
+        be flagged. Replaces the older 'Rust and Python' variant
+        which relied on the single-word Capitalized scan that was
+        removed (it false-positived on past-tense verbs like
+        'Developed')."""
         ok, reasons = self._check(
-            "Built the matching algorithm in Rust and Python.",
+            # PureTech is fabricated -- not in original, not in
+            # the quote, not in any answer. FakeTech is in the
+            # quote and would normally ground it; we moved it to
+            # the user's answer so the test isolates the
+            # fabricated case. Both are CamelCase so the scan
+            # catches them.
+            "Built the matching algorithm in PureTech and FakeTech.",
             "Built the matching algorithm.",
             "matching algorithm",
-            {"artifact": "the matching algorithm"},
+            {"artifact": "FakeTech"},
         )
         self.assertFalse(ok)
         joined = " ".join(reasons)
-        self.assertIn("rust", joined.lower())
+        self.assertIn("puretech", joined.lower())
 
     def test_user_mentioned_tech_passes(self):
+        # Single-word tech name (Rust) mentioned in the user's
+        # answer. CamelCase scan doesn't catch this and the
+        # category-coverage validator catches fabricated single-
+        # word tech names used to fill category answers. This
+        # test verifies the user-grounded path still works.
         ok, reasons = self._check(
             "Built the matching algorithm in Rust.",
             "Built the matching algorithm.",
@@ -1070,16 +1086,52 @@ class SubstantiveGroundingTests(unittest.TestCase):
             ok, f"sourced CamelCase tech rejected: {reasons}"
         )
 
-    def test_invented_camelcase_rejected(self):
+    def test_mid_sentence_capitalized_verb_not_flagged(self):
+        """Regression for the user's most recent report: a past-
+        tense verb in mid-sentence ('Developed', 'Designed')
+        used to be flagged as fabricated because the single-word
+        Capitalized scan couldn't distinguish it from a tech name.
+
+        After removing that scan, only true CamelCase tokens
+        (with mid-word uppercase) get flagged. Plain mid-sentence
+        verbs pass through without grounding checks -- they're
+        connective content, not substantive claims.
+        """
         ok, reasons = self._check(
-            "Built the API in FastAPI and Kafka.",
+            "Built a thing for our cohort, developed end to end "
+            "during the cohort's run, designed to scale.",
+            "Built a thing.",
+            "build a thing for a cohort",
+            {"scope": "our cohort"},
+        )
+        self.assertTrue(
+            ok, f"mid-sentence past-tense verb wrongly rejected: "
+            f"{reasons}"
+        )
+
+    def test_invented_camelcase_rejected(self):
+        """A CamelCase name that appears in NEITHER the original
+        nor the user's answers (only in the cited quote is NOT
+        enough -- see the job-only check for that path) gets
+        flagged as fabricated.
+
+        Original test fixture used 'FastAPI' (which the user
+        mentioned in their answer -- fabricated-name check would
+        not fire) and 'Kafka' (single-word, no longer in scope
+        post single-word Capitalized-scan removal). Both replaced
+        with CamelCase fabricated names so the scan catches them.
+        """
+        ok, reasons = self._check(
+            "Built the API in CoreLib and SideLib streams.",
             "Built the API.",
             "design a FastAPI service",
-            {"artifact": "FastAPI"},
+            {"artifact": "FastAPI"},  # FastAPI in answer grounds it
         )
         self.assertFalse(ok)
         joined = " ".join(reasons)
-        self.assertIn("kafka", joined.lower())
+        # Both fabricated names should be flagged.
+        self.assertIn("corelib", joined.lower())
+        self.assertIn("sidelib", joined.lower())
 
     def test_mid_sentence_tech_from_job_only_quote_flagged(self):
         """Regression for the user's recent report: the LLM took a
@@ -1350,11 +1402,15 @@ class CitationGroundingTests(unittest.TestCase):
             citation_quote=citation_quote,
         )
 
-    def test_drops_bullet_with_fabricated_quote(self):
-        # The bug from production: the LLM echoed the user's
-        # answer ("frontier AI labs to train LLMs") as the
-        # citation quote, but the cited job description is
-        # about backend APIs and doesn't mention frontier AI.
+    def test_keeps_bullet_under_relaxed_grounding_policy(self):
+        # Originally this validator dropped WEAK bullets whose
+        # citation_quote didn't ground against the cited job's
+        # description. After the experimental-feature policy
+        # change (slight hallucinations accepted for bullet-coach),
+        # the validator keeps WEAK bullets with valid descriptions
+        # regardless of quote content. Pins the relaxed policy so
+        # future re-tightening is a deliberate choice, not an
+        # accident.
         from app.schemas.suggestions import validate_coach_citation_grounding
 
         bullet = self._weak(
@@ -1367,7 +1423,13 @@ class CitationGroundingTests(unittest.TestCase):
         accepted = validate_coach_citation_grounding(
             [bullet], job_descriptions
         )
-        self.assertEqual(accepted, [])
+        self.assertEqual(
+            [b.bullet_id for b in accepted],
+            ["b1"],
+            "WEAK bullets with valid descriptions are kept under "
+            "the relaxed policy even when the quote is unrelated "
+            "to the description (the experimental-feature trade-off)",
+        )
 
     def test_keeps_bullet_with_real_quote(self):
         from app.schemas.suggestions import validate_coach_citation_grounding
@@ -1437,6 +1499,275 @@ class CitationGroundingTests(unittest.TestCase):
         )
         self.assertEqual([b.bullet_id for b in accepted], ["b1"])
 
+    def test_quote_matching_handles_unicode_and_trailing_punct(self):
+        """Regression for the user's reported 502: same quote
+        logic at start and rewrite time should produce the same
+        result. When it didn't, the underlying cause was that
+        _normalize didn't handle either of two legitimate
+        variations:
+
+        (1) Unicode: the LLM produces smart quotes (\u2019, \u201C)
+            and em-dashes, while job descriptions scraped from
+            career sites often have straight quotes and hyphens.
+            Same visual text, different code points -- substring
+            check fails.
+        (2) Trailing period: the LLM quotes a sentence with a
+            period; the matching source text doesn't have that
+            trailing period (it might be mid-sentence where the
+            quote was lifted from).
+
+        Both are now folded by _normalize's NFKC + side-punct
+        strip before substring matching.
+        """
+        from app.schemas.suggestions import validate_coach_citation_grounding
+
+        # (1) Smart-quote + em-dash in the quote; straight-quote +
+        # ASCII hyphens in the source. The validator's _normalize
+        # applies NFKC + manual em-dash replacement to make these
+        # comparable. (No pre-normalization here -- that would
+        # bypass the code path under test.)
+        bullet = self._weak(
+            citation_job_id="job-aaa",
+            # Curly quotes around "we build", em-dash at midpoint,
+            # trailing period.
+            citation_quote="we \u201cbuild\u201d with care \u2014 the team.",
+        )
+        job_descriptions = {
+            # Plain ASCII quotes, two-hyphen em-dash equivalent,
+            # no trailing period.
+            "job-aaa": 'we "build" with care -- the team',
+        }
+        accepted = validate_coach_citation_grounding(
+            [bullet], job_descriptions
+        )
+        self.assertEqual(
+            [b.bullet_id for b in accepted],
+            ["b1"],
+            "smart quotes + em-dash should match straight quotes "
+            "+ ASCII hyphens via NFKC + manual punctuation fold",
+        )
+
+        # (2) Trailing period in the quote; no period at the
+        # matching point in source. Side-punct strip handles this
+        # without affecting the rest of the string.
+        bullet2 = self._weak(
+            citation_job_id="job-bbb",
+            citation_quote="Built a job matching platform.",
+        )
+        job_descriptions2 = {
+            "job-bbb": "Looking for engineers. Built a job matching platform for internal use.",
+        }
+        accepted2 = validate_coach_citation_grounding(
+            [bullet2], job_descriptions2
+        )
+        self.assertEqual(
+            [b.bullet_id for b in accepted2],
+            ["b1"],
+            "trailing-period mismatch should not fail the substring check",
+        )
+
+    def test_paraphrased_quote_with_shared_vocabulary_passes(self):
+        """Under the relaxed policy (citation grounding check
+        disabled at /coach/start), WEAK bullets with paraphrased
+        quotes are kept. The score helper is still available for
+        diagnostic logging + future re-tightening, so this test
+        also pins that it returns a sensible non-zero score for a
+        genuine paraphrase.
+        """
+        from app.schemas.suggestions import (
+            validate_coach_citation_grounding,
+            _citation_grounding_score,
+        )
+
+        # Quote is a paraphrase of the JD's substance but isn't a
+        # verbatim substring. The score helper should still return
+        # a high value (it's used for diagnostic logs).
+        bullet = self._weak(
+            citation_job_id="job-aaa",
+            citation_quote=(
+                "Annotated and validated machine learning datasets "
+                "while maintaining high labeling accuracy and "
+                "adherence to QA guidelines across hundreds of "
+                "annotations."
+            ),
+        )
+        job_descriptions = {
+            "job-aaa": (
+                "We are hiring an ML Data Operations specialist to "
+                "annotate and validate machine learning datasets. "
+                "You will maintain high labeling accuracy, adhere to "
+                "QA guidelines, and review annotations across "
+                "hundreds of examples per day."
+            ),
+        }
+        score = _citation_grounding_score(
+            bullet.citation_quote, job_descriptions["job-aaa"]
+        )
+        self.assertGreater(
+            score,
+            0.5,
+            f"sanity: the score helper should return a high value "
+            f"for a genuine paraphrase (got {score:.2f}); if this "
+            "drops, the diagnostic log on /coach/rewrite loses "
+            "signal for debugging future grounding issues",
+        )
+        accepted = validate_coach_citation_grounding(
+            [bullet], job_descriptions
+        )
+        self.assertEqual(
+            [b.bullet_id for b in accepted],
+            ["b1"],
+            "paraphrased bullet is kept under the relaxed policy",
+        )
+
+    def test_fabricated_quote_kept_under_relaxed_policy(self):
+        """Under the relaxed policy, WEAK bullets with quotes that
+        share ZERO vocabulary with the cited JD's description are
+        kept (the experimental-feature trade-off: slight
+        hallucinations accepted in exchange for not 502-ing the
+        user mid-workshop). The score helper still returns 0 for
+        such quotes -- that's diagnostic, not gating.
+        """
+        from app.schemas.suggestions import (
+            validate_coach_citation_grounding,
+            _citation_grounding_score,
+        )
+
+        # Quote is fabricated from thin air -- no shared content
+        # vocabulary with the JD.
+        bullet = self._weak(
+            citation_job_id="job-aaa",
+            citation_quote=(
+                "Frontier AI labs to train LLMs on cutting edge "
+                "research with novel architectures."
+            ),
+        )
+        job_descriptions = {
+            "job-aaa": (
+                "We are hiring a backend engineer to design REST "
+                "APIs and maintain PostgreSQL databases."
+            ),
+        }
+        score = _citation_grounding_score(
+            bullet.citation_quote, job_descriptions["job-aaa"]
+        )
+        self.assertEqual(
+            score,
+            0.0,
+            "sanity: score helper should return 0 for a quote "
+            "with no shared content stems; this is the diagnostic "
+            "value you'd see in the rewrite log",
+        )
+        accepted = validate_coach_citation_grounding(
+            [bullet], job_descriptions
+        )
+        self.assertEqual(
+            [b.bullet_id for b in accepted],
+            ["b1"],
+            "fabricated quote is still kept under the relaxed "
+            "policy -- the user accepted this trade-off for the "
+            "experimental bullet-coach feature",
+        )
+
+
+class OverstrongClassificationTests(unittest.TestCase):
+    """Server-side safety net for gpt-4o-mini over-classifying
+    STRONG. When the LLM returns all-STRONG for a thin resume,
+    the user has no WEAK bullets to workshop on. The heuristic
+    reclassify_overstrong_bullets demotes thin STRONG bullets
+    server-side, synthesizing fallback questions."""
+
+    def _strong(self, bullet_id, original_text):
+        from app.schemas.suggestions import (
+            CoachBullet, CoachBulletVerdict,
+        )
+        return CoachBullet(
+            bullet_id=bullet_id,
+            verdict=CoachBulletVerdict.STRONG,
+            original_text=original_text,
+            strength_reason="Already a strong bullet.",
+            citation_job_id="job-aaa",
+            citation_quote="a verbatim substring of job description",
+        )
+
+    def _weak(self, bullet_id, original_text, questions):
+        from app.schemas.suggestions import (
+            CoachBullet, CoachBulletVerdict, CoachQuestion,
+            CoachQuestionType, CoachCategory,
+        )
+        return CoachBullet(
+            bullet_id=bullet_id,
+            verdict=CoachBulletVerdict.WEAK,
+            original_text=original_text,
+            weakness_reason="Missing dimensions.",
+            questions=questions,
+            citation_job_id="job-aaa",
+            citation_quote="a verbatim substring of job description",
+        )
+
+    def test_thin_strong_bullet_demoted(self):
+        from app.schemas.suggestions import reclassify_overstrong_bullets
+        # No audience, no outcome, no ownership, no artifact --
+        # the LLM marked it STRONG anyway. Server should demote.
+        bullets = [self._strong(
+            "b1",
+            "Built a job matching platform.",
+        )]
+        out = reclassify_overstrong_bullets(bullets)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].verdict.value, "WEAK")
+        # Synthesizes at least one fallback question.
+        self.assertGreater(len(out[0].questions), 0)
+
+    def test_genuinely_strong_bullet_untouched(self):
+        from app.schemas.suggestions import reclassify_overstrong_bullets
+        # Has artifact (API), audience (users), ownership (built),
+        # outcome (cutting ticket time). PASSES heuristic.
+        bullets = [self._strong(
+            "b1",
+            "Built the matching API serving 5k users, cutting "
+            "ticket resolution time by 30% for internal teams.",
+        )]
+        out = reclassify_overstrong_bullets(bullets)
+        self.assertEqual(out[0].verdict.value, "STRONG")
+
+    def test_weak_bullets_passthrough(self):
+        from app.schemas.suggestions import (
+            reclassify_overstrong_bullets,
+            CoachCategory, CoachQuestion, CoachQuestionType,
+        )
+        # Healthy mix: at least one WEAK. Heuristic leaves both
+        # STRONG and WEAK alone.
+        q = CoachQuestion(
+            key="scope", category=CoachCategory.SCOPE,
+            label="Who used it?", type=CoachQuestionType.TEXT,
+        )
+        bullets = [
+            self._weak("b1", "Built a thing.", [q]),
+            self._strong(
+                "b2",
+                "Built the matching API serving 5k users, "
+                "cutting ticket time 30%.",
+            ),
+        ]
+        out = reclassify_overstrong_bullets(bullets)
+        verdicts = sorted([b.verdict.value for b in out])
+        self.assertEqual(verdicts, ["STRONG", "WEAK"])
+        # WEAK bullet keeps its original question.
+        self.assertEqual(out[0].questions[0].key, "scope")
+
+    def test_falls_back_to_ownership_when_no_checklist(self):
+        from app.schemas.suggestions import reclassify_overstrong_bullets
+        # No checklist on the bullet -- heuristic picks
+        # OWNERSHIP as the highest-leverage missing category.
+        bullets = [self._strong(
+            "b1",
+            "Built something internally.",
+        )]
+        out = reclassify_overstrong_bullets(bullets)
+        cats = [q.category.value for q in out[0].questions]
+        self.assertEqual(len(cats), len(set(cats)),
+                         "synthesized questions should have unique categories")
 
 
 if __name__ == "__main__":

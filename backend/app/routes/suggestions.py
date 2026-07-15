@@ -13,7 +13,9 @@ from app.schemas.suggestions import (
     CoachBulletVerdict,
     CoachCategory,
     CoachRewriteRequest,
-    SuggestionsResponse,
+    DroppedCoachBullet,
+    _citation_grounding_score,
+    _quote_is_substring,
     validate_coach_rewrite_answer_keys,
     validate_coach_rewrite_category_coverage,
     validate_coach_rewrite_grounding,
@@ -409,6 +411,49 @@ def _attach_bullet_enrichment(
     return enriched
 
 
+def _record_coach_drops(
+    before: list[CoachBullet],
+    after: list[CoachBullet],
+    dropped_bullets: list[DroppedCoachBullet],
+    *,
+    reason: str,
+) -> None:
+    """Log + record any bullets in `before` that aren't in `after`.
+
+    `reason` is a stable short string from the documented set on
+    `DroppedCoachBullet` -- used both for the WARN log and for the
+    `reason` field on each appended `DroppedCoachBullet`. Called
+    twice in `/coach/start`: once after the citation_job_id
+    membership check (reason="citation_job_id_unknown") and once
+    after `validate_coach_citation_grounding`
+    (reason="citation_quote_not_substring"). Both checks must run
+    against the same starting list, so the caller passes two
+    separate `before` snapshots.
+    """
+    after_ids = {b.bullet_id for b in after}
+    before_by_id = {b.bullet_id: b for b in before}
+    for bullet_id, dropped in before_by_id.items():
+        if bullet_id in after_ids:
+            continue
+        logger.warning(
+            "coach_start dropped bullet: bullet_id=%s citation_job_id=%s "
+            "reason=%s quote=%r",
+            dropped.bullet_id,
+            dropped.citation_job_id,
+            reason,
+            dropped.citation_quote,
+        )
+        dropped_bullets.append(
+            DroppedCoachBullet(
+                bullet_id=dropped.bullet_id,
+                citation_job_id=dropped.citation_job_id,
+                citation_quote=dropped.citation_quote,
+                original_text=dropped.original_text,
+                reason=reason,
+            )
+        )
+
+
 @router.post("/suggestions/coach/start")
 async def coach_start(
     current_user=Depends(get_current_user),
@@ -424,6 +469,7 @@ async def coach_start(
     # Local imports — the LLM service imports schemas that would
     # otherwise need a forward reference.
     from app.schemas.suggestions import (
+        reclassify_overstrong_bullets,
         validate_coach_bullet_grounding,
         validate_coach_citation_grounding,
     )
@@ -480,15 +526,67 @@ async def coach_start(
             for s in job_summaries
         }
 
+        # Drop WEAK bullets whose citation_job_id isn't in the
+        # snapshot. Catches the LLM-hallucinated-job_id case:
+        # without this drop the bullet would survive start --
+        # `validate_coach_citation_grounding`'s "missing
+        # description" branch keeps best-effort, designed for the
+        # legitimate "job purged from Turso" case -- and then
+        # fail at rewrite with "citation quote is not a substring
+        # of the job description", because the route coerces the
+        # missing description to "" and the substring check
+        # returns False for any non-empty quote. STRONG bullets
+        # are kept: their citation_quote is cosmetic (no rewrite
+        # path) and the "missing description" tolerance for STRONG
+        # already exists by design.
+        known_job_ids = set(job_descriptions.keys())
+        before_membership = list(bullets)
+        bullets = [
+            b for b in bullets
+            if b.verdict == CoachBulletVerdict.STRONG
+            or b.citation_job_id in known_job_ids
+        ]
+
         # Drop any bullets whose citation_quote isn't a substring of
         # the cited job's description. The LLM sometimes fabricates
         # the quote (often echoing the user's answer text rather than
         # pulling from the job). Catching it here prevents the user
         # from investing time in a bullet whose rewrite will fail
         # with a confusing 502 error.
+        #
+        # Make the drop loud: capture each dropped bullet_id before
+        # the validator runs, then emit a WARN per drop and surface
+        # the set on the response so the paraphrase / fabrication
+        # rate is measurable from logs and telemetry. Previously
+        # this was silent -- the user just saw fewer bullets and
+        # the developer had no way to count how often the LLM was
+        # paraphrasing.
+        before_substring = list(bullets)
         bullets = validate_coach_citation_grounding(
             bullets, job_descriptions
         )
+
+        dropped_bullets: list[DroppedCoachBullet] = []
+        _record_coach_drops(
+            before_membership,
+            bullets,
+            dropped_bullets,
+            reason="citation_job_id_unknown",
+        )
+        _record_coach_drops(
+            before_substring,
+            bullets,
+            dropped_bullets,
+            reason="citation_quote_not_substring",
+        )
+        # Server-side safety net: gpt-4o-mini over-classifies
+        # STRONG for thin bullets, leaving the user with no
+        # workshop content. reclassify_overstrong_bullets demotes
+        # any STRONG bullet whose original_text clearly fails the
+        # qualitative-coverage heuristic, synthesizing one
+        # question per missing-strict category. Idempotent on
+        # sessions where STRONG classification looks genuine.
+        bullets = reclassify_overstrong_bullets(bullets)
 
         session_id = create_session(
             user_id=user_id,
@@ -500,6 +598,7 @@ async def coach_start(
             "session_id": session_id,
             "skills": skills,
             "bullets": bullets,
+            "dropped": dropped_bullets,
         }
     except HTTPException:
         raise
@@ -613,6 +712,7 @@ async def coach_rewrite(
         # ARTIFACT, etc.) instead of its key. The LLM reasons
         # better about categories than keys.
         category_for_key: dict[str, str] = {}
+        question_categories: set[CoachCategory] = set()
         for question in bullet.get("questions", []):
             if not isinstance(question, dict):
                 continue
@@ -622,10 +722,69 @@ async def coach_rewrite(
                 category_for_key[key] = (
                     category.value if hasattr(category, "value") else str(category)
                 )
+            if category is not None:
+                if isinstance(category, CoachCategory):
+                    question_categories.add(category)
+                elif isinstance(category, str):
+                    try:
+                        question_categories.add(
+                            CoachCategory(category.strip().upper())
+                        )
+                    except ValueError:
+                        pass
 
         # Skipped categories come from the request; the validator
         # treats them as "do not invent content for these".
         skipped_categories = request.skipped_categories or []
+
+        # Derive category_gaps here (used to be after the LLM
+        # call, but we need it before to compute auto-skip below).
+        # The prompt asks for `checklist` (six booleans); the
+        # Pydantic model also has an explicit `category_gaps`
+        # field the LLM may override -- prefer that when
+        # populated.
+        category_gaps: list[CoachCategory] = []
+        raw_gaps = bullet.get("category_gaps")
+        if isinstance(raw_gaps, list) and raw_gaps:
+            for g in raw_gaps:
+                if isinstance(g, CoachCategory):
+                    category_gaps.append(g)
+                elif isinstance(g, str):
+                    try:
+                        category_gaps.append(CoachCategory(g.strip().upper()))
+                    except ValueError:
+                        pass
+        if not category_gaps:
+            checklist = bullet.get("checklist")
+            if isinstance(checklist, dict):
+                for cat in CoachCategory:
+                    if not checklist.get(cat.value, True):
+                        category_gaps.append(cat)
+            elif checklist is not None:
+                for cat in CoachCategory:
+                    if not getattr(checklist, cat.value, True):
+                        category_gaps.append(cat)
+
+        # Auto-skip gap categories that don't have a question.
+        # The LLM sometimes produces a checklist with N gaps but
+        # only M<N questions (e.g., 5 categories marked missing
+        # but only 2 questions generated). The user can't answer
+        # what wasn't asked, so we treat those gap categories as
+        # implicitly skipped rather than 502-ing the request via
+        # validate_coach_rewrite_category_coverage's
+        # missing-question rule. Categories that DO have
+        # questions still go through the per-question coverage
+        # check below. Combined with `skipped_categories` to
+        # produce the effective skip list passed to both
+        # rewrite_bullet (so the LLM doesn't try to invent for
+        # them) and the validator.
+        auto_skipped: list[CoachCategory] = [
+            gap for gap in category_gaps
+            if gap not in question_categories
+        ]
+        effective_skipped_categories: list[CoachCategory] = (
+            list(skipped_categories) + auto_skipped
+        )
 
         rewritten_text = rewrite_bullet(
             original_text=bullet.get("original_text", ""),
@@ -633,7 +792,7 @@ async def coach_rewrite(
             citation_quote=citation_quote,
             skipped_categories=[
                 c.value if hasattr(c, "value") else c
-                for c in skipped_categories
+                for c in effective_skipped_categories
             ],
             category_for_key=category_for_key,
         )
@@ -645,11 +804,42 @@ async def coach_rewrite(
             citation_quote=citation_quote,
             citation_description=citation_description,
         )
+        # Diagnostic log: record what the validator saw so the
+        # developer can confirm whether a 502 is the citation-
+        # grounding rule or a fabrication / coverage rule, and so
+        # they can see the actual stored quote when debugging
+        # paraphrased citations. DEBUG by default -- enable
+        # `logging.getLogger(...).setLevel(DEBUG)` to see every
+        # rewrite call. Both the strict-substring match and the
+        # relaxed stem-overlap score are computed so logs show
+        # the full picture (e.g. "substring=False but score=0.6
+        # -- paraphrase was accepted by the relaxed check" or
+        # "substring=False, score=0.2 -- genuine fabrication").
+        quote_substring_match = _quote_is_substring(
+            citation_quote, citation_description
+        )
+        quote_grounding_score = _citation_grounding_score(
+            citation_quote, citation_description
+        )
+        logger.debug(
+            "coach_rewrite grounding check: bullet_id=%s "
+            "quote_substring_match=%s quote_grounding_score=%.2f "
+            "citation_quote=%r",
+            request.bullet_id,
+            quote_substring_match,
+            quote_grounding_score,
+            citation_quote,
+        )
         if not is_grounded:
             logger.warning(
-                "coach_rewrite grounding failed: %s | bullet_id=%s",
+                "coach_rewrite grounding failed: %s | bullet_id=%s "
+                "quote_substring_match=%s quote_grounding_score=%.2f "
+                "citation_quote=%r",
                 "; ".join(reasons),
                 request.bullet_id,
+                quote_substring_match,
+                quote_grounding_score,
+                citation_quote,
             )
             # Hallucination guard (rules 1-3 of
             # validate_coach_rewrite_grounding). Restored after the
@@ -681,38 +871,12 @@ async def coach_rewrite(
         # Category-coverage check (qualitative-coach v2): every
         # non-skipped gap category must either have a question
         # answered (with at least one answer token in the rewrite)
-        # OR be explicitly skipped. Gap coverage is the
-        # one-question-per-gap contract -- a bullet with 5 missing
-        # categories and only 4 questions is no longer a valid
-        # rewrite target.
+        # OR be explicitly skipped. Gap categories that lack a
+        # question are auto-skipped earlier (see above) so this
+        # rule's missing-question branch doesn't fire on them.
+        # Categories that DO have questions still go through the
+        # per-question coverage check below.
         question_dicts = bullet.get("questions", [])
-        # Derive category_gaps from the LLM-supplied checklist.
-        # The prompt asks for `checklist` (six booleans). The Pydantic
-        # model also has an explicit `category_gaps` field the LLM
-        # may override -- prefer that when populated.
-        category_gaps: list[CoachCategory] = []
-        raw_gaps = bullet.get("category_gaps")
-        if isinstance(raw_gaps, list) and raw_gaps:
-            for g in raw_gaps:
-                if isinstance(g, CoachCategory):
-                    category_gaps.append(g)
-                elif isinstance(g, str):
-                    try:
-                        category_gaps.append(CoachCategory(g.strip().upper()))
-                    except ValueError:
-                        pass
-        if not category_gaps:
-            checklist = bullet.get("checklist")
-            if isinstance(checklist, dict):
-                # category_gaps = categories where checklist[c] is False
-                for cat in CoachCategory:
-                    if not checklist.get(cat.value, True):
-                        category_gaps.append(cat)
-            elif checklist is not None:
-                # Pydantic CategoryChecklist instance
-                for cat in CoachCategory:
-                    if not getattr(checklist, cat.value, True):
-                        category_gaps.append(cat)
         category_ok, coverage_reasons = validate_coach_rewrite_category_coverage(
             rewritten_text,
             questions=[
@@ -724,7 +888,7 @@ async def coach_rewrite(
                 if isinstance(q, dict)
             ],
             answers=request.answers,
-            skipped_categories=skipped_categories,
+            skipped_categories=effective_skipped_categories,
             category_gaps=category_gaps or None,
         )
         if not category_ok:
