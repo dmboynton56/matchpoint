@@ -97,11 +97,16 @@ export function JobSearchAssistant({
             <button
               key={prompt}
               type="button"
+              disabled={isExtracting}
               onClick={() => {
+                if (isExtracting) return
                 setInputValue(prompt)
                 void submit(prompt)
               }}
-              className="rounded-full border border-border bg-muted/50 px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
+              className={cn(
+                "rounded-full border border-border bg-muted/50 px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground",
+                isExtracting && "pointer-events-none opacity-50"
+              )}
             >
               {prompt}
             </button>

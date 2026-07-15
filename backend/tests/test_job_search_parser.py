@@ -1,7 +1,9 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from app.schemas.job_search import ParsedJobSearchFilters
+from pydantic import ValidationError
+
+from app.schemas.job_search import JobSearchParseRequest, ParsedJobSearchFilters
 from app.services.job_search_parser import (
     parse_job_search_message,
     parsed_filters_to_dict,
@@ -9,6 +11,14 @@ from app.services.job_search_parser import (
 
 
 class JobSearchParserTests(unittest.TestCase):
+    def test_parse_request_rejects_whitespace_only(self):
+        with self.assertRaises(ValidationError):
+            JobSearchParseRequest(message="   ")
+
+    def test_parse_request_trims_surrounding_whitespace(self):
+        request = JobSearchParseRequest(message="  senior engineer  ")
+        self.assertEqual(request.message, "senior engineer")
+
     def test_parsed_filters_to_dict_omits_empty(self):
         parsed = ParsedJobSearchFilters(
             keywords="engineer",

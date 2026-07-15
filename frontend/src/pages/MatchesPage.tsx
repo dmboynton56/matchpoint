@@ -4,6 +4,7 @@ import { InfoIcon } from "lucide-react"
 import { toast } from "sonner"
 
 import { getMyMatches } from "@/apis/matches"
+import { getResumeDetails } from "@/apis/resumes"
 import {
   getProfilePreferences,
   type ProfilePreferences,
@@ -45,9 +46,14 @@ export function MatchesPage() {
     useState<ProfilePreferences | null>(null)
   const [profilePreferencesLoading, setProfilePreferencesLoading] =
     useState(false)
+  const [hasResume, setHasResume] = useState<boolean | null>(null)
+  const [resumeLoading, setResumeLoading] = useState(false)
 
   useEffect(() => {
-    if (authLoading || !user) return
+    if (authLoading || !user) {
+      setHasResume(null)
+      return
+    }
 
     let cancelled = false
 
@@ -60,7 +66,17 @@ export function MatchesPage() {
         if (cancelled) return
         if (result.ok) {
           setProfilePreferences(result.data)
+        } else {
+          toast.error("Failed to load profile preferences.")
         }
+      })
+      .catch((error) => {
+        if (cancelled) return
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Failed to load profile preferences"
+        toast.error(message)
       })
       .finally(() => {
         if (!cancelled) setProfilePreferencesLoading(false)
@@ -69,6 +85,40 @@ export function MatchesPage() {
     return () => {
       cancelled = true
       setProfilePreferences(null)
+    }
+  }, [user, authLoading])
+
+  useEffect(() => {
+    if (authLoading || !user) {
+      setHasResume(null)
+      return
+    }
+
+    let cancelled = false
+
+    void Promise.resolve()
+      .then(() => {
+        if (!cancelled) setResumeLoading(true)
+        return getResumeDetails()
+      })
+      .then((details) => {
+        if (cancelled) return
+        setHasResume(details.has_resume)
+      })
+      .catch((error) => {
+        if (cancelled) return
+        const message =
+          error instanceof Error ? error.message : "Failed to load resume"
+        toast.error(message)
+        setHasResume(false)
+      })
+      .finally(() => {
+        if (!cancelled) setResumeLoading(false)
+      })
+
+    return () => {
+      cancelled = true
+      setHasResume(null)
     }
   }, [user, authLoading])
 
@@ -104,12 +154,17 @@ export function MatchesPage() {
     }
   }, [user, authLoading, stateJobs])
 
-  if (authLoading || (user && matchesLoading && jobs.length === 0)) {
+  if (
+    authLoading ||
+    (user && matchesLoading && jobs.length === 0) ||
+    (user && resumeLoading && hasResume === null)
+  ) {
     return <RouteLoading />
   }
 
   const displayedJobs = user ? jobs : stateJobs
   const hasMatches = displayedJobs.length > 0
+  const userHasResume = !!user && hasResume === true
   const missingPreferenceLabels = profilePreferences
     ? getMissingProfilePreferenceLabels(profilePreferences)
     : []
@@ -142,7 +197,9 @@ export function MatchesPage() {
               ? `Showing ${displayedJobs.length} role${
                   displayedJobs.length === 1 ? "" : "s"
                 } ranked against your resume.`
-              : "Upload your resume below to see personalized job matches."}
+              : userHasResume
+                ? "We couldn't find matches for your resume yet. Review your resume or update your profile preferences."
+                : "Upload your resume below to see personalized job matches."}
           </p>
         </section>
 
@@ -203,6 +260,21 @@ export function MatchesPage() {
               </li>
             ))}
           </ul>
+        ) : userHasResume ? (
+          <div className="rounded-xl border border-dashed border-border bg-card/50 px-6 py-10 text-center">
+            <p className="text-sm text-muted-foreground">
+              No matches right now. Review your resume or update your profile
+              preferences to improve results.
+            </p>
+            <div className="mt-4 flex flex-wrap justify-center gap-2">
+              <Button asChild variant="outline" size="sm">
+                <Link to="/resume">Review resume</Link>
+              </Button>
+              <Button asChild size="sm">
+                <Link to="/profile">Update preferences</Link>
+              </Button>
+            </div>
+          </div>
         ) : (
           <div className="rounded-xl border border-dashed border-border bg-card/50 px-6 py-10 text-center">
             <p className="text-sm text-muted-foreground">

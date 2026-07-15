@@ -49,11 +49,9 @@ def main() -> None:
 
     while remaining > 0:
         rows = turso.fetch_jobs_for_summary_backfill(
-            limit=min(BATCH_SIZE, remaining)
+            limit=min(BATCH_SIZE, remaining),
+            exclude_ids=list(seen) or None,
         )
-        # Failed generations stay NULL in the DB and reappear in the next
-        # fetch — skip them so the loop terminates.
-        rows = [row for row in rows if row["id"] not in seen]
         if not rows:
             break
         seen.update(row["id"] for row in rows)

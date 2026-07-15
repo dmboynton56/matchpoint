@@ -16,7 +16,7 @@ def main() -> None:
         raise RuntimeError("TURSO_DATABASE_URL must be set")
 
     from app.db import turso
-    from app.services.job_metadata import derive_browse_metadata
+    from app.services.job_metadata import derive_browse_metadata, metadata_derived_timestamp
 
     turso.init_schema()
     total_updated = 0
@@ -27,12 +27,14 @@ def main() -> None:
             break
 
         batch: list[tuple[str, dict]] = []
+        derived_at = metadata_derived_timestamp()
         for row in rows:
             metadata = derive_browse_metadata(
                 title=row.get("title") or "",
                 location=row.get("location"),
                 description=row.get("description"),
             )
+            metadata["metadata_derived_at"] = derived_at
             batch.append((row["id"], metadata))
 
         turso.batch_update_job_metadata(batch)

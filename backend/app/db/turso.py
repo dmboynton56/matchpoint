@@ -121,6 +121,7 @@ BROWSE_EXTRA_COLUMNS: list[tuple[str, str]] = [
     ("pay_currency", "TEXT"),
     ("experience_level", "TEXT"),
     ("job_type", "TEXT"),
+    ("metadata_derived_at", "TEXT"),
 ]
 
 BROWSE_INDEXES_SQL = [
@@ -466,8 +467,8 @@ def upsert_jobs(jobs: list[dict]) -> int:
         "(external_id, company, title, description, location, posted_at, "
         "apply_url, source, embedding, last_seen_at, summary, summary_source_hash, "
         "summary_model, summary_generated_at, workplace_type, pay_min, pay_max, "
-        "pay_currency, experience_level, job_type) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "pay_currency, experience_level, job_type, metadata_derived_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(external_id) DO UPDATE SET "
         "company=excluded.company, "
         "title=excluded.title, "
@@ -486,12 +487,20 @@ def upsert_jobs(jobs: list[dict]) -> int:
         "THEN excluded.summary_model ELSE jobs.summary_model END, "
         "summary_generated_at=CASE WHEN excluded.summary_generated_at IS NOT NULL "
         "THEN excluded.summary_generated_at ELSE jobs.summary_generated_at END, "
-        "workplace_type=excluded.workplace_type, "
-        "pay_min=excluded.pay_min, "
-        "pay_max=excluded.pay_max, "
-        "pay_currency=excluded.pay_currency, "
-        "experience_level=excluded.experience_level, "
-        "job_type=excluded.job_type"
+        "workplace_type=CASE WHEN excluded.workplace_type IS NOT NULL "
+        "THEN excluded.workplace_type ELSE jobs.workplace_type END, "
+        "pay_min=CASE WHEN excluded.pay_min IS NOT NULL "
+        "THEN excluded.pay_min ELSE jobs.pay_min END, "
+        "pay_max=CASE WHEN excluded.pay_max IS NOT NULL "
+        "THEN excluded.pay_max ELSE jobs.pay_max END, "
+        "pay_currency=CASE WHEN excluded.pay_currency IS NOT NULL "
+        "THEN excluded.pay_currency ELSE jobs.pay_currency END, "
+        "experience_level=CASE WHEN excluded.experience_level IS NOT NULL "
+        "THEN excluded.experience_level ELSE jobs.experience_level END, "
+        "job_type=CASE WHEN excluded.job_type IS NOT NULL "
+        "THEN excluded.job_type ELSE jobs.job_type END, "
+        "metadata_derived_at=CASE WHEN excluded.metadata_derived_at IS NOT NULL "
+        "THEN excluded.metadata_derived_at ELSE jobs.metadata_derived_at END"
     )
     for job in jobs:
         external_id = job.get("external_id")
@@ -523,6 +532,7 @@ def upsert_jobs(jobs: list[dict]) -> int:
                 job.get("pay_currency"),
                 job.get("experience_level"),
                 job.get("job_type"),
+                job.get("metadata_derived_at"),
             ],
         )
         sent += 1
@@ -625,10 +635,10 @@ def _build_search_where(
         params.extend(workplace_params)
 
     if pay_min is not None:
-        conditions.append("(pay_max IS NULL OR pay_max >= ?)")
+        conditions.append("pay_max >= ?")
         params.append(pay_min)
     if pay_max is not None:
-        conditions.append("(pay_min IS NULL OR pay_min <= ?)")
+        conditions.append("pay_min <= ?")
         params.append(pay_max)
 
     if date_posted != "any" and date_posted in DATE_POSTED_WINDOW_DAYS:
@@ -636,7 +646,7 @@ def _build_search_where(
         cutoff = (
             datetime.now(timezone.utc) - timedelta(days=days)
         ).isoformat()
-        conditions.append("(posted_at IS NULL OR posted_at >= ?)")
+        conditions.append("posted_at >= ?")
         params.append(cutoff)
 
     return " AND ".join(conditions), params, terms
@@ -741,8 +751,9 @@ def update_job_summary(
     conn = get_client()
     conn.execute(
         "UPDATE jobs SET summary = ?, summary_source_hash = ?, "
-        "summary_model = ?, summary_generated_at = ? WHERE id = ?",
-        [summary, source_hash, model, generated_at, job_id],
+        "summary_model = ?, summary_generated_at = ? "
+        "WHERE id = ? AND (summary_source_hash IS NULL OR summary_source_hash = ?)",
+        [summary, source_hash, model, generated_at, job_id, source_hash],
     )
     conn.commit()
 
@@ -754,17 +765,20 @@ def batch_update_job_summaries(updates: list[tuple[str, dict]]) -> None:
     conn = get_client()
     sql = (
         "UPDATE jobs SET summary = ?, summary_source_hash = ?, "
-        "summary_model = ?, summary_generated_at = ? WHERE id = ?"
+        "summary_model = ?, summary_generated_at = ? "
+        "WHERE id = ? AND (summary_source_hash IS NULL OR summary_source_hash = ?)"
     )
     for job_id, summary_data in updates:
+        source_hash = summary_data["source_hash"]
         conn.execute(
             sql,
             [
                 summary_data["summary"],
-                summary_data["source_hash"],
+                source_hash,
                 summary_data["model"],
                 summary_data["generated_at"],
                 job_id,
+                source_hash,
             ],
         )
     conn.commit()
@@ -788,19 +802,30 @@ def fetch_jobs_for_metadata_backfill(*, limit: int = 100) -> list[dict]:
     conn = get_client()
     cursor = conn.execute(
         "SELECT id, title, location, description FROM jobs "
-        "WHERE workplace_type IS NULL LIMIT ?",
+        "WHERE metadata_derived_at IS NULL LIMIT ?",
         [limit],
     )
     return _fetchall_dicts(cursor)
 
 
-def fetch_jobs_for_summary_backfill(*, limit: int = 100) -> list[dict]:
+def fetch_jobs_for_summary_backfill(
+    *, limit: int = 100, exclude_ids: list[str] | None = None
+) -> list[dict]:
     conn = get_client()
+    conditions = [
+        "(summary IS NULL OR summary = '')",
+        "description IS NOT NULL",
+    ]
+    params: list[Any] = []
+    if exclude_ids:
+        placeholders = ",".join(["?"] * len(exclude_ids))
+        conditions.append(f"id NOT IN ({placeholders})")
+        params.extend(exclude_ids)
+    params.append(limit)
     cursor = conn.execute(
         "SELECT id, title, company, description FROM jobs "
-        "WHERE (summary IS NULL OR summary = '') AND description IS NOT NULL "
-        "LIMIT ?",
-        [limit],
+        f"WHERE {' AND '.join(conditions)} LIMIT ?",
+        params,
     )
     return _fetchall_dicts(cursor)
 
@@ -809,7 +834,8 @@ def update_job_metadata(job_id: str, metadata: dict) -> None:
     conn = get_client()
     conn.execute(
         "UPDATE jobs SET workplace_type = ?, pay_min = ?, pay_max = ?, "
-        "pay_currency = ?, experience_level = ?, job_type = ? WHERE id = ?",
+        "pay_currency = ?, experience_level = ?, job_type = ?, "
+        "metadata_derived_at = ? WHERE id = ?",
         [
             metadata.get("workplace_type"),
             metadata.get("pay_min"),
@@ -817,6 +843,7 @@ def update_job_metadata(job_id: str, metadata: dict) -> None:
             metadata.get("pay_currency"),
             metadata.get("experience_level"),
             metadata.get("job_type"),
+            metadata.get("metadata_derived_at"),
             job_id,
         ],
     )
@@ -830,7 +857,8 @@ def batch_update_job_metadata(updates: list[tuple[str, dict]]) -> None:
     conn = get_client()
     sql = (
         "UPDATE jobs SET workplace_type = ?, pay_min = ?, pay_max = ?, "
-        "pay_currency = ?, experience_level = ?, job_type = ? WHERE id = ?"
+        "pay_currency = ?, experience_level = ?, job_type = ?, "
+        "metadata_derived_at = ? WHERE id = ?"
     )
     for job_id, metadata in updates:
         conn.execute(
@@ -842,6 +870,7 @@ def batch_update_job_metadata(updates: list[tuple[str, dict]]) -> None:
                 metadata.get("pay_currency"),
                 metadata.get("experience_level"),
                 metadata.get("job_type"),
+                metadata.get("metadata_derived_at"),
                 job_id,
             ],
         )

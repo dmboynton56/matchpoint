@@ -203,13 +203,20 @@ export function formatPayRange(
 }
 
 /** e.g. "Posted 3 days ago", "Posted today". Returns null when unparseable. */
+function startOfLocalDay(date: Date): Date {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate())
+}
+
 export function formatPostedAt(postedAt: string | null | undefined): string | null {
   if (!postedAt) return null
   const postedDate = new Date(postedAt)
   if (Number.isNaN(postedDate.getTime())) return null
 
-  const diffMs = Date.now() - postedDate.getTime()
-  const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24))
+  const today = startOfLocalDay(new Date())
+  const postedDay = startOfLocalDay(postedDate)
+  const diffDays = Math.floor(
+    (today.getTime() - postedDay.getTime()) / (1000 * 60 * 60 * 24)
+  )
 
   if (diffDays <= 0) return "Posted today"
   if (diffDays === 1) return "Posted 1 day ago"

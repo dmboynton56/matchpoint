@@ -231,9 +231,9 @@ def run_pipeline():
 
     print("\n=== STEP 3.5: Deriving browse metadata ===")
     try:
-        from .job_metadata import derive_browse_metadata
+        from .job_metadata import derive_browse_metadata, metadata_derived_timestamp
     except ImportError:
-        from job_metadata import derive_browse_metadata
+        from job_metadata import derive_browse_metadata, metadata_derived_timestamp
 
     for job in new_jobs:
         metadata = derive_browse_metadata(
@@ -241,6 +241,7 @@ def run_pipeline():
             location=job.get("location"),
             description=job.get("description"),
         )
+        metadata["metadata_derived_at"] = metadata_derived_timestamp()
         job.update(metadata)
 
     embedding_texts = [job["description"] for job in new_jobs]

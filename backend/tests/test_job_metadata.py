@@ -14,6 +14,9 @@ class JobMetadataTests(unittest.TestCase):
     def test_infer_experience_level_intern(self):
         self.assertEqual(infer_experience_level("Software Engineering Intern"), "internship")
 
+    def test_intern_does_not_match_international(self):
+        self.assertIsNone(infer_experience_level("International Business Analyst"))
+
     def test_infer_job_type_contract(self):
         self.assertEqual(
             infer_job_type("Backend Developer", "This is a 6-month contract role."),

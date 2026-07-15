@@ -112,6 +112,61 @@ class TestTursoSearchJobs:
         companies = {row["company"] for row in rows}
         assert companies == {"Acme", "Beta Labs"}
 
+    def test_pay_filter_excludes_unknown_pay(self):
+        now = datetime.now(timezone.utc)
+        turso.upsert_jobs(
+            [
+                {
+                    "external_id": "gh-unknown-pay",
+                    "company": "Unknown Pay Co",
+                    "title": "Mystery Role",
+                    "description": "No compensation listed.",
+                    "location": "Remote",
+                    "posted_at": now.isoformat(),
+                    "apply_url": "https://example.com/unknown",
+                    "embedding": [0.4] * 8,
+                    "last_seen_at": now.isoformat(),
+                }
+            ]
+        )
+
+        rows, total = turso.search_jobs(pay_min=100000)
+        assert all(row["company"] != "Unknown Pay Co" for row in rows)
+
+        rows_all, total_all = turso.search_jobs()
+        assert total_all == 4
+        assert any(row["company"] == "Unknown Pay Co" for row in rows_all)
+
+    def test_date_posted_excludes_unknown_posted_at(self):
+        now = datetime.now(timezone.utc)
+        turso.upsert_jobs(
+            [
+                {
+                    "external_id": "gh-unknown-date",
+                    "company": "Undated Co",
+                    "title": "Undated Role",
+                    "description": "Evergreen opening.",
+                    "location": "Remote",
+                    "posted_at": None,
+                    "apply_url": "https://example.com/undated",
+                    "embedding": [0.5] * 8,
+                    "last_seen_at": now.isoformat(),
+                    "workplace_type": "remote",
+                    "experience_level": "mid",
+                    "job_type": "full_time",
+                    "pay_min": 120000,
+                    "pay_max": 140000,
+                    "pay_currency": "USD",
+                }
+            ]
+        )
+
+        rows, total = turso.search_jobs(date_posted="7d")
+        assert all(row["company"] != "Undated Co" for row in rows)
+
+        rows_all, total_all = turso.search_jobs()
+        assert any(row["company"] == "Undated Co" for row in rows_all)
+
     def test_relevance_sort(self):
         rows, _ = turso.search_jobs(
             keywords="engineer machine",
@@ -180,6 +235,77 @@ class TestTursoSearchJobs:
             "Updated summary 1",
             "Updated summary 2",
         }
+
+    def test_batch_update_job_summaries_rejects_stale_hash(self):
+        rows, _ = turso.search_jobs(page_size=1)
+        job_id = rows[0]["id"]
+        conn = turso.get_client()
+        conn.execute(
+            "UPDATE jobs SET summary = ?, summary_source_hash = ? WHERE id = ?",
+            ["Existing summary", "current-hash", job_id],
+        )
+        conn.commit()
+
+        turso.batch_update_job_summaries(
+            [
+                (
+                    job_id,
+                    {
+                        "summary": "Should not apply",
+                        "source_hash": "stale-hash",
+                        "model": "test-model",
+                        "generated_at": "2026-07-15T12:00:00+00:00",
+                    },
+                )
+            ]
+        )
+
+        cursor = conn.execute(
+            "SELECT summary, summary_source_hash FROM jobs WHERE id = ?",
+            [job_id],
+        )
+        summary, source_hash = cursor.fetchone()
+        assert summary == "Existing summary"
+        assert source_hash == "current-hash"
+
+    def test_metadata_backfill_marks_unclassified_rows(self):
+        now = datetime.now(timezone.utc)
+        turso.upsert_jobs(
+            [
+                {
+                    "external_id": "gh-unclassified",
+                    "company": "Plain Co",
+                    "title": "Generalist",
+                    "description": "Do many things.",
+                    "location": "Austin, TX",
+                    "posted_at": now.isoformat(),
+                    "apply_url": "https://example.com/plain",
+                    "embedding": [0.2] * 8,
+                    "last_seen_at": now.isoformat(),
+                }
+            ]
+        )
+        rows = turso.fetch_jobs_for_metadata_backfill(limit=10)
+        assert any(row["title"] == "Generalist" for row in rows)
+
+        from app.services.job_metadata import derive_browse_metadata, metadata_derived_timestamp
+
+        derived_at = metadata_derived_timestamp()
+        batch = []
+        for row in rows:
+            if row["title"] != "Generalist":
+                continue
+            metadata = derive_browse_metadata(
+                title=row.get("title") or "",
+                location=row.get("location"),
+                description=row.get("description"),
+            )
+            metadata["metadata_derived_at"] = derived_at
+            batch.append((row["id"], metadata))
+        turso.batch_update_job_metadata(batch)
+
+        rows_after = turso.fetch_jobs_for_metadata_backfill(limit=10)
+        assert all(row["title"] != "Generalist" for row in rows_after)
 
 
 class TestJobsSearchRoute:
@@ -478,3 +604,50 @@ class TestJobsSearchRoute:
         assert data["locations"] == ["Denver"]
         assert data["experienceLevels"] == ["entry"]
         assert data["payMin"] == 120000
+
+    def test_parse_endpoint_rejects_whitespace_only_message(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+
+        response = TestClient(app).post(
+            "/jobs/search/parse",
+            json={"message": "   "},
+        )
+        assert response.status_code == 422
+
+    def test_parse_endpoint_returns_generic_error(self, monkeypatch):
+        from fastapi.testclient import TestClient
+        from app.main import app
+        from app.routes import jobs as jobs_route
+
+        def boom(_message: str):
+            raise RuntimeError("secret parser failure")
+
+        monkeypatch.setattr(jobs_route, "parse_job_search_message", boom)
+
+        response = TestClient(app).post(
+            "/jobs/search/parse",
+            json={"message": "senior remote roles"},
+        )
+        assert response.status_code == 502
+        assert response.json()["detail"] == "Failed to parse search query."
+        assert "secret parser failure" not in response.text
+
+
+class TestGenerateAndAttachSummary:
+    def test_does_not_cache_hash_on_generation_failure(self, monkeypatch):
+        from app.services import job_summary
+
+        monkeypatch.setattr(job_summary, "generate_summary", lambda *args, **kwargs: None)
+
+        job = {
+            "description": "Build reliable systems end to end.",
+            "title": "Platform Engineer",
+            "company": "Example Co",
+        }
+        result = job_summary.generate_and_attach_summary(dict(job))
+
+        assert result["summary"] == "Build reliable systems end to end."
+        assert result.get("summary_source_hash") is None
+        assert result.get("summary_model") is None
+        assert result.get("summary_generated_at") is None

@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 from app.db import turso
 from app.services.embedding import client
-from app.services.job_metadata import browse_metadata_missing, derive_browse_metadata
+from app.services.job_metadata import browse_metadata_missing, derive_browse_metadata, metadata_derived_timestamp
 
 # Verified against /v1/models 2026-07-15: gpt-5.4-nano is real and the cheapest
 # chat-capable tier ("gpt-4o-nano" does not exist; gpt-4o-mini costs more).
@@ -142,9 +142,9 @@ def enrich_browse_listings(jobs: list[dict]) -> tuple[list[dict], list[str]]:
                 location=row.get("location"),
                 description=description,
             )
-            if any(value is not None for value in metadata.values()):
-                job.update(metadata)
-                metadata_updates.append((job["id"], metadata))
+            metadata["metadata_derived_at"] = metadata_derived_timestamp()
+            job.update(metadata)
+            metadata_updates.append((job["id"], metadata))
 
         if _missing_summary(job) and description.strip():
             job["summary"] = fallback_summary(description)
@@ -224,11 +224,11 @@ def generate_and_attach_summary(job: dict) -> dict:
         title=job.get("title") or "",
         company=job.get("company") or "",
     )
-    job["summary_source_hash"] = source_hash
-    job["summary_model"] = SUMMARY_MODEL
-    job["summary_generated_at"] = datetime.now(timezone.utc).isoformat()
     if summary:
         job["summary"] = summary
+        job["summary_source_hash"] = source_hash
+        job["summary_model"] = SUMMARY_MODEL
+        job["summary_generated_at"] = datetime.now(timezone.utc).isoformat()
     else:
         job["summary"] = fallback_summary(description)
     return job

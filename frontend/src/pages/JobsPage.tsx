@@ -80,6 +80,15 @@ export function JobsPage() {
           if (cancelled || !response) return
           setJobs(response.jobs)
           setTotal(response.total)
+
+          const totalPages = Math.max(1, Math.ceil(response.total / filters.pageSize))
+          if (
+            response.total > 0 &&
+            response.jobs.length === 0 &&
+            filters.page > totalPages
+          ) {
+            updateFilters({ ...filters, page: totalPages })
+          }
         })
         .catch((err) => {
           if (cancelled) return

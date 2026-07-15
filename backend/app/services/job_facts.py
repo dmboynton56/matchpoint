@@ -144,6 +144,8 @@ def _parse_range_amounts(range_text: str) -> list[int]:
     if high_raw.lower().endswith("k") and not low_raw.lower().endswith("k"):
         if low < 1000:
             low *= 1000
+    elif low < 1000 and high >= 1000:
+        low *= 1000
     return [low, high]
 
 
@@ -188,15 +190,13 @@ def extract_salary_facts(description_text: str) -> SalaryFacts | None:
     # Pass 2: explicit money ranges anywhere ("$120,000 - $150,000"),
     # even without a salary keyword nearby.
     for sentence in sentences:
-        match = MONEY_RANGE_PATTERN.search(sentence)
-        if not match:
-            continue
-        amounts = _parse_range_amounts(match.group(0))
-        if not amounts:
-            continue
-        salary = _build_salary(amounts, sentence)
-        if salary:
-            return salary
+        for match in MONEY_RANGE_PATTERN.finditer(sentence):
+            amounts = _parse_range_amounts(match.group(0))
+            if not amounts:
+                continue
+            salary = _build_salary(amounts, sentence)
+            if salary:
+                return salary
 
     return None
 

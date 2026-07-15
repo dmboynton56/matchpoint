@@ -25,11 +25,17 @@ export function JobBrowseCard({ job, className }: JobBrowseCardProps) {
 
   const payLabel = formatPayRange(job.pay_min, job.pay_max, job.pay_currency)
   const badges = [
-    payLabel,
-    job.job_type ? formatJobType(job.job_type) : null,
-    job.experience_level ? formatExperienceLevel(job.experience_level) : null,
-    job.workplace_type ? formatWorkplaceType(job.workplace_type) : null,
-  ].filter((label): label is string => label != null)
+    payLabel ? { key: "pay", label: payLabel } : null,
+    job.job_type
+      ? { key: "job_type", label: formatJobType(job.job_type) }
+      : null,
+    job.experience_level
+      ? { key: "experience_level", label: formatExperienceLevel(job.experience_level) }
+      : null,
+    job.workplace_type
+      ? { key: "workplace_type", label: formatWorkplaceType(job.workplace_type) }
+      : null,
+  ].filter((badge): badge is { key: string; label: string } => badge != null)
 
   return (
     <article
@@ -53,9 +59,9 @@ export function JobBrowseCard({ job, className }: JobBrowseCardProps) {
 
       {badges.length > 0 ? (
         <div className="mt-2 flex flex-wrap gap-1.5">
-          {badges.map((label) => (
-            <Badge key={label} variant="outline" className="text-muted-foreground">
-              {label}
+          {badges.map((badge) => (
+            <Badge key={badge.key} variant="outline" className="text-muted-foreground">
+              {badge.label}
             </Badge>
           ))}
         </div>

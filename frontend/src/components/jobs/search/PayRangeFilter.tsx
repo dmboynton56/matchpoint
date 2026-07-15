@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { ChevronDown } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
@@ -36,6 +36,14 @@ export function PayRangeFilter({
   const [minInput, setMinInput] = useState(payMin?.toString() ?? "")
   const [maxInput, setMaxInput] = useState(payMax?.toString() ?? "")
   const hasValue = payMin != null || payMax != null
+
+  useEffect(() => {
+    setMinInput(payMin?.toString() ?? "")
+  }, [payMin])
+
+  useEffect(() => {
+    setMaxInput(payMax?.toString() ?? "")
+  }, [payMax])
 
   const apply = () => {
     const parsedMin = minInput.trim() ? Number(minInput) : null

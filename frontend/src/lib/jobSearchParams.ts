@@ -54,7 +54,8 @@ export function parseFiltersFromSearchParams(
   params: URLSearchParams
 ): JobSearchFilters {
   const page = Math.max(1, Number(params.get("page")) || 1)
-  const pageSize = Number(params.get("page_size")) || DEFAULT_JOB_SEARCH_FILTERS.pageSize
+  const rawPageSize = Number(params.get("page_size")) || DEFAULT_JOB_SEARCH_FILTERS.pageSize
+  const pageSize = Math.max(1, Math.min(100, rawPageSize))
 
   return {
     keywords: params.get("q") ?? "",

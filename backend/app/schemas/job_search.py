@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 DatePosted = Literal["any", "24h", "3d", "7d", "14d", "30d"]
 JobsSortOption = Literal["relevance", "newest"]
@@ -40,6 +40,16 @@ class JobsSearchResponse(BaseModel):
 
 class JobSearchParseRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=2000)
+
+    @field_validator("message", mode="before")
+    @classmethod
+    def strip_message(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("message must be a string")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("message must not be blank")
+        return stripped
 
 
 class ParsedJobSearchFilters(BaseModel):

@@ -91,5 +91,5 @@ def parse_search_filters(body: JobSearchParseRequest):
         logger.exception("Job search parse failed")
         raise HTTPException(
             status_code=502,
-            detail=f"Failed to parse search query: {exc}",
+            detail="Failed to parse search query.",
         ) from exc

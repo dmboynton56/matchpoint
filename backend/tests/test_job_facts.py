@@ -52,6 +52,20 @@ class JobFactsTests(unittest.TestCase):
         self.assertEqual(salary.minimum, 120000)
         self.assertEqual(salary.maximum, 150000)
 
+    def test_salary_range_uses_later_valid_match(self):
+        salary = extract_salary_facts(
+            "Stipend of $5 - $10 daily. Annual pay is $90,000 - $110,000."
+        )
+        self.assertIsNotNone(salary)
+        self.assertEqual(salary.minimum, 90000)
+        self.assertEqual(salary.maximum, 110000)
+
+    def test_salary_range_scales_low_without_k_suffix(self):
+        salary = extract_salary_facts("Role pays $120 - $150,000.")
+        self.assertIsNotNone(salary)
+        self.assertEqual(salary.minimum, 120000)
+        self.assertEqual(salary.maximum, 150000)
+
     def test_hourly_pay_rate(self):
         salary = extract_salary_facts("Pay rate: $45 - $55 per hour.")
         self.assertIsNotNone(salary)
