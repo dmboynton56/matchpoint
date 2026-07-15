@@ -10,9 +10,12 @@ from app.schemas.suggestions import (
     MAX_SUGGESTIONS,
     MIN_SUGGESTIONS,
     CoachBullet,
+    CoachBulletVerdict,
+    CoachCategory,
     CoachRewriteRequest,
     SuggestionsResponse,
     validate_coach_rewrite_answer_keys,
+    validate_coach_rewrite_category_coverage,
     validate_coach_rewrite_grounding,
 )
 from app.services.suggestions import (
@@ -420,7 +423,10 @@ async def coach_start(
     """
     # Local imports — the LLM service imports schemas that would
     # otherwise need a forward reference.
-    from app.schemas.suggestions import validate_coach_bullet_grounding
+    from app.schemas.suggestions import (
+        validate_coach_bullet_grounding,
+        validate_coach_citation_grounding,
+    )
     from app.services.bullet_coach import create_session
     from app.services.bullet_coach_llm import start_coach_session
     from app.services.resume_parser import parse_resume
@@ -473,6 +479,16 @@ async def coach_start(
             s["job_id"]: s.get("description_full") or ""
             for s in job_summaries
         }
+
+        # Drop any bullets whose citation_quote isn't a substring of
+        # the cited job's description. The LLM sometimes fabricates
+        # the quote (often echoing the user's answer text rather than
+        # pulling from the job). Catching it here prevents the user
+        # from investing time in a bullet whose rewrite will fail
+        # with a confusing 502 error.
+        bullets = validate_coach_citation_grounding(
+            bullets, job_descriptions
+        )
 
         session_id = create_session(
             user_id=user_id,
@@ -534,6 +550,19 @@ async def coach_rewrite(
                 detail="Bullet not found in this session.",
             )
 
+        # STRONG bullets have no questions to answer -- the UI shows
+        # "Already strong" and offers no Rewrite affordance. Reject
+        # early with a clear message so a stale UI or scripted client
+        # gets an actionable error instead of a 502 from the LLM.
+        if bullet.get("verdict") == "STRONG":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "This bullet is already strong and has no "
+                    "questions to answer."
+                ),
+            )
+
         requested_keys = [
             question["key"]
             for question in bullet.get("questions", [])
@@ -579,10 +608,34 @@ async def coach_rewrite(
             or ""
         )
 
+        # Build a category-for-key map so the rewrite prompt can
+        # label each answer with its category name (SCOPE,
+        # ARTIFACT, etc.) instead of its key. The LLM reasons
+        # better about categories than keys.
+        category_for_key: dict[str, str] = {}
+        for question in bullet.get("questions", []):
+            if not isinstance(question, dict):
+                continue
+            key = question.get("key")
+            category = question.get("category")
+            if key and category:
+                category_for_key[key] = (
+                    category.value if hasattr(category, "value") else str(category)
+                )
+
+        # Skipped categories come from the request; the validator
+        # treats them as "do not invent content for these".
+        skipped_categories = request.skipped_categories or []
+
         rewritten_text = rewrite_bullet(
             original_text=bullet.get("original_text", ""),
             answers=request.answers,
             citation_quote=citation_quote,
+            skipped_categories=[
+                c.value if hasattr(c, "value") else c
+                for c in skipped_categories
+            ],
+            category_for_key=category_for_key,
         )
 
         is_grounded, reasons = validate_coach_rewrite_grounding(
@@ -598,13 +651,102 @@ async def coach_rewrite(
                 "; ".join(reasons),
                 request.bullet_id,
             )
+            # Hallucination guard (rules 1-3 of
+            # validate_coach_rewrite_grounding). Restored after the
+            # qualitative-coach v2 migration (fe2a845): the route
+            # previously only logged this, so fabricated numbers,
+            # technologies, or ungrounded citations could slip
+            # through whenever category coverage passed. Run BEFORE
+            # the category-coverage check so fabrication is a hard
+            # stop -- coverage is a retry-able soft failure and its
+            # 502 message is more actionable for the user.
+            #
+            # Surface the validator's specific reason so the user
+            # gets the action hint -- e.g. "PyTorch appears only in
+            # the cited job" beats the generic "rewrite couldn't be
+            # grounded". Reasons may be empty (defensive) so we keep
+            # a generic fallback.
+            detail = (
+                reasons[0]
+                if reasons
+                else "The rewrite couldn't be grounded in your "
+                "answers and the cited job. Try rephrasing your "
+                "answers, or pick a different bullet."
+            )
             raise HTTPException(
                 status_code=502,
-                detail=(
-                    "The rewrite couldn't be grounded in your answers "
-                    "and the cited job. Try rephrasing your answers, "
-                    "or pick a different bullet."
-                ),
+                detail=detail,
+            )
+
+        # Category-coverage check (qualitative-coach v2): every
+        # non-skipped gap category must either have a question
+        # answered (with at least one answer token in the rewrite)
+        # OR be explicitly skipped. Gap coverage is the
+        # one-question-per-gap contract -- a bullet with 5 missing
+        # categories and only 4 questions is no longer a valid
+        # rewrite target.
+        question_dicts = bullet.get("questions", [])
+        # Derive category_gaps from the LLM-supplied checklist.
+        # The prompt asks for `checklist` (six booleans). The Pydantic
+        # model also has an explicit `category_gaps` field the LLM
+        # may override -- prefer that when populated.
+        category_gaps: list[CoachCategory] = []
+        raw_gaps = bullet.get("category_gaps")
+        if isinstance(raw_gaps, list) and raw_gaps:
+            for g in raw_gaps:
+                if isinstance(g, CoachCategory):
+                    category_gaps.append(g)
+                elif isinstance(g, str):
+                    try:
+                        category_gaps.append(CoachCategory(g.strip().upper()))
+                    except ValueError:
+                        pass
+        if not category_gaps:
+            checklist = bullet.get("checklist")
+            if isinstance(checklist, dict):
+                # category_gaps = categories where checklist[c] is False
+                for cat in CoachCategory:
+                    if not checklist.get(cat.value, True):
+                        category_gaps.append(cat)
+            elif checklist is not None:
+                # Pydantic CategoryChecklist instance
+                for cat in CoachCategory:
+                    if not getattr(checklist, cat.value, True):
+                        category_gaps.append(cat)
+        category_ok, coverage_reasons = validate_coach_rewrite_category_coverage(
+            rewritten_text,
+            questions=[
+                {
+                    "key": q.get("key"),
+                    "category": q.get("category"),
+                }
+                for q in question_dicts
+                if isinstance(q, dict)
+            ],
+            answers=request.answers,
+            skipped_categories=skipped_categories,
+            category_gaps=category_gaps or None,
+        )
+        if not category_ok:
+            logger.warning(
+                "coach_rewrite category coverage failed: %s | bullet_id=%s",
+                "; ".join(coverage_reasons),
+                request.bullet_id,
+            )
+            # Surface the validator's specific reason in the user-facing
+            # message. The qualitative-coach v2 upgrade means the most
+            # actionable signal is WHICH gap or category was missed --
+            # "the rewrite didn't reflect your answers" is too generic
+            # to act on. The validator's reasons list already names the
+            # offending category(ies), so we prepend them.
+            detail = (
+                coverage_reasons[0]
+                if coverage_reasons
+                else "The rewrite didn't reflect your answers for every category."
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=detail,
             )
 
         return {

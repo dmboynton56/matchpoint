@@ -32,17 +32,51 @@ export interface Suggestion {
  * Bullet-coach types — used by the conversational rewrite flow.
  * Backend returns these in /suggestions/coach/start and accepts
  * them back in /suggestions/coach/rewrite.
+ *
+ * Qualitative-coach v2: every bullet is classified as STRONG or WEAK.
+ * STRONG bullets have no questions and no rewrite. WEAK bullets come
+ * with one question per missing qualitative category. The user answers
+ * the questions (or skips a category), the backend rewrites the bullet
+ * grounded in the original + their answers + the cited job.
  */
-export type CoachQuestionType = "TEXT"
+
+/**
+ * Six qualitative dimensions a strong resume bullet should cover.
+ * The LLM picks which categories are missing from each bullet and
+ * the user answers one question per missing category.
+ */
+export type CoachCategory =
+  | "SPECIFICITY"
+  | "SCOPE"
+  | "OWNERSHIP"
+  | "REPLACEMENT"
+  | "CAUSE_EFFECT"
+  | "ARTIFACT"
+
+/**
+ * Whether the bullet needs work (WEAK) or is already strong (STRONG).
+ * Drives UI affordance and whether /coach/rewrite is even callable
+ * for this bullet.
+ */
+export type CoachBulletVerdict = "STRONG" | "WEAK"
 
 export interface CoachQuestion {
-  /** ASCII key used to send the answer back. */
-  key: string
+  /**
+   * ASCII key used to send the answer back. Optional in the
+   * schema -- the validator derives it from the category when
+   * missing.
+   */
+  key?: string | null
+  /**
+   * Which qualitative dimension this question probes. Required.
+   * The validator rejects duplicate categories within a bullet.
+   */
+  category: CoachCategory
   /** User-facing question. Short enough to be a label. */
   label: string
   /** Optional helper text shown under the input. */
   hint?: string | null
-  type: CoachQuestionType
+  type: "TEXT"
 }
 
 export interface BulletLocation {
@@ -54,13 +88,22 @@ export interface BulletLocation {
   entry_text_snippet?: string | null
 }
 
+/**
+ * Per-bullet payload from /coach/start. WEAK bullets carry one
+ * question per missing category; STRONG bullets have empty
+ * questions + a strength_reason.
+ */
 export interface CoachBullet {
   /** Stable identifier the LLM picks (e.g. "b1"). */
   bullet_id: string
+  /** STRONG = no questions, WEAK = one question per missing category. */
+  verdict: CoachBulletVerdict
   /** Verbatim sentence from the resume. The user can Ctrl-F to find it. */
   original_text: string
-  /** One-sentence explanation of why this bullet is weak. */
-  weakness_reason: string
+  /** Required when verdict is WEAK; ignored when STRONG. */
+  weakness_reason?: string | null
+  /** Required when verdict is STRONG; ignored when WEAK. */
+  strength_reason?: string | null
   /** Section/entry the LLM believes this bullet came from. */
   location: BulletLocation
   /** Job ID the citation quote came from. */
@@ -71,7 +114,7 @@ export interface CoachBullet {
   citation_job_title?: string | null
   citation_job_company?: string | null
   citation_apply_url?: string | null
-  /** 2-4 targeted questions. */
+  /** Empty for STRONG bullets; one per missing category for WEAK. */
   questions: CoachQuestion[]
 }
 
@@ -80,18 +123,16 @@ export interface CoachStartResponse {
   session_id: string
   /** Skills returned alongside the bullet-coach list. */
   skills: Suggestion[]
-  /** Up to 4 weak bullets. */
+  /** Up to 5 bullets -- mix of STRONG and WEAK. */
   bullets: CoachBullet[]
 }
 
-export interface CoachRewriteCitation {
-  job_id: string
-  quote: string
-  job_title?: string | null
-  job_company?: string | null
-  apply_url?: string | null
-}
-
+/**
+ * Response from /coach/rewrite. The backend v2 returns flat
+ * citation_* fields (not a nested citation object) and does NOT
+ * include a `grounded` field -- the rewrite is already validated
+ * by the time it gets here.
+ */
 export interface CoachRewriteResponse {
   /** Echo of the bullet the rewrite was generated for. */
   bullet_id: string
@@ -99,10 +140,10 @@ export interface CoachRewriteResponse {
   original_text: string
   /** The LLM's suggested rewrite, grounded in the user's answers. */
   rewritten_text: string
-  /** Citation the rewrite draws on. Same shape as the start response. */
-  citation: CoachRewriteCitation
-  /** True when the rewrite passed the grounding validator. */
-  grounded: boolean
-  /** Empty when grounded is true; otherwise human-readable reasons. */
-  grounding_failures: string[]
+  /** Flat citation fields (not a nested object). */
+  citation_job_id: string
+  citation_quote: string
+  citation_job_title?: string | null
+  citation_job_company?: string | null
+  citation_apply_url?: string | null
 }

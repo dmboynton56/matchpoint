@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
+import re
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 MAX_SUGGESTIONS = 5
@@ -231,6 +233,58 @@ def _tokens(text: str) -> set[str]:
     return {t for t in cleaned if len(t) >= 2}
 
 
+def _stem(token: str) -> str:
+    """Tiny suffix-stripping stemmer.
+
+    Drops common English inflectional suffixes so morphological
+    variants match each other in grounding checks. Examples:
+      "replacing" -> "replac", "replaced" -> "replac", "replace" -> "replac"
+      "serving"   -> "serv",   "served"   -> "serv",   "serves"  -> "serv"
+      "built"     -> "built" (no change -- short enough)
+      "building"  -> "build",  "builds"   -> "build"
+
+    We do NOT aim for linguistic accuracy (this is not Porter). The
+    goal is just to recognize that "replacing" and "replaced" should
+    match for the grounding validator -- both come from the same
+    user answer or original bullet and the rewrite is allowed to
+    flex the form.
+
+    Sufficient stem length: tokens shorter than 4 chars are returned
+    unchanged to avoid over-stemming ("the" -> "th", "is" -> "").
+    """
+    if len(token) < 4:
+        return token
+    # Order matters: strip longer suffixes first so "ing" doesn't
+    # gobble the "e" from "-inge" etc. (rough Porter-like ordering).
+    for suffix in ("ation", "izations", "izing", "isation", "isation"):
+        if token.endswith(suffix) and len(token) > len(suffix) + 2:
+            return token[: -len(suffix)]
+    for suffix in ("ies",):
+        if token.endswith(suffix) and len(token) > len(suffix) + 2:
+            return token[: -len(suffix)] + "y"
+    for suffix in ("ing", "edly", "ed"):
+        if token.endswith(suffix) and len(token) > len(suffix) + 2:
+            return token[: -len(suffix)]
+    for suffix in ("ly",):
+        if token.endswith(suffix) and len(token) > len(suffix) + 2:
+            return token[: -len(suffix)]
+    for suffix in ("es", "s"):
+        if token.endswith(suffix) and len(token) > len(suffix) + 2:
+            return token[: -len(suffix)]
+    return token
+
+
+def _stems(text: str) -> set[str]:
+    """Return the set of stems for every token in `text`.
+
+    Use this for grounding checks where morphological variants
+    should match ("replacing" matches "replaced"). The structural
+    allowlist in _COACH_STRUCTURAL_TOKENS is compared against stems
+    too, so "of" / "to" / "the" still work without stemming.
+    """
+    return {_stem(tok) for tok in _tokens(text)}
+
+
 def _quote_is_substring(quote: str, source_text: str) -> bool:
     return _normalize(quote) in _normalize(source_text)
 
@@ -354,27 +408,89 @@ def validate_suggestions(
 
 
 # ---------------------------------------------------------------------------
-# Bullet-coach flow
+# Bullet-coach flow (v2: qualitative categories + verdict)
 # ---------------------------------------------------------------------------
-# A two-step conversational flow that rewrites a weak resume bullet with
-# measurable impact. The LLM never invents numbers — instead it asks the
-# user for the facts it needs (technologies, scale, team size, etc.) and
-# the user supplies them. The rewrite then grounds only in those user
-# facts plus the original bullet text plus the cited job's quote.
+# A two-step conversational flow that rewrites weak resume bullets and
+# acknowledges strong ones. The coach is grounded in qualitative
+# categories (specificity, scope, ownership, replacement, cause→effect,
+# artifact) rather than asking the user for numeric facts they may not
+# have. Every category maps to a question the user can answer without
+# measuring.
+#
+# Verdict: each surfaced bullet is classified as either STRONG or WEAK.
+#   - STRONG: bullet already has all six categories. No questions. The
+#     UI renders "✓ Already strong" with the LLM's strength_reason. No
+#     rewrite possible — /coach/rewrite returns 400 for STRONG bullets.
+#   - WEAK: at least one category missing. One question per gap. The
+#     user fills in answers (or skips), the validator grounds the
+#     rewrite in the original + answers + cited quote.
 #
 # Step 1 (`POST /suggestions/coach/start`):
-#   - LLM scans the resume for weak bullets AND returns SKILL suggestions
-#     (the same shape as the one-shot flow) in a single call. Returns
-#     `session_id` + the bullets to coach on.
+#   - LLM scans the resume for bullets, classifies each as STRONG/WEAK.
+#     WEAK bullets come with one question per missing category. STRONG
+#     bullets come with a strength_reason. The call also returns SKILL
+#     suggestions in the same shape as the one-shot flow.
+#   - Server allocates session_id (in-memory, 1-hour TTL).
 # Step 2 (`POST /suggestions/coach/rewrite`):
-#   - User supplies answers to the LLM's questions. LLM returns the
-#     rewritten bullet grounded in the original + answers + cited quote.
+#   - User supplies answers to the WEAK bullet's questions. They may
+#     skip categories. LLM returns a rewritten bullet grounded only in
+#     the original + non-skipped answers + cited quote. The validator
+#     enforces per-category coverage: every non-skipped category's
+#     answer must contribute at least one substantive token to the
+#     rewrite.
 # ---------------------------------------------------------------------------
 
-MAX_COACH_QUESTIONS = 4
+# Max questions per WEAK bullet. Must equal len(CoachCategory) --
+# one question per missing category, never more. Keep in sync with
+# the enum on line 449. Kept as a literal so pydantic's
+# `Field(max_length=...)` evaluates statically.
+MAX_COACH_QUESTIONS = 6
 MAX_COACH_QUESTION_LABEL_LEN = 200
 MAX_COACH_ANSWER_LEN = 280
 MAX_COACH_BULLETS_PER_SESSION = 5
+MIN_STRENGTH_REASON_LEN = 10
+
+
+class CoachCategory(str, Enum):
+    """The six qualitative dimensions a strong resume bullet covers.
+
+    The LLM picks which categories are missing from each bullet and
+    the route generates one question per missing category. The user
+    fills in answers (or skips). The validator confirms each
+    non-skipped answer contributed at least one substantive token to
+    the rewrite.
+
+    Order is deliberate: SPECIFICITY first (the most common gap),
+    ARTIFACT last (the most concrete).
+    """
+
+    SPECIFICITY = "SPECIFICITY"
+    SCOPE = "SCOPE"
+    OWNERSHIP = "OWNERSHIP"
+    REPLACEMENT = "REPLACEMENT"
+    CAUSE_EFFECT = "CAUSE_EFFECT"
+    ARTIFACT = "ARTIFACT"
+
+
+class CoachBulletVerdict(str, Enum):
+    """Whether the bullet needs work or is already strong."""
+
+    STRONG = "STRONG"
+    WEAK = "WEAK"
+
+
+# Maps each CoachCategory to a default key the UI can use as a stable
+# map identifier. The validator fills question.key from this when the
+# LLM doesn't supply one. Keys are ASCII-safe (the same regex the
+# prompt asks the LLM to produce) so the UI doesn't need to escape.
+_CATEGORY_DEFAULT_KEYS: dict[CoachCategory, str] = {
+    CoachCategory.SPECIFICITY: "specificity",
+    CoachCategory.SCOPE: "scope",
+    CoachCategory.OWNERSHIP: "ownership",
+    CoachCategory.REPLACEMENT: "replacement",
+    CoachCategory.CAUSE_EFFECT: "cause_effect",
+    CoachCategory.ARTIFACT: "artifact",
+}
 
 
 class CoachQuestionType(str, Enum):
@@ -387,45 +503,62 @@ class CoachQuestionType(str, Enum):
 class CoachQuestion(BaseModel):
     # Stable key the UI uses to send the answer back. Must be unique
     # within a single bullet's question list (the LLM is asked to
-    # produce ASCII keys like "scale" or "tech_stack").
-    key: str = Field(max_length=64)
+    # produce ASCII keys like "scale" or "tech_stack"). When missing
+    # (LLM only sends category), the validator fills it from the
+    # category's default key. We allow None here so the validator
+    # can populate it; the route layer /save_answers loop also
+    # tolerates a derived key.
+    key: str | None = Field(default=None, max_length=64)
+    # Required: which qualitative dimension this question probes.
+    # The validator rejects duplicate categories within a bullet.
+    category: CoachCategory
     label: str = Field(max_length=MAX_COACH_QUESTION_LABEL_LEN)
     # Hint shown in lighter text under the input. Optional.
     hint: str | None = Field(default=None, max_length=MAX_COACH_QUESTION_LABEL_LEN)
     type: CoachQuestionType = CoachQuestionType.TEXT
 
+    @field_validator("category", mode="before")
+    @classmethod
+    def _normalize_category(cls, v):
+        """Tolerate lowercase / mixed-case category strings from the
+        LLM. The prompt asks for uppercase but models slip.
+        """
+        if isinstance(v, str):
+            return v.strip().upper()
+        return v
 
-class BulletDiagnosis(BaseModel):
-    """Structured analysis of why a bullet is weak.
 
-    The LLM fills this in for every weak bullet it surfaces. The
-    five booleans are independent — a bullet can be strong on
-    `mentions_technology` but weak on `mentions_metric`, for example.
-    The UI renders these as a row of checkmarks/crosses so the user
-    can see WHY the bullet was flagged before they read the
-    questions. The validator also uses them to sanity-check: if
-    `mentions_metric = true` but the original text has no number,
-    something is off.
+class CategoryChecklist(BaseModel):
+    """Six booleans describing which qualitative dimensions the bullet
+    ALREADY has. The LLM fills these in for every bullet. Server
+    derives category_gaps from this: gaps = [c for c in CoachCategory
+    if not checklist[c]].
 
-    Each field is intentionally a bool (not an enum) because the
-    MVP only needs yes/no. Future versions could add a `quality_score`
-    per dimension (0-3) without breaking the schema.
+    Each field is a bool (not an enum) because the MVP only needs
+    yes/no. Future versions could add a quality_score per dimension
+    (0-3) without breaking the schema.
     """
 
-    # Did the bullet describe an action the candidate took?
-    # ("Built", "Led", "Migrated", "Designed", "Owned", ...)
-    mentions_action: bool
-    # Did the bullet name specific tools, languages, frameworks?
-    mentions_technology: bool
-    # Did the bullet describe the size / scale of the work?
-    # (How many users, requests/sec, MB, team size, etc.)
-    mentions_scope: bool
-    # Did the bullet describe a business or user outcome?
-    # (Faster, cheaper, reduced churn, opened a new market, ...)
-    mentions_outcome: bool
-    # Did the bullet include a numeric anchor?
-    # (A number, %, $, latency figure, request count, etc.)
-    mentions_metric: bool
+    # Does the bullet name a concrete artifact or describe the most
+    # interesting technical part? ("Built the matching algorithm",
+    # not just "Built a thing".)
+    SPECIFICITY: bool
+    # Does it say who used it / what touched it / how big it was?
+    # (40 students, 3 internal teams, 5k MAU, etc.)
+    SCOPE: bool
+    # Does it say "I owned/led/shipped" rather than "helped with /
+    # worked on"? Clear ownership language.
+    OWNERSHIP: bool
+    # Does it say what existed before, or what got unblocked
+    # because of this? ("Replaced the legacy CSV export flow",
+    # "unblocked the mobile team".)
+    REPLACEMENT: bool
+    # Does it connect the work to an outcome? ("X, which led to Y"
+    # or "Y because X".)
+    CAUSE_EFFECT: bool
+    # Does it name a specific thing? (API, dashboard, rule, doc,
+    # migration, etc.)
+    ARTIFACT: bool
 
 
 class BulletLocation(BaseModel):
@@ -464,10 +597,26 @@ class CoachBullet(BaseModel):
     # when calling /coach/rewrite. Random short string, opaque to the
     # client.
     bullet_id: str = Field(max_length=64)
+    # Whether this bullet needs work (WEAK) or is already strong (STRONG).
+    # Required. Drives UI affordance and whether /coach/rewrite is even
+    # callable for this bullet.
+    verdict: CoachBulletVerdict
     original_text: str = Field(max_length=MAX_SUGGESTION_TEXT_LEN)
     # Why this bullet is weak, surfaced to the user as the "why this
-    # matters" framing. One short sentence.
-    weakness_reason: str = Field(max_length=MAX_WHY_IT_MATTERS_LEN)
+    # matters" framing. One short sentence. Required when verdict is
+    # WEAK, ignored when STRONG (the validator drops the bullet if
+    # verdict is WEAK without a weakness_reason).
+    weakness_reason: str | None = Field(
+        default=None, max_length=MAX_WHY_IT_MATTERS_LEN
+    )
+    # Why this bullet is strong, surfaced to the user as the "✓
+    # Already strong — [reason]" affordance. Required when verdict is
+    # STRONG, ignored when WEAK (the validator drops the bullet if
+    # verdict is STRONG without a strength_reason of at least
+    # MIN_STRENGTH_REASON_LEN characters).
+    strength_reason: str | None = Field(
+        default=None, max_length=MAX_WHY_IT_MATTERS_LEN
+    )
     # The job whose evidence supports the rewrite. The UI renders the
     # standard "Vercel — Senior Software Engineer ↗" link off this.
     citation_job_id: str = Field(max_length=64)
@@ -481,23 +630,62 @@ class CoachBullet(BaseModel):
         default=None, max_length=MAX_LEARNING_URL_LEN
     )
     citation_quote: str = Field(max_length=MAX_CITATION_QUOTE_LEN)
-    # 2-4 questions the LLM needs answered before it can rewrite.
-    # Min 1, max MAX_COACH_QUESTIONS — enforced server-side because
-    # the LLM occasionally returns 0 or 5+ and we want predictable
-    # UX.
+    # Questions the LLM needs answered before it can rewrite. Empty
+    # when verdict is STRONG. One per missing category when verdict is
+    # WEAK. Validator enforces: STRONG -> empty list, WEAK -> at least
+    # one question. No duplicate categories within a single bullet.
+    # Cap is len(CoachCategory) so a bullet genuinely missing all 6
+    # qualitative dimensions can ask one question per gap (was 4
+    # before, which silently truncated gap coverage).
     questions: list[CoachQuestion] = Field(
-        min_length=1, max_length=MAX_COACH_QUESTIONS
+        default_factory=list, max_length=MAX_COACH_QUESTIONS
     )
-    # Structured diagnosis of why this bullet is weak. Drives both
-    # the question-picking logic (LLM uses it as the conditioning
-    # signal) and the UI's "why is this weak" affordance. Optional —
-    # the validator doesn't require it (older clients may not have
-    # the field).
-    diagnosis: BulletDiagnosis | None = None
+    # Checklist of which categories the bullet ALREADY has. Server
+    # derives category_gaps from this when the LLM doesn't override.
+    # Optional — older clients may not have the field.
+    checklist: CategoryChecklist | None = None
+    # Explicit list of categories missing from the bullet. Server
+    # derives this from the checklist but the LLM is allowed to
+    # override when its judgment differs (e.g. it sees a gap the
+    # boolean reflection missed).
+    category_gaps: list[CoachCategory] = Field(default_factory=list)
     # Where this bullet sits in the candidate's resume. Optional —
     # the parser can fail on unusual resume formats, in which case
     # the route layer falls back to a generic "Resume" location.
     location: BulletLocation | None = None
+
+    @field_validator("category_gaps", mode="before")
+    @classmethod
+    def _normalize_category_gaps(cls, v):
+        """Tolerate lowercase / mixed-case category strings from the LLM
+        inside the gaps list."""
+        if v is None:
+            return []
+        if not isinstance(v, list):
+            return v
+        return [
+            item.strip().upper() if isinstance(item, str) else item
+            for item in v
+        ]
+
+    def resolved_questions(self) -> list[CoachQuestion]:
+        """Return questions with their `key` field populated.
+
+        When the LLM supplied a key, it survives. When it didn't,
+        we fill in the default key for the question's category.
+        UI code that needs to map question -> answer uses this.
+        """
+        out: list[CoachQuestion] = []
+        for question in self.questions:
+            if question.key:
+                out.append(question)
+                continue
+            derived_key = _CATEGORY_DEFAULT_KEYS.get(question.category)
+            if derived_key is None:
+                # Shouldn't happen — categories are constrained.
+                continue
+            out.append(question.model_copy(update={"key": derived_key}))
+        return out
 
 
 class CoachStartResponse(BaseModel):
@@ -516,6 +704,24 @@ class CoachRewriteRequest(BaseModel):
     # allowed (the user can skip a question), but every key the LLM
     # produced for this bullet must be present (validator below).
     answers: dict[str, str] = Field(default_factory=dict)
+    # Categories the user explicitly opted out of. The rewrite prompt
+    # treats these as "do not invent content for this dimension" and
+    # the validator lets the LLM drop the corresponding category from
+    # the rewrite without penalizing it. A category in this list
+    # implies the matching question's answer is irrelevant.
+    skipped_categories: list[CoachCategory] = Field(default_factory=list)
+
+    @field_validator("skipped_categories", mode="before")
+    @classmethod
+    def _normalize_skipped(cls, v):
+        if v is None:
+            return []
+        if not isinstance(v, list):
+            return v
+        return [
+            item.strip().upper() if isinstance(item, str) else item
+            for item in v
+        ]
 
 
 class CoachRewriteResponse(BaseModel):
@@ -550,6 +756,30 @@ def _safe_key_regex():
     return _COACH_KEY_PATTERN
 
 
+def _resolve_question_keys(
+    questions: list[CoachQuestion],
+) -> list[CoachQuestion]:
+    """Fill question.key from the category default when missing.
+
+    Returns a NEW list with new CoachQuestion instances. Originals
+    are not mutated. This is the same logic as
+    CoachBullet.resolved_questions() exposed at module level so the
+    validator + route layer can use it without instantiating a full
+    CoachBullet.
+    """
+    out: list[CoachQuestion] = []
+    for question in questions:
+        if question.key and _safe_key_regex().match(question.key):
+            out.append(question)
+            continue
+        derived = _CATEGORY_DEFAULT_KEYS.get(question.category)
+        if derived is None:
+            out.append(question)  # leave key as-is; validator will reject
+            continue
+        out.append(question.model_copy(update={"key": derived}))
+    return out
+
+
 def validate_coach_start_request(
     skills: list[Suggestion], bullets: list[CoachBullet]
 ) -> tuple[list[Suggestion], list[CoachBullet]]:
@@ -559,15 +789,21 @@ def validate_coach_start_request(
       (UX budget: more than ~5 bullets to coach at once is
       overwhelming).
     - Bullet IDs must be unique within the response.
-    - Question keys within a bullet must be unique.
-    - Question key format is restricted to ASCII letters /
-      digits / underscore so the UI can use them safely as
-      map keys.
+    - When verdict is WEAK: at least one question required, question
+      keys within a bullet must be unique, no duplicate categories,
+      question key format restricted to ASCII letters / digits /
+      underscore so the UI can use them safely as map keys.
+    - When verdict is STRONG: strength_reason must be at least
+      MIN_STRENGTH_REASON_LEN characters; questions must be empty.
     - Each bullet's `original_text` must be a non-empty string
       that is at least 8 chars long (filters out LLM responses
       that send empty or trivial "bullets" like "-" or "n/a").
       Substring-grounding against the entry happens in the
       route layer, which has the parsed resume in scope.
+
+    The validator resolves question.key from category defaults when
+    missing (so a question with no explicit key still has a usable
+    key in the response).
     """
     safe_key = _safe_key_regex()
 
@@ -579,17 +815,59 @@ def validate_coach_start_request(
         if len(bullet.original_text.strip()) < 8:
             # Trivial "bullet" (likely the LLM degenerated).
             continue
+
+        if bullet.verdict == CoachBulletVerdict.STRONG:
+            # STRONG: must have a strength_reason of meaningful length,
+            # questions must be empty. The UI treats these as
+            # "✓ Already strong" with no rewrite available.
+            reason = (bullet.strength_reason or "").strip()
+            if len(reason) < MIN_STRENGTH_REASON_LEN:
+                # The LLM didn't say what's strong. Drop the bullet
+                # rather than ship a half-formed positive feedback.
+                continue
+            if bullet.questions:
+                # STRONG bullets should not have questions. Drop any
+                # questions the LLM accidentally produced.
+                cleaned = bullet.model_copy(update={"questions": []})
+                accepted.append(cleaned)
+                seen_bullet_ids.add(bullet.bullet_id)
+                continue
+            accepted.append(bullet)
+            seen_bullet_ids.add(bullet.bullet_id)
+            continue
+
+        # WEAK: at least one question, no duplicate categories, valid keys.
+        if not bullet.questions:
+            # No questions for a weak bullet -> nothing to coach on.
+            # Drop silently rather than ship a bullet with no
+            # affordance.
+            continue
+
         seen_question_keys: set[str] = set()
-        cleaned_questions = []
+        seen_categories: set[CoachCategory] = set()
+        cleaned_questions: list[CoachQuestion] = []
         for question in bullet.questions:
-            if not safe_key.match(question.key):
+            if question.category in seen_categories:
+                # Two questions for the same category. Skip the
+                # duplicate; first one wins.
+                continue
+            seen_categories.add(question.category)
+            key = (question.key or "").strip()
+            if not key:
+                # Derive from category default.
+                key = _CATEGORY_DEFAULT_KEYS.get(question.category, "")
+            if not safe_key.match(key):
                 # Bad key -- skip the question. The bullet
                 # still survives with its other questions.
                 continue
-            if question.key in seen_question_keys:
+            if key in seen_question_keys:
                 continue
-            seen_question_keys.add(question.key)
-            cleaned_questions.append(question)
+            seen_question_keys.add(key)
+            # Stamp the resolved key back onto the question so the
+            # rest of the pipeline sees a populated key field.
+            cleaned_questions.append(
+                question.model_copy(update={"key": key})
+            )
         if not cleaned_questions:
             # Every question was rejected -- drop the bullet
             # rather than ship a "no questions" coach entry.
@@ -674,12 +952,71 @@ def validate_coach_bullet_grounding(
     return accepted
 
 
+def validate_coach_citation_grounding(
+    bullets: list[CoachBullet],
+    job_descriptions: dict[str, str],
+) -> list[CoachBullet]:
+    """Drop bullets whose `citation_quote` isn't a substring of the
+    cited job's description.
+
+    The LLM is asked in the prompt to return a verbatim substring
+    of the cited job, but it sometimes fabricates a quote -- often
+    echoing the user's answer text instead of pulling from the job
+    description. When that happens, the session stores a fake quote
+    and the rewrite validator later fails with "citation quote is
+    not a substring of the job description" -- which is the right
+    error but lands too late (the user has already answered
+    questions and clicked Rewrite).
+
+    Catching it here, at the start flow, drops the bad bullet
+    before the user invests time in it. Better UX than surfacing
+    the error after answers.
+
+    For STRONG bullets, we DON'T check -- they have no rewrite
+    path, so a bad citation_quote there is cosmetic (the citation
+    link still works via citation_job_id). The check is only
+    meaningful for WEAK bullets.
+
+    Bullets whose `citation_job_id` is missing from
+    `job_descriptions` are kept (best-effort; the validator can't
+    prove they're bad either).
+    """
+    accepted: list[CoachBullet] = []
+    for bullet in bullets:
+        # STRONG bullets don't go through the rewrite path --
+        # citation_quote doesn't gate anything. Skip the check.
+        if bullet.verdict == CoachBulletVerdict.STRONG:
+            accepted.append(bullet)
+            continue
+        job_id = bullet.citation_job_id
+        description = job_descriptions.get(job_id)
+        if description is None:
+            # We don't have the description (job purged from Turso,
+            # or the LLM picked an unknown job). Skip the check --
+            # we can't prove fabrication either way.
+            accepted.append(bullet)
+            continue
+        if _quote_is_substring(bullet.citation_quote, description):
+            accepted.append(bullet)
+        # else: drop silently. The user gets fewer bullets to
+        # coach on, but every bullet shown has a citation they
+        # can verify against the actual job posting.
+    return accepted
+
+
 # Structural / common-English tokens that legitimately appear in any
 # rewrite. We strip these from the fabricated-token check so the
 # validator focuses on substance (numbers, names, claims) rather than
 # grammatical glue (verbs, articles, prepositions).
 _COACH_STRUCTURAL_TOKENS: frozenset[str] = frozenset({
     "the", "and", "for", "with", "from", "into", "over", "about",
+    # Common prepositions/articles not yet in the original list.
+    # The category-coverage validator (validate_coach_rewrite_
+    # category_coverage) filters answers through this list before
+    # stem-comparing to the rewrite, so the user's true-glue
+    # words don't accidentally count as substantive overlap.
+    "of", "in", "on", "at", "to", "by", "as", "an",
+    "is", "it", "its",
     "this", "that", "these", "those", "have", "has", "had", "are",
     "was", "were", "been", "will", "would", "could", "should", "may",
     "can", "must", "shall", "their", "they", "them", "your", "yours",
@@ -728,13 +1065,28 @@ def validate_coach_rewrite_grounding(
     Hallucination guard, structural:
       1. The citation quote must substring-match the cited job
          description. (Same rule as the one-shot validator.)
-      2. Every token in the rewrite that ISN'T in the original bullet,
-         the user's answers, or the cited quote is treated as a
-         fabrication candidate. We allow structural / grammatical
-         tokens through (verbs, articles, prepositions) but anything
-         substantive (numbers, names, claims) fails the rewrite.
+      2. Every substantive token in the rewrite must be traceable
+         to one of:
+           - the original bullet (allowed)
+           - one of the user's answers (allowed -- user supplied)
+           - the cited job quote (allowed, but see rule 4 below)
+         and the trace must go through the user's own words, not
+         just the quote. The job quote is treated as the AIM of
+         the rewrite (target language, target skills) but not as
+         a source of facts about the candidate's experience --
+         a tech name appearing ONLY in the quote (PyTorch, etc.)
+         is still a fabrication if the candidate never used it.
       3. The rewrite must be meaningfully different from the original —
          otherwise the LLM is just returning what we already had.
+      4. Substantive rewrite tokens that are in the cited quote but
+         NOT in the original bullet or the user's answers are flagged
+         as "job-only" with a specific message naming the technology,
+         so the UI can tell the candidate which term came from the
+         job posting rather than their actual experience.
+
+    Category-coverage (the qualitative-coach v2 upgrade) is enforced
+    separately by validate_coach_rewrite_category_coverage, called by
+    the route after this check passes.
     """
     reasons: list[str] = []
 
@@ -750,25 +1102,468 @@ def validate_coach_rewrite_grounding(
     if _normalize(rewritten_text) == _normalize(original_text):
         reasons.append("rewrite is identical to the original bullet")
 
-    # Rule 2: every substantive token in the rewrite must be traceable
+    # Rule 2: every *substantive* token in the rewrite must be traceable
     # to one of:
     #   - the original bullet (always allowed)
-    #   - one of the user's answers (always allowed — user supplied)
-    #   - the cited job quote (allowed — that's the grounding source)
+    #   - one of the user's answers (always allowed -- user supplied)
+    #   - the cited job quote (allowed -- that's the grounding source)
+    #
+    # "Substantive" means: digits and numeric words (numbers, %), and
+    # technology identifiers (FastAPI, next.js, JWT, k8s). These are
+    # the things the LLM can plausibly fabricate to make the rewrite
+    # sound more impressive. Connectors, common verbs, articles,
+    # prepositions, generic nouns ("replacing", "enabling", "serving")
+    # are allowed through -- the LLM needs these to write English
+    # and rejecting them for not being sourced produces false
+    # positives on every natural rewrite.
+    #
+    # CamelCase / single-word Capitalized tech names ("PyTorch",
+    # "FastAPI", "Kafka") are detected via a raw-text scan of the
+    # rewrite since _tokens lowercases and destroys casing
+    # signals. See _rewrite_tech_words below for the scan + the
+    # sentence-initial position filter that keeps verb-led
+    # rewrites ("Built", "Created") from being flagged as
+    # substantive content.
     rewrite_tokens = _tokens(rewritten_text)
     original_tokens = _tokens(original_text)
     answer_tokens: set[str] = set()
     for answer in answers.values():
         answer_tokens |= _tokens(answer)
     quote_tokens = _tokens(citation_quote)
-    allowed_tokens = original_tokens | answer_tokens | quote_tokens
-    fabricated_tokens = rewrite_tokens - allowed_tokens
-    suspicious = fabricated_tokens - _COACH_STRUCTURAL_TOKENS
-    if suspicious:
+
+    def _titlecase_set(text: str) -> set[str]:
+        out: set[str] = set()
+        for raw_tok in re.findall(r"[A-Za-z0-9+#\.]+", text):
+            cleaned = raw_tok.rstrip(".,;:!?")
+            if not cleaned:
+                continue
+            if (
+                cleaned[0].isupper()
+                and any(ch.islower() for ch in cleaned)
+                and all(ch.isalpha() for ch in cleaned)
+            ):
+                out.add(cleaned.lower())
+        return out
+
+    # Earlier this function passed a "rewrite_titlecase" set built
+    # from the rewrite's own text to _is_substantive -- with the idea
+    # that "Built the FastAPI service" should mark BOTH "built" and
+    # "fastapi" as substantive so they could be matched against
+    # allowed stems. The same regex also accepts sentence-initial
+    # capital ("Built", "Created", "Designed"), which are the exact
+    # words the LLM rewrites commonly lead with -- so each rewrite
+    # produced false positives when the original bullet used a
+    # different verb. We no longer build or pass rewrite_titlecase.
+    #
+    # That fix exposed the opposite bug: tokenization lowercases
+    # CamelCase tech names ("PyTorch" -> "pytorch") so the rewrite-
+    # side substance check no longer sees them as substantive, and
+    # the validator could no longer tell whether a tech mention in
+    # the rewrite was sourced. So we re-detect CamelCase via a raw-
+    # text scan below (see _CAMELCASE_RE) and add those tokens back
+    # to substantive_rewrite so they get checked.
+
+    # Tech-name shapes detected in the rewrite's RAW text (before
+    # tokenization, which lowercases and destroys casing signals):
+    #   - CamelCase like "FastAPI", "JavaScript", "PyTorch",
+    #     "TypeScript" -- leading cap followed by at least one more
+    #     [A-Z][a-z]+ chunk.
+    #   - Leading cap followed by lowercase, like "Kafka", "Rust",
+    #     "Python" -- single-word tech names that lose their
+    #     capitalization on tokenization.
+    # Both shapes are caught here so the validator can compare them
+    # against source-side allow-stems. Sentence-initial capital
+    # tokens ("Built", "Created", "Designed") are excluded via the
+    # position filter in _rewrite_proper_nouns() below -- otherwise
+    # the LLM's natural verb-led rewrites would falsely flag common
+    # verbs as substantive. This is a tighter rule than the old
+    # write-side titlecase scan, which is what we want.
+    _CAMELCASE_RE = re.compile(r"\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b")
+    _CAPITALIZED_TECH_RE = re.compile(r"\b[A-Z][a-z]{2,}\b")
+
+    def _is_substantive(token: str, titlecase_source: set[str]) -> bool:
+        if any(ch.isdigit() for ch in token):
+            return True
+        if any(ch.isupper() for ch in token[1:]):
+            return True
+        # On the rewrite side (called with an empty set), this
+        # check is a no-op. On the source side, it captures
+        # CamelCase tech names whose lowercase form would
+        # otherwise look unsourced.
+        if token in titlecase_source:
+            return True
+        if "." in token and not token.endswith("."):
+            return True
+        if "#" in token or "+" in token:
+            return True
+        letters = sum(ch.isalpha() for ch in token)
+        digits = sum(ch.isdigit() for ch in token)
+        if letters > 0 and digits > 0:
+            return True
+        return False
+
+    substantive_rewrite: set[str] = {
+        tok for tok in rewrite_tokens
+        if _is_substantive(tok, set())
+    }
+    # Add tech names from the rewrite's RAW text (not the
+    # lowercased tokens). This recovers the "PyTorch", "FastAPI",
+    # "JavaScript", "Kafka" cases that the lowercased substance
+    # check misses. Without this, the LLM could append
+    # "optimizing PyTorch models" at the end of a rewrite, source
+    # that only in the cited job quote (not the user's answers),
+    # and the validator wouldn't notice -- a fabrication the user
+    # can't catch from the UI.
+    #
+    # Position filter: skip any match at the very start of the
+    # rewrite. Sentence-initial words are typically verbs ("Built",
+    # "Created", "Designed") which are connective content, not
+    # substantive claims. This avoids the "Built/Created false
+    # positive" the previous titlecase approach hit, while still
+    # catching mid-sentence tech-name fabrications.
+    def _rewrite_tech_words(text: str) -> set[str]:
+        out: set[str] = set()
+        # CamelCase catches FastAPI, JavaScript, PyTorch, etc.
+        for m in _CAMELCASE_RE.finditer(text):
+            out.add(m.group(0).lower())
+        # Single-word Capitalized catches Kafka, Rust, Python, etc.
+        # Skip a match whose start position is 0 (sentence-initial)
+        # AND which appears before any other sentence-initial-like
+        # candidate -- a single token at position 0 is most likely a
+        # verb lead. Mid-sentence matches (start_pos > 0) are
+        # always kept. Position-0 matches are also kept if the
+        # rewrite starts with another tech-word before them
+        # (e.g., "FastAPI and Rust" -- both should be caught).
+        capital_matches = list(_CAPITALIZED_TECH_RE.finditer(text))
+        for i, m in enumerate(capital_matches):
+            if m.start() == 0:
+                # If this is the first tech-word-shaped match but
+                # there are MORE matches later, the rewrite starts
+                # with multiple capitalized tokens -- we keep them
+                # all because the user's prose can lead with a
+                # tech name legitimately.
+                if len(capital_matches) > 1:
+                    out.add(m.group(0).lower())
+                # else: position-0 capital + nothing else looks like
+                # a tech name. Treat as sentence-initial verb lead
+                # and skip. (Less restrictive: we could check if a
+                # mid-sentence match follows later, but that adds
+                # complexity for a rare edge case.)
+                continue
+            out.add(m.group(0).lower())
+        return out
+
+    rewrite_camelcase: set[str] = _rewrite_tech_words(rewritten_text)
+    substantive_rewrite |= rewrite_camelcase
+
+    # Build the source-side allow-set using the same detection rule
+    # over raw source text. Without this, a source token like
+    # "FastAPI" gets tokenized as "fastapi" and a rewrite token
+    # "FastAPI" gets flagged as fabricated even though the user
+    # said "FastAPI" verbatim in their answer.
+    sources_text = [
+        original_text,
+        " ".join(answers.values()),
+        citation_quote,
+    ]
+    sources_titlecase = set()
+    for src_text in sources_text:
+        sources_titlecase |= _titlecase_set(src_text)
+
+    # Split the source stems into what the USER supplied (original
+    # + answers -- things the candidate actually said) and what the
+    # JOB supplied (cited quote -- things only in the target job's
+    # description). A tech token that lands in the rewrite's
+    # substantive set is "user-grounded" if its stem is in
+    # user_supplied_stems, "job-only" if its stem is in
+    # job_supplied_stems but NOT user_supplied_stems, and
+    # "fabricated" if neither. The user's recent report caught the
+    # case where the LLM took a tech name from the cited job quote
+    # (e.g. "PyTorch") and appended it to a rewrite about totally
+    # different work -- fabricating a tech claim that doesn't
+    # reflect the candidate's experience.
+    user_supplied_text = [original_text, " ".join(answers.values())]
+    job_supplied_text = [citation_quote]
+    user_supplied_token_sets = (original_tokens, answer_tokens)
+    job_supplied_token_sets = (quote_tokens,)
+
+    def _build_allowed_stems(token_sets, text_list):
+        """Build allowed-substantive stems for a subset of sources.
+
+        Mirrors the build below but scoped to the source slices
+        passed in. Same rules: substantive tokens contribute stems,
+        pure-numeric tokens are added verbatim.
+        """
+        out: set[str] = set()
+        for src_tokens, src_text in zip(token_sets, text_list):
+            for tok in src_tokens:
+                if _is_substantive(tok, sources_titlecase):
+                    out.add(_stem(tok))
+            # Pure-numeric tokens: add verbatim so "5000" matches
+            # "5,000" via stem, and "50k" matches "50" (stems don't
+            # capture suffixes).
+            for tok in src_tokens:
+                if any(ch.isdigit() for ch in tok):
+                    out.add(tok)
+        return out
+
+    user_supplied_stems = _build_allowed_stems(
+        user_supplied_token_sets, user_supplied_text
+    )
+    job_supplied_stems = _build_allowed_stems(
+        job_supplied_token_sets, job_supplied_text
+    )
+
+    # Backward-compat: a stem is "fabricated" if it's in NEITHER
+    # source bucket. A stem is "job-only" if it's in the job-supplied
+    # set but NOT in the user-supplied set. A stem is "user-grounded"
+    # if it's in the user-supplied set.
+    fabricated: set[str] = set()
+    job_only_tech: set[str] = set()
+    for tok in sorted(substantive_rewrite):
+        stem = _stem(tok)
+        if stem in user_supplied_stems:
+            continue
+        # Exact-membership fallback for pure-numeric tokens (e.g.
+        # "5,000" vs "5000" stems don't collapse, but exact match
+        # does).
+        if tok in {t for src in (original_tokens, answer_tokens) for t in src}:
+            continue
+        if tok in job_supplied_stems or stem in job_supplied_stems:
+            # Tech token is in the cited quote but not in anything
+            # the user actually said. Flag with a specific reason:
+            # this rewrites the candidate as having experience they
+            # didn't claim.
+            job_only_tech.add(tok)
+        else:
+            fabricated.add(tok)
+
+    if job_only_tech:
+        # Name up to five so the message stays short. Sort for
+        # determinism.
+        names = sorted(job_only_tech)[:5]
         reasons.append(
-            "rewrite contains tokens not present in the original "
-            "bullet, the cited quote, or the user's answers: "
-            + ", ".join(sorted(suspicious)[:5])
+            "rewrite uses technology that only appears in the cited "
+            "job, not in your answers or the original bullet: "
+            + ", ".join(names)
+            + ". Remove or replace with something from your answers."
+        )
+    if fabricated:
+        # Same reason wording as before for the legacy fabrication
+        # case so existing assertions on this string keep passing.
+        names = sorted(fabricated)[:5]
+        reasons.append(
+            "rewrite contains substantive claims (numbers or "
+            "technologies) not present in the original bullet, the "
+            "cited quote, or the user's answers: "
+            + ", ".join(names)
+        )
+
+    return (len(reasons) == 0, reasons)
+
+
+def validate_coach_rewrite_category_coverage(
+    rewritten_text: str,
+    *,
+    questions: list[CoachQuestion],
+    answers: dict[str, str],
+    skipped_categories: list[CoachCategory] | None = None,
+    category_gaps: list[CoachCategory] | None = None,
+) -> tuple[bool, list[str]]:
+    """Enforce per-category coverage on the rewrite.
+
+    For every category the LLM flagged as a gap on the bullet, the
+    user must EITHER:
+      - have answered a question for that category (and at least one
+        substantive token from that answer must appear in the
+        rewrite), OR
+      - have explicitly skipped that category (`skipped_categories`).
+
+    This enforces the one-question-per-gap contract: a WEAK bullet
+    that the LLM identified as missing 5 categories must produce 5
+    questions, not 4. The old validator only counted coverage for
+    questions that existed -- a bullet with gaps {SCOPE, OWNERSHIP,
+    ARTIFACT} that only got a question for SCOPE would silently pass
+    with the other two categories absent from grounding.
+
+    Edge cases (logged as warnings via the reasons list, NOT as
+    rejections):
+      - The answer is one word and that word is in the structural
+        allowlist (e.g. "yes", "ok"). No substantive fingerprint
+        available.
+      - The answer is empty (user skipped without marking the
+        category as skipped). Treated as skipped for this rule.
+      - The answer is in a different language than the rewrite;
+        tokens won't match. Warn, don't reject.
+
+    Edge case (silent skip):
+      - The question's category is in `skipped_categories`. No
+        coverage check runs for that category.
+      - The gap category is in `skipped_categories`. No question
+        required for it.
+
+    Edge case (soft pass, no gap-coverage check):
+      - `category_gaps` is None or empty (older clients /
+        checklist-not-set). Falls back to per-question coverage
+        only -- the old behavior. Logged as warning so we notice
+        when this happens in production.
+    """
+    reasons: list[str] = []
+    skipped = set(skipped_categories or [])
+    # ------------------------------------------------------------------
+    # Rule 1 (new): every non-skipped gap must have a question.
+    # Runs BEFORE per-question coverage so the user gets the most
+    # actionable message ("you didn't even answer SCOPE") rather than
+    # a generic per-question-coverage failure on the question they
+    # DID answer. Fall back to per-question-only check when gaps are
+    # missing -- this preserves compatibility with older clients.
+    # ------------------------------------------------------------------
+    missing_gaps: list[CoachCategory] = []
+    if category_gaps:
+        question_categories: set[CoachCategory] = set()
+        # Inline category normalization here: _q_category is defined
+        # later in this function and a forward reference inside this
+        # branch would raise UnboundLocalError (Python sees the
+        # later assignment and treats the name as local throughout).
+        for q in questions:
+            cat = q.get("category") if isinstance(q, dict) else getattr(q, "category", None)
+            if cat is None:
+                continue
+            if isinstance(cat, CoachCategory):
+                question_categories.add(cat)
+            elif isinstance(cat, str):
+                try:
+                    question_categories.add(CoachCategory(cat.strip().upper()))
+                except ValueError:
+                    pass
+        missing_gaps = [
+            gap for gap in category_gaps
+            if gap not in skipped and gap not in question_categories
+        ]
+        if missing_gaps:
+            missing_names = ", ".join(
+                gap.value for gap in missing_gaps
+            )
+            reasons.append(
+                f"rewrite skipped categories without a question or "
+                f"skip marker: {missing_names}. Add a question or "
+                f"mark the category as skipped before requesting "
+                f"a rewrite."
+            )
+            return (False, reasons)
+    # Build the rewrite's stem set once, up front. Used by the
+    # per-question coverage check below to compare against each
+    # answer's substantive stems. Stems handle morphological
+    # variants ("customer" vs "customers") and the structural-
+    # token filter handles "the" / "and" / etc. that shouldn't
+    # count as a fingerprint.
+    rewrite_stems_cached: set[str] = set()
+    for tok in _tokens(rewritten_text):
+        rewrite_stems_cached.add(_stem(tok))
+    # Build a key -> category map so we can resolve answer keys to
+    # categories. The UI sends answers keyed by question.key; the
+    # validator needs the category. We accept either CoachQuestion
+    # objects or plain dicts (the route layer passes dicts because
+    # the session store serializes bullets as dicts on read).
+    key_to_category: dict[str, CoachCategory] = {}
+
+    def _q_key(q) -> str | None:
+        if isinstance(q, dict):
+            return q.get("key")
+        return getattr(q, "key", None)
+
+    def _q_category(q) -> CoachCategory | None:
+        cat = q.get("category") if isinstance(q, dict) else getattr(q, "category", None)
+        if cat is None:
+            return None
+        # Normalize string categories to enum values. The validator
+        # also accepts already-enum values.
+        if isinstance(cat, CoachCategory):
+            return cat
+        if isinstance(cat, str):
+            try:
+                return CoachCategory(cat.strip().upper())
+            except ValueError:
+                return None
+        return None
+
+    for question in questions:
+        qkey = _q_key(question)
+        qcat = _q_category(question)
+        if qkey and qcat is not None:
+            key_to_category[qkey] = qcat
+
+    for question in questions:
+        category = _q_category(question)
+        if category is None:
+            continue
+        if category in skipped:
+            continue
+        key = _q_key(question) or _CATEGORY_DEFAULT_KEYS.get(category, "")
+        answer = answers.get(key, "") if key else ""
+        if not answer or not answer.strip():
+            # Empty answer -- documented as a soft skip ("Empty
+            # answer (user skipped without marking the category
+            # as skipped). Treated as skipped for this rule.").
+            # We `continue` WITHOUT appending a reason so the
+            # rewrite route's coverage check accepts this case.
+            # The button in the UI is also disabled until the
+            # user either fills in an answer or marks the
+            # category as skipped, but the validator soft-skips
+            # as a safety net (e.g. partially-filled bullets
+            # submitted before the in-flight UI changes ship).
+            continue
+        # Filter out structural-only ("glue") tokens from the
+        # answer's stem set before comparing to the rewrite.
+        # Without this, an answer like "the" passes trivial-
+        # token-overlap even though it carries zero factual
+        # information. We compare stems so morphological variants
+        # match ("customers" vs "customer", "matched" vs "match").
+        answer_stems: set[str] = set()
+        for tok in _tokens(answer):
+            stem = _stem(tok)
+            if stem in _COACH_STRUCTURAL_TOKENS:
+                continue
+            answer_stems.add(stem)
+        if not answer_stems:
+            # Answer collapsed to all structural tokens (or was
+            # empty after tokenization) -- no substantive
+            # fingerprint to check. Soft skip: don't fail, don't
+            # penalize. The route can still rely on the LLM
+            # having seen the raw text in the prompt and the
+            # category_gaps path providing the structural gate.
+            continue
+        rewrite_stems = rewrite_stems_cached
+        overlap = answer_stems & rewrite_stems
+        if not overlap:
+            reasons.append(
+                f"category {category.value}: answer words did not "
+                "appear in the rewrite ("
+                + ", ".join(sorted(answer_stems)[:3])
+                + ")"
+            )
+
+    # If category_gaps was missing (None or empty list) and there
+    # are no per-question failures, fall back to the old behavior:
+    # the per-question coverage was sufficient on its own. Logged
+    # at warning level so production can monitor how often the
+    # route layer doesn't populate category_gaps -- but never
+    # promoted to a hard failure, since that would silently
+    # regress the old flow.
+    has_real_failures = any(
+        "answer words did not appear" in r for r in reasons
+    )
+    if not category_gaps and not has_real_failures:
+        # Don't return the warning as a reason (would gate the
+        # route). Log it instead so production telemetry still
+        # catches the regression.
+        logging.getLogger(__name__).warning(
+            "category_gaps not provided to validator; "
+            "gap-coverage check skipped. If this happens in "
+            "production, the LLM/parser isn't populating "
+            "category_gaps before /coach/rewrite, and the "
+            "one-question-per-gap contract is unenforceable "
+            "for that bullet."
         )
 
     return (len(reasons) == 0, reasons)
