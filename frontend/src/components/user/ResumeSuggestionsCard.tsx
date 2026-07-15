@@ -129,6 +129,23 @@ const CATEGORY_LABEL: Record<CoachCategory, string> = {
   ARTIFACT: "Artifact",
 }
 
+// Maps each CoachCategory to the default question.key the UI uses
+// when the LLM didn't supply one. Mirrors _CATEGORY_DEFAULT_KEYS
+// in backend/app/schemas/suggestions.py so the answer map keys
+// match what the backend expects. Kept as string-string literal
+// map (not enum-keyed Map) because CoachCategory is a TypeScript
+// string-literal union — there is no runtime enum to key by here.
+// Single source of truth: both BulletCoachWeakItem's resolvedKey
+// and ResumeSuggestionsCard's handleToggleSkip read from this.
+const _DEFAULT_CATEGORY_KEYS: Record<string, string> = {
+  SPECIFICITY: "specificity",
+  SCOPE: "scope",
+  OWNERSHIP: "ownership",
+  REPLACEMENT: "replacement",
+  CAUSE_EFFECT: "cause_effect",
+  ARTIFACT: "artifact",
+}
+
 /**
  * Render a single WEAK bullet-coach entry: location breadcrumb,
  * weakness reason, original-text quote, one question input per
@@ -174,18 +191,25 @@ function BulletCoachWeakItem({
   }
 
   // The backend derives a default key from the category when the
-  // LLM omits question.key. We mirror that derivation here so the
-  // answer map keys match what the backend expects.
-  const fallbackKeyFor: Record<CoachCategory, string> = {
-    SPECIFICITY: "specificity",
-    SCOPE: "scope",
-    OWNERSHIP: "ownership",
-    REPLACEMENT: "replacement",
-    CAUSE_EFFECT: "cause_effect",
-    ARTIFACT: "artifact",
-  }
+  // LLM omits question.key. Reuse the module-level map so we
+  // don't drift from the parent component's handler (which uses
+  // _DEFAULT_CATEGORY_KEYS when adding a skip-category).
   const resolvedKey = (question: { key?: string | null; category: CoachCategory }) =>
-    question.key || fallbackKeyFor[question.category]
+    question.key || _DEFAULT_CATEGORY_KEYS[question.category] || ""
+
+  // Disable the rewrite button until every question has either a
+  // non-empty answer OR an explicit skip on its category. Without
+  // this, an untouched / partially-completed bullet could be
+  // submitted with missing answer keys and rejected by the
+  // backend (line 286 only checks `pending` for the spinner; the
+  // empty-answer state used to slip through).
+  const allQuestionsResolved = bullet.questions.every((question) => {
+    const key = resolvedKey(question)
+    return (
+      skippedCategories.includes(question.category) ||
+      Boolean(answers[key]?.trim())
+    )
+  })
 
   return (
     <li className="rounded-md border border-border bg-background/60 px-3 py-3 space-y-3">
@@ -283,7 +307,7 @@ function BulletCoachWeakItem({
               type="button"
               size="sm"
               onClick={onRequestRewrite}
-              disabled={pending}
+              disabled={pending || !allQuestionsResolved}
             >
               {pending ? (
                 <>
@@ -532,15 +556,52 @@ export function ResumeSuggestionsCard({ enabled }: ResumeSuggestionsCardProps) {
     setState((current) => {
       if (current.kind !== "coach_ready") return current
       const existing = current.skipped_categories[bulletId] ?? []
-      const next = existing.includes(category)
+      const wasSkipped = existing.includes(category)
+      const next = wasSkipped
         ? existing.filter((c) => c !== category)
         : [...existing, category]
+      // When the user explicitly skips a category, also clear
+      // the answer text for that question's key so the value
+      // never gets sent to the rewrite prompt or the
+      // grounding validator. The validator would have let
+      // empty/skipped through (soft skip), but the prompt
+      // builder still surfaces `[category skipped]  <answer>`
+      // for non-empty answers in skipped categories -- that
+      // path is intentional (see bullet_coach_llm rewrite
+      // prompt). Clearing the answer here makes the wire
+      // representation unambiguous: skip == empty answer.
+      // When unskipping, leave any prior text alone -- the user
+      // might want to recover it. (Frontend doesn't currently
+      // restore on unskip; out of scope here.)
+      let nextAnswers = current.answers
+      if (!wasSkipped) {
+        const bullet = current.session.bullets.find(
+          (b) => b.bullet_id === bulletId
+        )
+        const question = bullet?.questions.find(
+          (q) => q.category === category
+        )
+        if (question) {
+          const key =
+            question.key ||
+            _DEFAULT_CATEGORY_KEYS[category] ||
+            ""
+          if (key) {
+            const existingAnswers = current.answers[bulletId] ?? {}
+            nextAnswers = {
+              ...current.answers,
+              [bulletId]: { ...existingAnswers, [key]: "" },
+            }
+          }
+        }
+      }
       return {
         ...current,
         skipped_categories: {
           ...current.skipped_categories,
           [bulletId]: next,
         },
+        answers: nextAnswers,
       }
     })
   }
@@ -553,22 +614,43 @@ export function ResumeSuggestionsCard({ enabled }: ResumeSuggestionsCardProps) {
         pending: { ...current.pending, [bullet.bullet_id]: true },
       }
     })
+    // Pull current values out of the state ref so we don't race
+    // with pending setState calls above.
+    const currentState = state
+    if (currentState.kind !== "coach_ready") return
+    // Capture the session id THIS request was dispatched against.
+    // If the user refreshes the workshop (handleStartCoach) while
+    // this /coach/rewrite request is in flight, the resolved
+    // response would otherwise be written into the new session's
+    // state -- potentially under the same LLM-generated bullet id,
+    // overwriting or attributing the new session's answer to a
+    // superseded answer. Discard anything whose session id no
+    // longer matches the one we sent.
+    // Declared OUTSIDE the try/catch so the catch block can read
+    // it -- block-scoped consts declared inside `try` are not
+    // visible in the sibling `catch`.
+    const requestedSessionId = currentState.session.session_id
+    const answers = currentState.answers[bullet.bullet_id] ?? {}
+    const skipped =
+      currentState.skipped_categories[bullet.bullet_id] ?? []
     try {
-      // Pull current values out of the state ref so we don't race
-      // with pending setState calls above.
-      const currentState = state
-      if (currentState.kind !== "coach_ready") return
-      const answers = currentState.answers[bullet.bullet_id] ?? {}
-      const skipped =
-        currentState.skipped_categories[bullet.bullet_id] ?? []
       const response = await rewriteBullet({
-        session_id: currentState.session.session_id,
+        session_id: requestedSessionId,
         bullet_id: bullet.bullet_id,
         answers,
         skipped_categories: skipped,
       })
       setState((current) => {
-        if (current.kind !== "coach_ready") return current
+        if (
+          current.kind !== "coach_ready" ||
+          current.session.session_id !== requestedSessionId
+        ) {
+          // Workshop was refreshed or exited while this request
+          // was pending. Drop the response -- the new session
+          // is unrelated and the bullet id may not even exist
+          // there anymore.
+          return current
+        }
         return {
           ...current,
           rewrites: { ...current.rewrites, [bullet.bullet_id]: response },
@@ -576,6 +658,18 @@ export function ResumeSuggestionsCard({ enabled }: ResumeSuggestionsCardProps) {
         }
       })
     } catch (error) {
+      // Same session guard as the success path below -- if the
+      // workshop was refreshed while the request was in flight,
+      // the 502 toast and pending-state clearing belong to the
+      // discarded session, not the user's current view. Swallow
+      // the toast; the new session's first request will surface
+      // its own errors if it hits them.
+      if (
+        currentState.kind !== "coach_ready" ||
+        currentState.session.session_id !== requestedSessionId
+      ) {
+        return
+      }
       // Keep the user's answers intact so they can rephrase and retry.
       // The backend's 502 detail is the user-facing message -- it
       // explains which categories the rewrite didn't reflect.
@@ -585,7 +679,18 @@ export function ResumeSuggestionsCard({ enabled }: ResumeSuggestionsCardProps) {
           : "Failed to generate rewrite."
       toast.error(message)
       setState((current) => {
-        if (current.kind !== "coach_ready") return current
+        if (
+          current.kind !== "coach_ready" ||
+          current.session.session_id !== requestedSessionId
+        ) {
+          // Belt-and-suspenders: also guard the setState against
+          // a race that snuck in between the snapshot above and
+          // the setState (e.g. handleStartCoach fired during the
+          // same microtask). The component owning state may now
+          // be in coach_loading or coach_error with a new
+          // session id; never write into a stale session.
+          return current
+        }
         return {
           ...current,
           pending: { ...current.pending, [bullet.bullet_id]: false },

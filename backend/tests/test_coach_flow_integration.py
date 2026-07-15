@@ -28,6 +28,20 @@ What we're verifying:
   6. /coach/rewrite threads skipped_categories through to the LLM
      and tolerates an empty rewrite (validator soft-skips empty
      answers).
+  7. /coach/rewrite enforces the grounding validator's rejection
+     path (502 when the rewrite fabricates a number or technology
+     not in {original, answers, cited quote}, even if category
+     coverage passes). This was the regression of the original
+     hallucination guard; reintroduced as a hard rejection after
+     the qualitative-coach v2 migration (fe2a845).
+  8. /coach/start accepts a WEAK bullet with up to len(CoachCategory)
+     questions (was capped at 4, which silently truncated gaps).
+  9. /coach/rewrite rejects with 502 when the LLM-supplied bullet
+     is missing a question for a checklist gap that wasn't skipped
+     (the one-question-per-gap contract).
+  10. /coach/rewrite passes when every checklist gap is in
+      skipped_categories even if the rewrite adds nothing for
+      those categories.
 """
 
 from __future__ import annotations
@@ -40,6 +54,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.schemas.suggestions import (
+    CategoryChecklist,
     CoachBullet,
     CoachBulletVerdict,
     CoachCategory,
@@ -140,7 +155,18 @@ def _fake_start_response():
         weakness_reason="No clear audience or what the platform replaced.",
         citation_job_id="job-bbb",
         citation_quote="Built a job matching platform",
-        checklist=None,
+        # Checklist drives the gap-coverage validator. Two gaps
+        # (SCOPE, ARTIFACT) match the two questions below so the
+        # existing tests verify the validator's happy path with
+        # a populated checklist.
+        checklist=CategoryChecklist(
+            SPECIFICITY=True,
+            SCOPE=False,
+            OWNERSHIP=True,
+            REPLACEMENT=True,
+            CAUSE_EFFECT=True,
+            ARTIFACT=False,
+        ),
         questions=[
             CoachQuestion(
                 key="scope",
@@ -346,7 +372,16 @@ class CoachFlowIntegrationTests(unittest.TestCase):
         self.assertIn("already strong", body["detail"].lower())
 
     def test_coach_rewrite_skipped_categories_accepted(self):
-        """User skips one category; rewrite doesn't need to mention it."""
+        """User skips one category; rewrite doesn't need to mention it.
+
+        Mirrors what the frontend now sends after the suggestion-3
+        fix: when the user hits 'Skip' on a category, the UI clears
+        that question's answer locally (handleToggleSkip sets the
+        answer key to ""), so the request carries an empty string
+        for the skipped question's key. The backend validator
+        should soft-skip that empty value (not fail), so the
+        rewrite passes -- which is the contract the UI depends on.
+        """
         from contextlib import ExitStack
 
         with ExitStack() as stack:
@@ -384,13 +419,74 @@ class CoachFlowIntegrationTests(unittest.TestCase):
                     "bullet_id": "b_weak",
                     "answers": {
                         scope_key: "my cohort of 40 students",
-                        artifact_key: "the matching algorithm",
+                        # After frontend suggestion-3 fix:
+                        # skipping ARTIFACT also clears its answer.
+                        artifact_key: "",
                     },
                     "skipped_categories": ["ARTIFACT"],
                 },
             )
 
         self.assertEqual(response.status_code, 200, response.text)
+
+    def test_coach_rewrite_empty_answer_soft_skip(self):
+        """Regression for suggestion 1a: an empty answer to a
+        non-skipped category should be treated as a soft skip (the
+        validator must NOT add a reason for it) -- the request
+        passes as long as the OTHER answers ground the rewrite.
+
+        Prior to the fix, empty answers appended a reason, which
+        tipped the route's 502 path even though the documented
+        behavior was a soft skip. Mirrors what a partial-input
+        request looks like before the new button-guard UI ships.
+        """
+        from contextlib import ExitStack
+
+        with ExitStack() as stack:
+            for ctx in self._mock_dependencies():
+                stack.enter_context(ctx)
+
+            start = self.client.post("/suggestions/coach/start")
+            session_id = start.json()["session_id"]
+            weak = next(
+                b for b in start.json()["bullets"]
+                if b["bullet_id"] == "b_weak"
+            )
+            scope_key = weak["questions"][0]["key"]
+            artifact_key = weak["questions"][1]["key"]
+
+            # Rewrite uses scope words but no artifact words.
+            # artifact answer is empty (a soft skip).
+            rewrite_text = (
+                "Built a job matching platform for my cohort of 40 "
+                "students end to end."
+            )
+            stack.enter_context(
+                patch(
+                    "app.services.bullet_coach_llm.rewrite_bullet",
+                    return_value=rewrite_text,
+                )
+            )
+
+            response = self.client.post(
+                "/suggestions/coach/rewrite",
+                json={
+                    "session_id": session_id,
+                    "bullet_id": "b_weak",
+                    "answers": {
+                        scope_key: "my cohort of 40 students",
+                        artifact_key: "",  # soft skip
+                    },
+                    "skipped_categories": [],
+                },
+            )
+
+        # The empty answer is soft-skipped. The substantive answer
+        # ("my cohort of 40 students") supplies enough grounding
+        # for the SCOPE category, so the rewrite passes.
+        self.assertEqual(
+            response.status_code, 200, response.text
+        )
 
     def test_coach_rewrite_missing_answer_word_rejected(self):
         """If the LLM's rewrite omits the user's answer words for a
@@ -435,6 +531,352 @@ class CoachFlowIntegrationTests(unittest.TestCase):
         # Category coverage OR the rewrite==original grounding rule
         # will fail. Either way, the route returns 502.
         self.assertEqual(response.status_code, 502)
+
+    def test_coach_rewrite_fabricated_token_rejected(self):
+        """Regression for fe2a845: even if the rewrite passes category
+        coverage (it uses the user's answer words), fabricating a
+        number or technology that is NOT in {original, answers,
+        cited quote} must still return 502.
+
+        The route used to log grounding failures and continue, so a
+        well-formed-but-fabricated rewrite ("...99% uptime" when
+        the user never said 99) would slip through whenever the
+        category-coverage check happened to pass. That gate is now
+        a hard rejection -- the user gets the "couldn't be grounded"
+        message and the fake number never reaches the UI.
+        """
+        from contextlib import ExitStack
+
+        with ExitStack() as stack:
+            for ctx in self._mock_dependencies():
+                stack.enter_context(ctx)
+
+            start = self.client.post("/suggestions/coach/start")
+            session_id = start.json()["session_id"]
+            weak = next(
+                b for b in start.json()["bullets"]
+                if b["bullet_id"] == "b_weak"
+            )
+            scope_key = weak["questions"][0]["key"]
+            artifact_key = weak["questions"][1]["key"]
+
+            # Category coverage WILL pass: "cohort" and "students"
+            # cover SCOPE; "matching algorithm" covers ARTIFACT.
+            # The bare original ("Built a job matching platform")
+            # is sourced. The fabricated "99%" is the trap --
+            # digits not present in any source token.
+            rewrite_text = (
+                "Built a job matching platform for my cohort of 40 "
+                "students using the matching algorithm with 99% "
+                "uptime."
+            )
+            stack.enter_context(
+                patch(
+                    "app.services.bullet_coach_llm.rewrite_bullet",
+                    return_value=rewrite_text,
+                )
+            )
+
+            response = self.client.post(
+                "/suggestions/coach/rewrite",
+                json={
+                    "session_id": session_id,
+                    "bullet_id": "b_weak",
+                    "answers": {
+                        scope_key: "my cohort of 40 students",
+                        artifact_key: "the matching algorithm",
+                    },
+                    "skipped_categories": [],
+                },
+            )
+
+        self.assertEqual(
+            response.status_code, 502, response.text,
+        )
+        body = response.json()
+        # The validator surfaces its specific reason in the detail.
+        # This rewrite had a fabricated "99%" so the message
+        # references "substantive claims". The exact wording has
+        # changed as the validator gained more nuanced reason
+        # strings (job-only vs fabricated); check for the substance
+        # of the failure rather than a hard-coded word.
+        self.assertIn("substantive", body["detail"].lower())
+        # And confirm the fabricated token name appears so the user
+        # knows what to remove.
+        self.assertIn("99", body["detail"])
+
+    def test_coach_start_accepts_six_question_bullet(self):
+        """Regression: WEAK bullet with >4 questions used to be
+        rejected by the schema's max_length. Six questions (one per
+        CoachCategory) is the legitimate upper bound -- a bullet
+        can lack all six qualitative dimensions."""
+        from contextlib import ExitStack
+
+        # Build a separate start response for this scenario:
+        # one WEAK bullet with 6 questions (one per category)
+        # and a checklist that names every category as a gap.
+        # original_text MUST be a substring of _fake_resume() so
+        # validate_coach_bullet_grounding doesn't drop it.
+        six_q_weak = CoachBullet(
+            bullet_id="b_six_weak",
+            verdict=CoachBulletVerdict.WEAK,
+            original_text="Designed a code review rubric used by 12 instructors.",
+            weakness_reason="No detail on any dimension.",
+            citation_job_id="job-bbb",
+            citation_quote="Built a job matching platform",
+            checklist=CategoryChecklist(
+                SPECIFICITY=False,
+                SCOPE=False,
+                OWNERSHIP=False,
+                REPLACEMENT=False,
+                CAUSE_EFFECT=False,
+                ARTIFACT=False,
+            ),
+            questions=[
+                CoachQuestion(
+                    key=k,
+                    category=c,
+                    label=f"q-{k}",
+                    type=CoachQuestionType.TEXT,
+                )
+                for k, c in (
+                    ("specificity", CoachCategory.SPECIFICITY),
+                    ("scope", CoachCategory.SCOPE),
+                    ("ownership", CoachCategory.OWNERSHIP),
+                    ("replacement", CoachCategory.REPLACEMENT),
+                    ("cause_effect", CoachCategory.CAUSE_EFFECT),
+                    ("artifact", CoachCategory.ARTIFACT),
+                )
+            ],
+        )
+        six_q_response = CoachStartResponse(
+            session_id="placeholder",
+            skills=[],
+            bullets=[six_q_weak],
+        )
+
+        with ExitStack() as stack:
+            for ctx in self._mock_dependencies():
+                stack.enter_context(ctx)
+            # Override the LLM response with a 6-question bullet.
+            stack.enter_context(
+                patch(
+                    "app.services.bullet_coach_llm.start_coach_session",
+                    return_value=(six_q_response.skills, six_q_response.bullets),
+                )
+            )
+
+            response = self.client.post("/suggestions/coach/start")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        # The 6-question bullet must survive -- before the cap
+        # lift this would have failed pydantic validation.
+        weak = next(
+            b for b in body["bullets"] if b["bullet_id"] == "b_six_weak"
+        )
+        self.assertEqual(len(weak["questions"]), 6)
+
+    def test_coach_rewrite_missing_gap_question_rejected(self):
+        """Bug fix: when the LLM supplies a checklist naming more
+        gaps than the questions it produced, /coach/rewrite must
+        reject with 502 naming the uncovered gap category. This is
+        the one-question-per-gap contract that the 4-question cap
+        was silently violating."""
+        from contextlib import ExitStack
+
+        # Override the WEAK bullet's checklist to claim THREE gaps
+        # (SCOPE, OWNERSHIP, ARTIFACT) but only produce questions
+        # for SCOPE and ARTIFACT. The validator's gap-coverage
+        # check must catch the missing OWNERSHIP question.
+        gap_mismatch_weak = CoachBullet(
+            bullet_id="b_weak",
+            verdict=CoachBulletVerdict.WEAK,
+            original_text="Built a job matching platform for the cohort.",
+            weakness_reason="Missing dimensions.",
+            citation_job_id="job-bbb",
+            citation_quote="Built a job matching platform",
+            checklist=CategoryChecklist(
+                SPECIFICITY=True,
+                SCOPE=False,
+                OWNERSHIP=False,
+                REPLACEMENT=True,
+                CAUSE_EFFECT=True,
+                ARTIFACT=False,
+            ),
+            questions=[
+                CoachQuestion(
+                    key="scope",
+                    category=CoachCategory.SCOPE,
+                    label="Who used it?",
+                    type=CoachQuestionType.TEXT,
+                ),
+                CoachQuestion(
+                    key="artifact",
+                    category=CoachCategory.ARTIFACT,
+                    label="What's interesting?",
+                    type=CoachQuestionType.TEXT,
+                ),
+                # NOTE: no OWNERSHIP question even though checklist
+                # says OWNERSHIP is a gap.
+            ],
+        )
+        gm_response = CoachStartResponse(
+            session_id="placeholder",
+            skills=[],
+            bullets=[gap_mismatch_weak],
+        )
+
+        with ExitStack() as stack:
+            for ctx in self._mock_dependencies():
+                stack.enter_context(ctx)
+            stack.enter_context(
+                patch(
+                    "app.services.bullet_coach_llm.start_coach_session",
+                    return_value=(gm_response.skills, gm_response.bullets),
+                )
+            )
+
+            start = self.client.post("/suggestions/coach/start")
+            session_id = start.json()["session_id"]
+            weak = next(
+                b for b in start.json()["bullets"]
+                if b["bullet_id"] == "b_weak"
+            )
+            scope_key = weak["questions"][0]["key"]
+            artifact_key = weak["questions"][1]["key"]
+
+            # Even with a perfectly-grounded rewrite that uses
+            # SCOPE and ARTIFACT words, the missing OWNERSHIP
+            # question means this rewrite should be rejected.
+            rewrite_text = (
+                "Built a job matching platform for my cohort of 40 "
+                "students using the matching algorithm"
+            )
+            stack.enter_context(
+                patch(
+                    "app.services.bullet_coach_llm.rewrite_bullet",
+                    return_value=rewrite_text,
+                )
+            )
+
+            response = self.client.post(
+                "/suggestions/coach/rewrite",
+                json={
+                    "session_id": session_id,
+                    "bullet_id": "b_weak",
+                    "answers": {
+                        scope_key: "my cohort of 40 students",
+                        artifact_key: "the matching algorithm",
+                    },
+                    "skipped_categories": [],
+                },
+            )
+
+        self.assertEqual(
+            response.status_code, 502, response.text,
+        )
+        body = response.json()
+        # The validator names the missing gap category in the
+        # message so the UI can highlight the right question.
+        self.assertIn("OWNERSHIP", body["detail"])
+
+    def test_coach_rewrite_all_gaps_skipped_passes(self):
+        """When the user explicitly skips every checklist gap, the
+        validator accepts even a minimal rewrite -- nothing to
+        ground against."""
+        from contextlib import ExitStack
+
+        all_skipped_weak = CoachBullet(
+            bullet_id="b_weak",
+            verdict=CoachBulletVerdict.WEAK,
+            original_text="Built a job matching platform for the cohort.",
+            weakness_reason="Missing dimensions.",
+            citation_job_id="job-bbb",
+            citation_quote="Built a job matching platform",
+            checklist=CategoryChecklist(
+                SPECIFICITY=True,
+                SCOPE=False,
+                OWNERSHIP=False,
+                REPLACEMENT=True,
+                CAUSE_EFFECT=True,
+                ARTIFACT=False,
+            ),
+            questions=[
+                CoachQuestion(
+                    key="scope",
+                    category=CoachCategory.SCOPE,
+                    label="Who used it?",
+                    type=CoachQuestionType.TEXT,
+                ),
+                CoachQuestion(
+                    key="ownership",
+                    category=CoachCategory.OWNERSHIP,
+                    label="Did you lead?",
+                    type=CoachQuestionType.TEXT,
+                ),
+                CoachQuestion(
+                    key="artifact",
+                    category=CoachCategory.ARTIFACT,
+                    label="What's interesting?",
+                    type=CoachQuestionType.TEXT,
+                ),
+            ],
+        )
+        as_response = CoachStartResponse(
+            session_id="placeholder",
+            skills=[],
+            bullets=[all_skipped_weak],
+        )
+
+        with ExitStack() as stack:
+            for ctx in self._mock_dependencies():
+                stack.enter_context(ctx)
+            stack.enter_context(
+                patch(
+                    "app.services.bullet_coach_llm.start_coach_session",
+                    return_value=(as_response.skills, as_response.bullets),
+                )
+            )
+
+            start = self.client.post("/suggestions/coach/start")
+            session_id = start.json()["session_id"]
+
+            # User skips every gap category. The rewrite can be
+            # minimal -- just different from the original so it
+            # doesn't trip the grounding validator's "rewrite is
+            # identical to the original" rule (rule 3).
+            rewrite_text = "Built a job matching platform for the cohort end to end."
+            stack.enter_context(
+                patch(
+                    "app.services.bullet_coach_llm.rewrite_bullet",
+                    return_value=rewrite_text,
+                )
+            )
+
+            response = self.client.post(
+                "/suggestions/coach/rewrite",
+                json={
+                    "session_id": session_id,
+                    "bullet_id": "b_weak",
+                    # Empty answers are allowed (user can leave
+                    # them blank) -- the key just needs to be
+                    # present so the validator can tell the
+                    # rewrite was for THESE questions.
+                    "answers": {
+                        "scope": "",
+                        "ownership": "",
+                        "artifact": "",
+                    },
+                    "skipped_categories": [
+                        "SCOPE", "OWNERSHIP", "ARTIFACT",
+                    ],
+                },
+            )
+
+        self.assertEqual(
+            response.status_code, 200, response.text,
+        )
 
     def test_coach_rewrite_missing_session_returns_404(self):
         """A session_id the server doesn't know about -> 404."""

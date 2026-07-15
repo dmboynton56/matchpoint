@@ -1081,6 +1081,224 @@ class SubstantiveGroundingTests(unittest.TestCase):
         joined = " ".join(reasons)
         self.assertIn("kafka", joined.lower())
 
+    def test_mid_sentence_tech_from_job_only_quote_flagged(self):
+        """Regression for the user's recent report: the LLM took a
+        tech name (PyTorch) from the cited job quote and appended
+        it to a rewrite where the candidate never used PyTorch.
+        Before this fix, tokenization lowercased the CamelCase
+        token and the rewrite-side substance check missed it
+        entirely -- the rewrite was returned with a fabricated
+        claim the user couldn't catch from the UI.
+
+        After the fix: PyTorch is detected via raw-text CamelCase
+        scan, classified as "job-only" (in the cited quote but
+        not in the user's answers or original bullet), and the
+        validator surfaces it with a specific reason so the UI can
+        tell the user which tech name came from the job posting
+        rather than their experience.
+        """
+        ok, reasons = self._check(
+            # CamelCase "PyTorch" mid-sentence, only in the cited
+            # quote -- not in the original bullet, not in any user
+            # answer.
+            "Built the matching algorithm for students while "
+            "optimizing PyTorch models end to end.",
+            "Built a thing.",  # original bullet, no tech
+            "designing, reviewing, and optimizing PyTorch models",  # quote
+            {
+                "scope": "students",
+                "artifact": "the matching algorithm",
+            },
+        )
+        self.assertFalse(ok, f"rewrite slipped through: {reasons}")
+        joined = " ".join(reasons)
+        # Specific reason naming the fabrication mode.
+        self.assertIn("pytorch", joined.lower())
+        # Validator explicitly calls out job-vs-user sourcing.
+        self.assertIn("cited job", joined.lower())
+
+    def test_user_mentioned_pytorch_passes(self):
+        """Negative test for the user's report: if the user MENTIONS
+        PyTorch in their answer (or original bullet), the rewrite
+        using PyTorch must pass. The split into user-supplied vs
+        job-supplied stems means a rewrite-token-stem in
+        user_supplied_stems is grounded -- not flagged as
+        job-only."""
+        ok, reasons = self._check(
+            "Built the matching algorithm using PyTorch for the cohort.",
+            "Built a thing.",
+            "designing, reviewing, and optimizing PyTorch models",
+            {
+                "scope": "students",
+                "artifact": "the matching algorithm using PyTorch",
+            },
+        )
+        self.assertTrue(
+            ok, f"user-grounded tech rejected: {reasons}"
+        )
+
+    def test_sentence_initial_verb_not_flagged(self):
+        """Negative test for the position-filter heuristic: a
+        rewrite that starts with a verb ("Built") should not
+        flag "built" as a fabricated substantive token. The
+        previous validator fired on every verb-led rewrite; this
+        test guards against regressing to that behavior.
+        """
+        ok, reasons = self._check(
+            "Built the matching platform end to end for our cohort.",
+            "Designed a thing.",
+            "build a matching platform",
+            {"scope": "our cohort"},
+        )
+        self.assertTrue(
+            ok, f"verb-led rewrite wrongly rejected: {reasons}"
+        )
+
+
+class CategoryCoverageSubstantiveOverlapTests(unittest.TestCase):
+    """The category-coverage validator's overlap rule uses stems
+    (not exact tokens) and filters out structural / glue words
+    before comparing. This class verifies the v2 behavior:
+
+      - "customer" in answer satisfies "customers" in rewrite
+        (stem match).
+      - Pure structural answers ("the and of") don't count as a
+        fingerprint, but also don't fail the check (soft skip).
+      - Empty answers are a soft skip (not a hard failure) since
+        the UI button guards against this in normal flow.
+
+    These three together closed a UX gap where the validator
+    rejected answers that contained only common-English words,
+    and accepted rewrites that happened to share a single
+    article like "the".
+    """
+
+    def _check(
+        self,
+        rewrite_text,
+        *,
+        questions,
+        answers,
+        skipped=None,
+        category_gaps=None,
+    ):
+        from app.schemas.suggestions import (
+            validate_coach_rewrite_category_coverage,
+        )
+        return validate_coach_rewrite_category_coverage(
+            rewrite_text,
+            questions=questions,
+            answers=answers,
+            skipped_categories=skipped or [],
+            category_gaps=category_gaps,
+        )
+
+    def _q(self, key, category):
+        from app.schemas.suggestions import (
+            CoachQuestion, CoachCategory,
+        )
+        return CoachQuestion(
+            key=key,
+            category=category,
+            label=f"label-{key}",
+        )
+
+    def test_inflection_in_answer_matches_rewrite(self):
+        """'customers' in answer satisfies 'customers' stem in
+        the rewrite (stem-match handles plurals)."""
+        from app.schemas.suggestions import CoachCategory
+        questions = [self._q("scope", CoachCategory.SCOPE)]
+        ok, reasons = self._check(
+            "Built a platform for customers at the cohort.",
+            questions=questions,
+            answers={"scope": "customers at our cohort"},
+        )
+        self.assertTrue(
+            ok, f"inflection rejected: {reasons}"
+        )
+
+    def test_inflection_in_rewrite_matches_answer(self):
+        """'customer' in answer satisfies 'customers' stem in the
+        rewrite -- the stem path goes both ways."""
+        from app.schemas.suggestions import CoachCategory
+        questions = [self._q("scope", CoachCategory.SCOPE)]
+        ok, reasons = self._check(
+            "Built a platform for customers at the cohort.",
+            questions=questions,
+            answers={"scope": "customer"},
+        )
+        self.assertTrue(
+            ok, f"inflection (answer=plural, rewrite=singular) "
+            f"rejected: {reasons}"
+        )
+
+    def test_structural_only_answer_is_soft_skip(self):
+        """A pure-structural answer ('the and of') has no
+        substantive fingerprint. The validator must NOT fail on
+        this -- it's an empty-fingerprint case, not a fabrication.
+        This is the documented behavior: empty / all-structural
+        answers are soft-skipped."""
+        from app.schemas.suggestions import CoachCategory
+        questions = [self._q("scope", CoachCategory.SCOPE)]
+        ok, reasons = self._check(
+            "Built a thing for the cohort.",
+            questions=questions,
+            answers={"scope": "the and of"},
+            category_gaps=[CoachCategory.SCOPE],
+        )
+        self.assertTrue(
+            ok, f"structural-only answer wrongly rejected: "
+            f"{reasons}"
+        )
+
+    def test_empty_answer_is_soft_skip(self):
+        """Empty answer string is a documented soft skip --
+        validator must not reject the rewrite, even when
+        category_gaps requires the category to have content."""
+        from app.schemas.suggestions import CoachCategory
+        questions = [self._q("scope", CoachCategory.SCOPE)]
+        ok, reasons = self._check(
+            "Built a thing.",
+            questions=questions,
+            answers={"scope": ""},  # empty string
+            category_gaps=[CoachCategory.SCOPE],
+        )
+        self.assertTrue(
+            ok, f"empty answer wrongly rejected: {reasons}"
+        )
+
+    def test_substantive_answer_with_structural_match_alone_rejected(
+        self,
+    ):
+        """A substantive answer ('inventory dashboard') that
+        shares ONLY structural / glue words with the rewrite is
+        a real coverage failure -- the LLM didn't echo the
+        user's substantive terms. This is the case stem-based
+        + structural-filter was designed to catch."""
+        from app.schemas.suggestions import CoachCategory
+        questions = [self._q("artifact", CoachCategory.ARTIFACT)]
+        ok, reasons = self._check(
+            "Built a thing end-to-end.",  # nothing about dashboard
+            questions=questions,
+            answers={"artifact": "the inventory dashboard"},
+        )
+        self.assertFalse(
+            ok, "substantive answer must fail when rewrite has "
+            "no overlapping non-structural stems"
+        )
+
+    def test_substantive_overlap_passes(self):
+        from app.schemas.suggestions import CoachCategory
+        questions = [self._q("artifact", CoachCategory.ARTIFACT)]
+        ok, reasons = self._check(
+            "Built the inventory dashboard for ops.",
+            questions=questions,
+            answers={"artifact": "inventory dashboard"},
+        )
+        self.assertTrue(
+            ok, f"substantive overlap rejected: {reasons}"
+        )
+
 
 
 
