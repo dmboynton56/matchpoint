@@ -110,14 +110,44 @@ def push_matrix_to_branch(
                 f"{fetch.returncode} (likely first run, branch not on remote yet)"
             )
 
-        # Create a worktree on the branch. If the branch doesn't exist locally,
-        # create it. If the worktree already exists from a previous failed run,
-        # remove it first.
-        existing = _run(
+# Clean up any stale worktree on this branch from a previous run.
+        # We can't just look for our current tmpdir path (a random suffix
+        # is involved), and we can't do a substring check (per CodeRabbit).
+        # So: parse `git worktree list --porcelain`, find any worktree
+        # whose branch matches, and remove that path.
+        list_cmd = _run(
             ["git", "worktree", "list", "--porcelain"], repo_root
         )
-        if str(worktree) in existing.stdout:
-            _run(["git", "worktree", "remove", "--force", str(worktree)], repo_root)
+        if list_cmd.returncode == 0:
+            current_path = None
+            current_branch = None
+            stale_to_remove: list[str] = []
+            for raw_line in list_cmd.stdout.splitlines():
+                line = raw_line.strip()
+                if line.startswith("worktree "):
+                    current_path = line[len("worktree "):]
+                elif line.startswith("branch "):
+                    current_branch = line[len("branch "):]
+                    if (
+                        current_path is not None
+                        and current_branch == f"refs/heads/{branch}"
+                        and current_path != str(worktree)
+                    ):
+                        stale_to_remove.append(current_path)
+                    current_path = None
+                    current_branch = None
+            for stale_path in stale_to_remove:
+                print(
+                    f"[data-cache] removing stale worktree on {branch}: "
+                    f"{stale_path}"
+                )
+                _run(
+                    ["git", "worktree", "remove", "--force", stale_path],
+                    repo_root,
+                )
+                # If the worktree dir was already gone, prune the
+                # administrative record so git doesn't keep complaining.
+                _run(["git", "worktree", "prune"], repo_root)
 
         # Check if the branch exists locally
         local_exists = _run(
@@ -195,16 +225,22 @@ def push_matrix_to_branch(
             return
 
         # Commit. Use --amend if there's an existing HEAD, else plain commit.
+        # Pass the committer identity via -c so the pipeline doesn't depend
+        # on a globally-configured git user on the host machine.
         head_check = _run(["git", "rev-parse", "--verify", "HEAD"], worktree)
         msg = commit_message or f"embeddings: update matrix ({_utc_timestamp()})"
+        git_identity = [
+            "-c", "user.name=matchpoint-pipeline",
+            "-c", "user.email=pipeline@matchpoint.local",
+        ]
         if head_check.returncode == 0:
             commit = _run(
-                ["git", "commit", "--amend", "--no-edit", "-m", msg],
+                ["git", *git_identity, "commit", "--amend", "--no-edit", "-m", msg],
                 worktree,
             )
         else:
             commit = _run(
-                ["git", "commit", "-m", msg, "--allow-empty"],
+                ["git", *git_identity, "commit", "-m", msg, "--allow-empty"],
                 worktree,
             )
         if commit.returncode != 0:

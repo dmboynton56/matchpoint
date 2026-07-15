@@ -1,11 +1,14 @@
 """
 run_pipeline.py — Daily job pipeline
-  1. Scrape job postings from Greenhouse boards
+  1. Scrape job postings from every configured source
+     (Greenhouse boards + Lever + Ashby + Adzuna). Each source is wrapped
+     in its own try/except so one flaking API never blocks the others.
   2. Fetch existing external_ids from Turso, filter to new-only
   3. Clean & build embedding text for new jobs only
   4. Batch-embed via OpenAI
-  5. Insert new jobs into Turso
+  5. Insert new jobs into Turso (with `source` column populated)
   6. Purge jobs older than 7 days
+  7. Publish the (matrix, ids) artifact to the data-cache branch
 
 The pipeline only writes to the `jobs` table, which now lives on Turso
 (libSQL). All other state (job_matches, profiles, resumes, auth) remains
@@ -19,6 +22,9 @@ from datetime import datetime, timezone, timedelta
 
 try:
     from .scraper100 import scrape_all
+    from .scraper_lever import scrape_all as scrape_lever
+    from .scraper_ashby import scrape_all as scrape_ashby
+    from .sources.adzuna import fetch as fetch_adzuna
     from .cleaning import buildCleanedText
     from .embedding import generate_embeddings_batch
     from .embedding_matrix import (
@@ -29,6 +35,9 @@ try:
     from ..db import turso
 except ImportError:
     from scraper100 import scrape_all
+    from scraper_lever import scrape_all as scrape_lever
+    from scraper_ashby import scrape_all as scrape_ashby
+    from sources.adzuna import fetch as fetch_adzuna
     from cleaning import buildCleanedText
     from embedding import generate_embeddings_batch
     from embedding_matrix import (
@@ -151,7 +160,40 @@ def run_pipeline():
     turso.init_schema()
 
     print("=== STEP 1: Scraping ===")
-    jobs = scrape_all()
+    jobs: list[dict] = []
+
+    # Greenhouse: direct company boards.
+    try:
+        greenhouse_jobs = scrape_all()
+        jobs.extend(greenhouse_jobs)
+        print(f"  Greenhouse: {len(greenhouse_jobs)} jobs")
+    except Exception as e:
+        print(f"  Greenhouse source failed (continuing): {e}")
+
+    # Lever: public job-board API (no key needed). Smaller/earlier-stage
+    # tech companies.
+    try:
+        lever_jobs = scrape_lever()
+        jobs.extend(lever_jobs)
+        print(f"  Lever: {len(lever_jobs)} jobs")
+    except Exception as e:
+        print(f"  Lever source failed (continuing): {e}")
+
+    # Ashby: public job-board API (no key needed). Series A–C startups.
+    try:
+        ashby_jobs = scrape_ashby()
+        jobs.extend(ashby_jobs)
+        print(f"  Ashby: {len(ashby_jobs)} jobs")
+    except Exception as e:
+        print(f"  Ashby source failed (continuing): {e}")
+
+    # Adzuna: configured via ADZUNA_APP_ID + ADZUNA_APP_KEY. No-op if unset.
+    try:
+        adzuna_jobs = fetch_adzuna()
+        jobs.extend(adzuna_jobs)
+        print(f"  Adzuna: {len(adzuna_jobs)} jobs")
+    except Exception as e:
+        print(f"  Adzuna source failed (continuing): {e}")
 
     if not jobs:
         print("No jobs scraped — exiting.")

@@ -863,6 +863,28 @@ async def coach_rewrite(
                 "answers and the cited job. Try rephrasing your "
                 "answers, or pick a different bullet."
             )
+            # Hallucination guard (rules 1-3 of
+            # validate_coach_rewrite_grounding). Restored after the
+            # qualitative-coach v2 migration (fe2a845): the route
+            # previously only logged this, so fabricated numbers,
+            # technologies, or ungrounded citations could slip
+            # through whenever category coverage passed. Run BEFORE
+            # the category-coverage check so fabrication is a hard
+            # stop -- coverage is a retry-able soft failure and its
+            # 502 message is more actionable for the user.
+            #
+            # Surface the validator's specific reason so the user
+            # gets the action hint -- e.g. "PyTorch appears only in
+            # the cited job" beats the generic "rewrite couldn't be
+            # grounded". Reasons may be empty (defensive) so we keep
+            # a generic fallback.
+            detail = (
+                reasons[0]
+                if reasons
+                else "The rewrite couldn't be grounded in your "
+                "answers and the cited job. Try rephrasing your "
+                "answers, or pick a different bullet."
+            )
             raise HTTPException(
                 status_code=502,
                 detail=detail,
