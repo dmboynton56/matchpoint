@@ -149,7 +149,7 @@ export function ProfilePage() {
       const response = await recalculateMyMatches()
       setPreferenceRecalcDialogOpen(false)
       toast.success("Matches recalculated.", { position: "top-center" })
-      navigate("/jobs", { state: { jobs: response.jobs } })
+      navigate("/matches", { state: { jobs: response.jobs } })
     } catch (error) {
       const message =
         error instanceof Error

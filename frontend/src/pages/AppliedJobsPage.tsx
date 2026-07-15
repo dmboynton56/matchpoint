@@ -101,7 +101,7 @@ export function AppliedJobsPage() {
               as applied, or browse your job list.
             </p>
             <Button asChild className="mt-4">
-              <Link to="/jobs">View matches</Link>
+              <Link to="/matches">View matches</Link>
             </Button>
           </div>
         )}

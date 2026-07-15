@@ -2,6 +2,7 @@ import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from app.routes.jobs import router as jobs_router
 from app.routes.matches import router as matches_router
 from app.routes.resumes import router as resumes_router
 from app.routes.suggestions import router as suggestions_router
@@ -25,6 +26,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(jobs_router)
 app.include_router(matches_router)
 app.include_router(resumes_router)
 app.include_router(suggestions_router)

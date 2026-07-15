@@ -229,6 +229,20 @@ def run_pipeline():
         job["description"] = buildCleanedText(job)
         job["last_seen_at"] = now
 
+    print("\n=== STEP 3.5: Deriving browse metadata ===")
+    try:
+        from .job_metadata import derive_browse_metadata
+    except ImportError:
+        from job_metadata import derive_browse_metadata
+
+    for job in new_jobs:
+        metadata = derive_browse_metadata(
+            title=job.get("title") or "",
+            location=job.get("location"),
+            description=job.get("description"),
+        )
+        job.update(metadata)
+
     embedding_texts = [job["description"] for job in new_jobs]
 
     print("\n=== STEP 4: Generating embeddings ===")

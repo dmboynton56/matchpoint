@@ -23,6 +23,7 @@ import json
 import os
 import pathlib
 import threading
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 import httpx
@@ -39,6 +40,36 @@ load_dotenv()
 
 TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "").strip()
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "").strip()
+
+
+def _configured_database_url() -> str:
+    """Read Turso URL at call time so pytest can override before connect."""
+    return os.getenv("TURSO_DATABASE_URL", TURSO_DATABASE_URL).strip()
+
+
+def _configured_auth_token() -> str:
+    return os.getenv("TURSO_AUTH_TOKEN", TURSO_AUTH_TOKEN).strip()
+
+
+def _assert_safe_test_database() -> None:
+    """Refuse remote Turso when the process is running tests.
+
+    Pytest sets PYTEST_CURRENT_TEST per test; conftest sets
+    MATCHPOINT_PYTEST_ISOLATE_TURSO before any app import. Either signal
+    means destructive fixtures must not hit libsql:// URLs from .env.
+    """
+    if not (
+        os.getenv("PYTEST_CURRENT_TEST")
+        or os.getenv("MATCHPOINT_PYTEST_ISOLATE_TURSO")
+    ):
+        return
+    url = _configured_database_url()
+    if url and url != ":memory:":
+        raise RuntimeError(
+            "Refusing to open remote Turso during tests "
+            f"({url!r}). Tests must use TURSO_DATABASE_URL=':memory:' "
+            "(see backend/tests/conftest.py)."
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -79,6 +110,40 @@ CREATE INDEX IF NOT EXISTS idx_jobs_last_seen_at ON jobs (last_seen_at);
 # is created by init_schema() after the column-add migration step below,
 # so it always runs against a table that has the column it indexes.
 
+BROWSE_EXTRA_COLUMNS: list[tuple[str, str]] = [
+    ("summary", "TEXT"),
+    ("summary_source_hash", "TEXT"),
+    ("summary_model", "TEXT"),
+    ("summary_generated_at", "TEXT"),
+    ("workplace_type", "TEXT"),
+    ("pay_min", "INTEGER"),
+    ("pay_max", "INTEGER"),
+    ("pay_currency", "TEXT"),
+    ("experience_level", "TEXT"),
+    ("job_type", "TEXT"),
+]
+
+BROWSE_INDEXES_SQL = [
+    "CREATE INDEX IF NOT EXISTS idx_jobs_posted_at ON jobs (posted_at)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_workplace_type ON jobs (workplace_type)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_experience_level ON jobs (experience_level)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_job_type ON jobs (job_type)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_pay_min ON jobs (pay_min)",
+]
+
+DATE_POSTED_WINDOW_DAYS: dict[str, int] = {
+    "24h": 1,
+    "3d": 3,
+    "7d": 7,
+    "14d": 14,
+    "30d": 30,
+}
+
+BROWSE_LIST_COLUMNS = (
+    "id, title, company, location, apply_url, posted_at, summary, "
+    "job_type, experience_level, workplace_type, pay_min, pay_max, pay_currency"
+)
+
 
 # -----------------------------------------------------------------------------
 # Client lifecycle (singleton)
@@ -97,25 +162,29 @@ def _require_libsql() -> None:
 
 def _open_client() -> "libsql.Connection":  # type: ignore[type-arg]
     _require_libsql()
-    if not TURSO_DATABASE_URL:
+    _assert_safe_test_database()
+    database_url = _configured_database_url()
+    auth_token = _configured_auth_token()
+    if not database_url:
         raise RuntimeError(
             "TURSO_DATABASE_URL is not set. Add it to backend/.env "
             "(e.g. libsql://matchpoint-jobs-<org>.turso.io)."
         )
-    if TURSO_DATABASE_URL == ":memory:":
+    if database_url == ":memory:":
         # Local smoke-test path; bypass auth token.
         return libsql.connect(":memory:")
-    if not TURSO_AUTH_TOKEN:
+    if not auth_token:
         raise RuntimeError(
             "TURSO_AUTH_TOKEN is not set. Add it to backend/.env (or Vercel/GH "
             "secrets for the daily pipeline)."
         )
-    return libsql.connect(TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+    return libsql.connect(database_url, auth_token=auth_token)
 
 
 def get_client() -> "libsql.Connection":  # type: ignore[type-arg]
     """Return the process-wide Turso connection, opening it on first use."""
     global _client
+    _assert_safe_test_database()
     if _client is not None:
         return _client
     with _client_lock:
@@ -195,6 +264,7 @@ def init_schema(client: "libsql.Connection | None" = None) -> None:  # type: ign
         # fall back to the legacy always-apply path.
         warm = False
     if warm:
+        _ensure_browse_columns(conn)
         return
     # libsql's HTTP transport (Hrana) rejects multi-statement payloads, so
     # apply each DDL statement individually. Wrap each in try/except so a
@@ -287,7 +357,19 @@ def init_schema(client: "libsql.Connection | None" = None) -> None:  # type: ign
             "[init_schema] migration: added `source` column to existing jobs "
             "table (defaulted to 'greenhouse' for legacy rows)"
         )
+    _ensure_browse_columns(conn)
     conn.commit()
+
+
+def _ensure_browse_columns(conn) -> None:
+    """Idempotently add browse/search columns and indexes."""
+    cursor = conn.execute("PRAGMA table_info(jobs)")
+    existing = {row[1] for row in cursor.fetchall()}
+    for name, col_type in BROWSE_EXTRA_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {col_type}")
+    for stmt in BROWSE_INDEXES_SQL:
+        conn.execute(stmt)
 
 
 def _schema_is_warm(conn) -> bool:
@@ -382,8 +464,10 @@ def upsert_jobs(jobs: list[dict]) -> int:
     sql = (
         "INSERT INTO jobs "
         "(external_id, company, title, description, location, posted_at, "
-        "apply_url, source, embedding, last_seen_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "apply_url, source, embedding, last_seen_at, summary, summary_source_hash, "
+        "summary_model, summary_generated_at, workplace_type, pay_min, pay_max, "
+        "pay_currency, experience_level, job_type) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(external_id) DO UPDATE SET "
         "company=excluded.company, "
         "title=excluded.title, "
@@ -393,7 +477,21 @@ def upsert_jobs(jobs: list[dict]) -> int:
         "apply_url=excluded.apply_url, "
         "source=excluded.source, "
         "embedding=excluded.embedding, "
-        "last_seen_at=excluded.last_seen_at"
+        "last_seen_at=excluded.last_seen_at, "
+        "summary=CASE WHEN excluded.summary IS NOT NULL THEN excluded.summary "
+        "ELSE jobs.summary END, "
+        "summary_source_hash=CASE WHEN excluded.summary_source_hash IS NOT NULL "
+        "THEN excluded.summary_source_hash ELSE jobs.summary_source_hash END, "
+        "summary_model=CASE WHEN excluded.summary_model IS NOT NULL "
+        "THEN excluded.summary_model ELSE jobs.summary_model END, "
+        "summary_generated_at=CASE WHEN excluded.summary_generated_at IS NOT NULL "
+        "THEN excluded.summary_generated_at ELSE jobs.summary_generated_at END, "
+        "workplace_type=excluded.workplace_type, "
+        "pay_min=excluded.pay_min, "
+        "pay_max=excluded.pay_max, "
+        "pay_currency=excluded.pay_currency, "
+        "experience_level=excluded.experience_level, "
+        "job_type=excluded.job_type"
     )
     for job in jobs:
         external_id = job.get("external_id")
@@ -415,6 +513,16 @@ def upsert_jobs(jobs: list[dict]) -> int:
                 source,
                 _embedding_to_text(job.get("embedding")),
                 job.get("last_seen_at"),
+                job.get("summary"),
+                job.get("summary_source_hash"),
+                job.get("summary_model"),
+                job.get("summary_generated_at"),
+                job.get("workplace_type"),
+                job.get("pay_min"),
+                job.get("pay_max"),
+                job.get("pay_currency"),
+                job.get("experience_level"),
+                job.get("job_type"),
             ],
         )
         sent += 1
@@ -450,6 +558,294 @@ def purge_older_than(cutoff_iso: str) -> int:
     )
     conn.commit()
     return int(getattr(cursor, "rowcount", 0) or 0)
+
+
+def _experience_level_filter_sql(levels: list[str]) -> tuple[str, list[Any]]:
+    from app.services.job_metadata import experience_level_filter_sql
+
+    return experience_level_filter_sql(levels)
+
+
+def _job_type_filter_sql(types: list[str]) -> tuple[str, list[Any]]:
+    from app.services.job_metadata import job_type_filter_sql
+
+    return job_type_filter_sql(types)
+
+
+def _workplace_type_filter_sql(types: list[str]) -> tuple[str, list[Any]]:
+    from app.services.job_metadata import workplace_type_filter_sql
+
+    return workplace_type_filter_sql(types)
+
+
+def _build_search_where(
+    *,
+    keywords: str = "",
+    locations: list[str] | None = None,
+    experience_levels: list[str] | None = None,
+    job_types: list[str] | None = None,
+    workplace_types: list[str] | None = None,
+    pay_min: int | None = None,
+    pay_max: int | None = None,
+    date_posted: str = "any",
+) -> tuple[str, list[Any], list[str]]:
+    """Return (WHERE clause, params, keyword terms) for browse search."""
+    conditions = ["1=1"]
+    params: list[Any] = []
+    haystack = (
+        "LOWER(COALESCE(title, '') || ' ' || COALESCE(company, '') || ' ' "
+        "|| COALESCE(description, ''))"
+    )
+
+    terms = [term for term in keywords.strip().lower().split() if term]
+    for term in terms:
+        conditions.append(f"{haystack} LIKE ?")
+        params.append(f"%{term}%")
+
+    if locations:
+        loc_parts = []
+        for location in locations:
+            loc_parts.append("LOWER(COALESCE(location, '')) LIKE ?")
+            params.append(f"%{location.lower()}%")
+        conditions.append(f"({' OR '.join(loc_parts)})")
+
+    if experience_levels:
+        fragment, level_params = _experience_level_filter_sql(experience_levels)
+        conditions.append(fragment)
+        params.extend(level_params)
+
+    if job_types:
+        fragment, type_params = _job_type_filter_sql(job_types)
+        conditions.append(fragment)
+        params.extend(type_params)
+
+    if workplace_types:
+        fragment, workplace_params = _workplace_type_filter_sql(workplace_types)
+        conditions.append(fragment)
+        params.extend(workplace_params)
+
+    if pay_min is not None:
+        conditions.append("(pay_max IS NULL OR pay_max >= ?)")
+        params.append(pay_min)
+    if pay_max is not None:
+        conditions.append("(pay_min IS NULL OR pay_min <= ?)")
+        params.append(pay_max)
+
+    if date_posted != "any" and date_posted in DATE_POSTED_WINDOW_DAYS:
+        days = DATE_POSTED_WINDOW_DAYS[date_posted]
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=days)
+        ).isoformat()
+        conditions.append("(posted_at IS NULL OR posted_at >= ?)")
+        params.append(cutoff)
+
+    return " AND ".join(conditions), params, terms
+
+
+def _build_search_order(
+    *,
+    sort: str,
+    terms: list[str],
+    haystack: str,
+) -> tuple[str, list[Any]]:
+    """Return (ORDER BY clause, extra params for relevance scoring)."""
+    if sort == "newest" or (sort == "relevance" and not terms):
+        return (
+            "CASE WHEN posted_at IS NULL THEN 0 ELSE 1 END DESC, posted_at DESC",
+            [],
+        )
+
+    score_parts: list[str] = []
+    order_params: list[Any] = []
+    for term in terms:
+        pattern = f"%{term}%"
+        score_parts.append(
+            "(CASE WHEN LOWER(COALESCE(title, '')) LIKE ? THEN 3 ELSE 0 END)"
+        )
+        order_params.append(pattern)
+        score_parts.append(
+            "(CASE WHEN LOWER(COALESCE(company, '')) LIKE ? THEN 2 ELSE 0 END)"
+        )
+        order_params.append(pattern)
+        score_parts.append(f"(CASE WHEN {haystack} LIKE ? THEN 1 ELSE 0 END)")
+        order_params.append(pattern)
+
+    relevance_expr = " + ".join(score_parts) if score_parts else "0"
+    return (
+        f"({relevance_expr}) DESC, "
+        "CASE WHEN posted_at IS NULL THEN 0 ELSE 1 END DESC, posted_at DESC",
+        order_params,
+    )
+
+
+def search_jobs(
+    *,
+    keywords: str = "",
+    locations: list[str] | None = None,
+    experience_levels: list[str] | None = None,
+    job_types: list[str] | None = None,
+    workplace_types: list[str] | None = None,
+    pay_min: int | None = None,
+    pay_max: int | None = None,
+    date_posted: str = "any",
+    sort: str = "relevance",
+    page: int = 1,
+    page_size: int = 20,
+) -> tuple[list[dict], int]:
+    """Browse/search jobs with filters. Returns (rows, total_count)."""
+    page = max(1, page)
+    page_size = max(1, min(page_size, 100))
+    offset = (page - 1) * page_size
+
+    where, params, terms = _build_search_where(
+        keywords=keywords,
+        locations=locations,
+        experience_levels=experience_levels,
+        job_types=job_types,
+        workplace_types=workplace_types,
+        pay_min=pay_min,
+        pay_max=pay_max,
+        date_posted=date_posted,
+    )
+    haystack = (
+        "LOWER(COALESCE(title, '') || ' ' || COALESCE(company, '') || ' ' "
+        "|| COALESCE(description, ''))"
+    )
+    order_by, order_params = _build_search_order(
+        sort=sort, terms=terms, haystack=haystack
+    )
+
+    conn = get_client()
+    count_cursor = conn.execute(
+        f"SELECT COUNT(*) FROM jobs WHERE {where}", params
+    )
+    total = int(count_cursor.fetchone()[0])
+
+    select_params = [*params, *order_params, page_size, offset]
+    cursor = conn.execute(
+        f"SELECT {BROWSE_LIST_COLUMNS} FROM jobs WHERE {where} "
+        f"ORDER BY {order_by} LIMIT ? OFFSET ?",
+        select_params,
+    )
+    return _fetchall_dicts(cursor), total
+
+
+def update_job_summary(
+    job_id: str,
+    *,
+    summary: str,
+    source_hash: str,
+    model: str,
+    generated_at: str,
+) -> None:
+    conn = get_client()
+    conn.execute(
+        "UPDATE jobs SET summary = ?, summary_source_hash = ?, "
+        "summary_model = ?, summary_generated_at = ? WHERE id = ?",
+        [summary, source_hash, model, generated_at, job_id],
+    )
+    conn.commit()
+
+
+def batch_update_job_summaries(updates: list[tuple[str, dict]]) -> None:
+    """Update generated summaries for many jobs with a single commit."""
+    if not updates:
+        return
+    conn = get_client()
+    sql = (
+        "UPDATE jobs SET summary = ?, summary_source_hash = ?, "
+        "summary_model = ?, summary_generated_at = ? WHERE id = ?"
+    )
+    for job_id, summary_data in updates:
+        conn.execute(
+            sql,
+            [
+                summary_data["summary"],
+                summary_data["source_hash"],
+                summary_data["model"],
+                summary_data["generated_at"],
+                job_id,
+            ],
+        )
+    conn.commit()
+
+
+def fetch_job_text(job_ids: list[str]) -> list[dict]:
+    """Return title/location/description text for browse-row enrichment."""
+    if not job_ids:
+        return []
+    conn = get_client()
+    placeholders = ",".join(["?"] * len(job_ids))
+    cursor = conn.execute(
+        "SELECT id, title, company, location, description "
+        f"FROM jobs WHERE id IN ({placeholders})",
+        list(job_ids),
+    )
+    return _fetchall_dicts(cursor)
+
+
+def fetch_jobs_for_metadata_backfill(*, limit: int = 100) -> list[dict]:
+    conn = get_client()
+    cursor = conn.execute(
+        "SELECT id, title, location, description FROM jobs "
+        "WHERE workplace_type IS NULL LIMIT ?",
+        [limit],
+    )
+    return _fetchall_dicts(cursor)
+
+
+def fetch_jobs_for_summary_backfill(*, limit: int = 100) -> list[dict]:
+    conn = get_client()
+    cursor = conn.execute(
+        "SELECT id, title, company, description FROM jobs "
+        "WHERE (summary IS NULL OR summary = '') AND description IS NOT NULL "
+        "LIMIT ?",
+        [limit],
+    )
+    return _fetchall_dicts(cursor)
+
+
+def update_job_metadata(job_id: str, metadata: dict) -> None:
+    conn = get_client()
+    conn.execute(
+        "UPDATE jobs SET workplace_type = ?, pay_min = ?, pay_max = ?, "
+        "pay_currency = ?, experience_level = ?, job_type = ? WHERE id = ?",
+        [
+            metadata.get("workplace_type"),
+            metadata.get("pay_min"),
+            metadata.get("pay_max"),
+            metadata.get("pay_currency"),
+            metadata.get("experience_level"),
+            metadata.get("job_type"),
+            job_id,
+        ],
+    )
+    conn.commit()
+
+
+def batch_update_job_metadata(updates: list[tuple[str, dict]]) -> None:
+    """Update browse metadata for many jobs in one transaction."""
+    if not updates:
+        return
+    conn = get_client()
+    sql = (
+        "UPDATE jobs SET workplace_type = ?, pay_min = ?, pay_max = ?, "
+        "pay_currency = ?, experience_level = ?, job_type = ? WHERE id = ?"
+    )
+    for job_id, metadata in updates:
+        conn.execute(
+            sql,
+            [
+                metadata.get("workplace_type"),
+                metadata.get("pay_min"),
+                metadata.get("pay_max"),
+                metadata.get("pay_currency"),
+                metadata.get("experience_level"),
+                metadata.get("job_type"),
+                job_id,
+            ],
+        )
+    conn.commit()
 
 
 # -----------------------------------------------------------------------------
@@ -799,6 +1195,14 @@ __all__ = [
     "upsert_jobs",
     "update_last_seen",
     "purge_older_than",
+    "search_jobs",
+    "update_job_summary",
+    "batch_update_job_summaries",
+    "fetch_job_text",
+    "fetch_jobs_for_metadata_backfill",
+    "fetch_jobs_for_summary_backfill",
+    "update_job_metadata",
+    "batch_update_job_metadata",
     "vector_search",
     "fetch_full_jobs",
     "close",
