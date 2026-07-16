@@ -6,7 +6,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from app.services.job_facts import extract_job_facts
+from .job_facts import extract_job_facts
 
 METADATA_FIELDS = (
     "workplace_type",
