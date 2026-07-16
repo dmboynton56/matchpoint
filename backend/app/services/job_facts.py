@@ -1,7 +1,7 @@
 import re
 
-from app.schemas.ranking import JobFacts, SalaryFacts
-from app.services.cleaning import normalizeText, resolve_job_location, stripHTML
+from ..schemas.ranking import JobFacts, SalaryFacts
+from .cleaning import normalizeText, resolve_job_location, stripHTML
 
 
 WORK_MODE_PATTERN = re.compile(
