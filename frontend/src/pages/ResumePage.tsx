@@ -85,7 +85,7 @@ export function ResumePage() {
       const response = await uploadResume(file)
       await refreshResume()
       toast.success("Resume updated.", { position: "top-center" })
-      navigate("/jobs", { state: { jobs: response.jobs } })
+      navigate("/matches", { state: { jobs: response.jobs } })
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Resume upload failed."

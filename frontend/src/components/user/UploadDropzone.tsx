@@ -36,7 +36,7 @@ const UploadDropzone = ({
         toast.success("Resume uploaded successfully")
         onUploadSuccess?.(response)
         if (navigateAfterUpload) {
-          navigate("/jobs", { state: { jobs: response.jobs } })
+          navigate("/matches", { state: { jobs: response.jobs } })
         }
         return {
           status: "success",

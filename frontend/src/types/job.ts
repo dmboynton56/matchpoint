@@ -9,6 +9,26 @@ export type MatchNote = {
   is_warning: boolean
 }
 
+/** Employment type for a job listing (browse/search results). */
+export type JobType =
+  | "full_time"
+  | "part_time"
+  | "contract"
+  | "internship"
+  | "temporary"
+
+/** Seniority level for a job listing (browse/search results). */
+export type ExperienceLevel =
+  | "internship"
+  | "entry"
+  | "mid"
+  | "senior"
+  | "lead"
+  | "executive"
+
+/** Where the work happens for a job listing (browse/search results). */
+export type WorkplaceType = "remote" | "hybrid" | "on_site"
+
 export type JobMatch = {
   id: string
   /** `job_matches.id` when loaded from the matches API. */
@@ -41,11 +61,52 @@ export type JobMatch = {
   match_highlights?: string[] | null
   match_concerns?: string[] | null
   job_facts?: Record<string, unknown> | null
+  /**
+   * Browse/search listing metadata below — not populated by the matches API
+   * today. Optional + nullable so `JobListingCard` keeps working for both
+   * personalized matches and the `/jobs` browse results once the backend
+   * `GET /jobs/search` endpoint starts returning these fields.
+   */
+  job_type?: JobType | null
+  experience_level?: ExperienceLevel | null
+  workplace_type?: WorkplaceType | null
+  pay_min?: number | null
+  pay_max?: number | null
+  pay_currency?: string | null
+  posted_at?: string | null
 }
 
 /** UI-only extras for landing previews — not returned by the API. */
 export type JobListing = JobMatch & {
   tags?: string[]
+}
+
+/**
+ * Job row from Turso / `GET /jobs/search` — catalog fields only, no match
+ * metadata. Mirrors `fetch_full_jobs()` in backend/app/db/turso.py.
+ */
+export type JobBrowseListing = {
+  id: string
+  title: string
+  company: string
+  location: string | null
+  apply_url: string | null
+  /** Cached short summary for browse cards; full description omitted from list API. */
+  summary?: string | null
+  description?: string | null
+  posted_at: string | null
+  job_type?: JobType | null
+  experience_level?: ExperienceLevel | null
+  workplace_type?: WorkplaceType | null
+  pay_min?: number | null
+  pay_max?: number | null
+  pay_currency?: string | null
+}
+
+export function hasBrowseApplyUrl(
+  job: JobBrowseListing
+): job is JobBrowseListing & { apply_url: string } {
+  return typeof job.apply_url === "string" && job.apply_url.length > 0
 }
 
 export type MatchScoreTier = "excellent" | "good" | "fair" | "low"
@@ -83,6 +144,87 @@ export function matchScoreAccentClass(tier: MatchScoreTier): string {
 export function formatMatchScore(score: number): string {
   const percent = Math.round(score * 100)
   return `${percent}% match`
+}
+
+const JOB_TYPE_LABELS: Record<JobType, string> = {
+  full_time: "Full-time",
+  part_time: "Part-time",
+  contract: "Contract",
+  internship: "Internship",
+  temporary: "Temporary",
+}
+
+const EXPERIENCE_LEVEL_LABELS: Record<ExperienceLevel, string> = {
+  internship: "Internship",
+  entry: "Entry level",
+  mid: "Mid level",
+  senior: "Senior",
+  lead: "Lead",
+  executive: "Executive",
+}
+
+const WORKPLACE_TYPE_LABELS: Record<WorkplaceType, string> = {
+  remote: "Remote",
+  hybrid: "Hybrid",
+  on_site: "On-site",
+}
+
+export function formatJobType(value: JobType): string {
+  return JOB_TYPE_LABELS[value]
+}
+
+export function formatExperienceLevel(value: ExperienceLevel): string {
+  return EXPERIENCE_LEVEL_LABELS[value]
+}
+
+export function formatWorkplaceType(value: WorkplaceType): string {
+  return WORKPLACE_TYPE_LABELS[value]
+}
+
+/** e.g. "$110k – $140k", "$110k+", "Up to $140k", or null when both bounds are missing. */
+export function formatPayRange(
+  min: number | null | undefined,
+  max: number | null | undefined,
+  currency: string | null | undefined = "USD"
+): string | null {
+  if (min == null && max == null) return null
+
+  const symbol = currency === "USD" || !currency ? "$" : `${currency} `
+  const formatAmount = (value: number) =>
+    value >= 1000 ? `${symbol}${Math.round(value / 1000)}k` : `${symbol}${value}`
+
+  if (min != null && max != null) {
+    return min === max
+      ? formatAmount(min)
+      : `${formatAmount(min)} – ${formatAmount(max)}`
+  }
+  if (min != null) return `${formatAmount(min)}+`
+  return `Up to ${formatAmount(max!)}`
+}
+
+/** e.g. "Posted 3 days ago", "Posted today". Returns null when unparseable. */
+function startOfLocalDay(date: Date): Date {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate())
+}
+
+export function formatPostedAt(postedAt: string | null | undefined): string | null {
+  if (!postedAt) return null
+  const postedDate = new Date(postedAt)
+  if (Number.isNaN(postedDate.getTime())) return null
+
+  const today = startOfLocalDay(new Date())
+  const postedDay = startOfLocalDay(postedDate)
+  const diffDays = Math.floor(
+    (today.getTime() - postedDay.getTime()) / (1000 * 60 * 60 * 24)
+  )
+
+  if (diffDays <= 0) return "Posted today"
+  if (diffDays === 1) return "Posted 1 day ago"
+  if (diffDays < 30) return `Posted ${diffDays} days ago`
+  const diffMonths = Math.floor(diffDays / 30)
+  if (diffMonths < 12) return `Posted ${diffMonths} month${diffMonths === 1 ? "" : "s"} ago`
+  const diffYears = Math.floor(diffMonths / 12)
+  return `Posted ${diffYears} year${diffYears === 1 ? "" : "s"} ago`
 }
 
 export function hasApplyUrl(

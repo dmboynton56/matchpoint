@@ -70,7 +70,7 @@ const SignupLoginCard = () => {
           `Successfully ${isLogin ? "logged in" : "signed up"}. Redirecting to dashboard...`,
           { position: "top-center" }
         )
-        navigate("/jobs", { replace: true })
+        navigate("/matches", { replace: true })
       }
     } catch (err) {
       const message =

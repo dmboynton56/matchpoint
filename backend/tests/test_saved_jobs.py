@@ -1,8 +1,4 @@
-import os
 from copy import deepcopy
-
-os.environ["TURSO_DATABASE_URL"] = ":memory:"
-os.environ["TURSO_AUTH_TOKEN"] = ""
 
 import pytest
 from fastapi import HTTPException

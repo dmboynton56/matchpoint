@@ -11,6 +11,10 @@ const JobsPage = lazy(() =>
   import("@/pages/JobsPage").then((m) => ({ default: m.JobsPage }))
 )
 
+const MatchesPage = lazy(() =>
+  import("@/pages/MatchesPage").then((m) => ({ default: m.MatchesPage }))
+)
+
 const ProfilePage = lazy(() =>
   import("@/pages/ProfilePage").then((m) => ({ default: m.ProfilePage }))
 )
@@ -33,6 +37,7 @@ export function App() {
       <Routes>
         <Route path="/" element={<LandingPage />} />
         <Route path="/jobs" element={<JobsPage />} />
+        <Route path="/matches" element={<MatchesPage />} />
         <Route
           path="/profile"
           element={

@@ -8,6 +8,28 @@ WORK_MODE_PATTERN = re.compile(
     r"\b(remote|hybrid|in-office|on-site|onsite)\b", re.IGNORECASE
 )
 MONEY_PATTERN = re.compile(r"\$\s*\d[\d,]*(?:\.\d+)?\s*[kK]?")
+# "$120,000 - $150,000", "$120k–$150k", "$120-150k", "$120,000 to 150,000"
+MONEY_RANGE_PATTERN = re.compile(
+    r"\$\s*\d[\d,]*(?:\.\d+)?\s*[kK]?\s*(?:-|–|—|\bto\b|\bthrough\b)\s*"
+    r"\$?\s*\d[\d,]*(?:\.\d+)?\s*[kK]?",
+    re.IGNORECASE,
+)
+RANGE_SEPARATOR_PATTERN = re.compile(
+    r"\s*(?:-|–|—|\bto\b|\bthrough\b)\s*", re.IGNORECASE
+)
+SALARY_KEYWORDS = (
+    "salary",
+    "base pay",
+    "compensation",
+    "pay range",
+    "pay rate",
+    "per hour",
+    "an hour",
+    "/hr",
+    "hourly",
+    "per year",
+    "annually",
+)
 CITY_STATE_PATTERN = re.compile(
     r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*,\s*[A-Z]{2})\b"
 )
@@ -103,17 +125,54 @@ def _salary_period(sentence: str) -> str:
     return "annual"
 
 
+def _plausible_amounts(amounts: list[int], period: str) -> list[int]:
+    if period == "hourly":
+        return [amount for amount in amounts if 7 <= amount <= 500]
+    return [amount for amount in amounts if 10_000 <= amount <= 1_500_000]
+
+
+def _parse_range_amounts(range_text: str) -> list[int]:
+    """Parse both sides of a money range, expanding "$120-150k" shorthand."""
+    parts = RANGE_SEPARATOR_PATTERN.split(range_text, maxsplit=1)
+    if len(parts) != 2:
+        return []
+    low_raw, high_raw = (part.strip() for part in parts)
+    low = _parse_money(low_raw)
+    high = _parse_money(high_raw)
+    if low is None or high is None:
+        return []
+    if high_raw.lower().endswith("k") and not low_raw.lower().endswith("k"):
+        if low < 1000:
+            low *= 1000
+    elif low < 1000 and high >= 1000:
+        low *= 1000
+    return [low, high]
+
+
+def _build_salary(amounts: list[int], sentence: str) -> SalaryFacts | None:
+    period = _salary_period(sentence)
+    plausible = _plausible_amounts(amounts, period)
+    if not plausible:
+        return None
+    return SalaryFacts(
+        minimum=min(plausible),
+        maximum=max(plausible),
+        currency="USD",
+        period=period,
+        evidence=normalizeText(sentence)[:240],
+    )
+
+
 def extract_salary_facts(description_text: str) -> SalaryFacts | None:
     if not description_text:
         return None
 
     sentences = re.split(r"(?<=[.!?])\s+", description_text)
+
+    # Pass 1: sentences that talk about pay explicitly — any $ amounts count.
     for sentence in sentences:
         lowered = sentence.lower()
-        if not any(
-            marker in lowered
-            for marker in ("salary", "base pay", "compensation", "pay range")
-        ):
+        if not any(marker in lowered for marker in SALARY_KEYWORDS):
             continue
 
         amounts = [
@@ -124,14 +183,20 @@ def extract_salary_facts(description_text: str) -> SalaryFacts | None:
         if not parsed_amounts:
             continue
 
-        evidence = normalizeText(sentence)[:240]
-        return SalaryFacts(
-            minimum=min(parsed_amounts),
-            maximum=max(parsed_amounts),
-            currency="USD",
-            period=_salary_period(sentence),
-            evidence=evidence,
-        )
+        salary = _build_salary(parsed_amounts, sentence)
+        if salary:
+            return salary
+
+    # Pass 2: explicit money ranges anywhere ("$120,000 - $150,000"),
+    # even without a salary keyword nearby.
+    for sentence in sentences:
+        for match in MONEY_RANGE_PATTERN.finditer(sentence):
+            amounts = _parse_range_amounts(match.group(0))
+            if not amounts:
+                continue
+            salary = _build_salary(amounts, sentence)
+            if salary:
+                return salary
 
     return None
 
