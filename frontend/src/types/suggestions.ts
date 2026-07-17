@@ -118,6 +118,28 @@ export interface CoachBullet {
   questions: CoachQuestion[]
 }
 
+/**
+ * A WEAK bullet the start validator discarded and the reason why.
+ * Mirrors backend `DroppedCoachBullet`. Surfaced in
+ * `CoachStartResponse.dropped` so the client can show a
+ * "couldn't ground N bullets" hint. `reason` is a short stable
+ * string — currently `citation_job_id_unknown`. Typed as
+ * `string` so the backend can add new reasons without a
+ * frontend schema migration.
+ *
+ * Note: paraphrased / fabricated citation quotes are NOT
+ * surfaced here. The start-side citation-grounding policy is
+ * intentionally permissive for the experimental bullet-coach
+ * feature (see backend `validate_coach_citation_grounding`).
+ */
+export interface DroppedCoachBullet {
+  bullet_id: string
+  citation_job_id: string
+  citation_quote: string
+  original_text: string
+  reason: string
+}
+
 export interface CoachStartResponse {
   /** Session identifier the UI sends back to /coach/rewrite. */
   session_id: string
@@ -125,6 +147,9 @@ export interface CoachStartResponse {
   skills: Suggestion[]
   /** Up to 5 bullets -- mix of STRONG and WEAK. */
   bullets: CoachBullet[]
+  /** WEAK bullets the start validator discarded. Empty when every
+   * bullet the LLM produced grounded cleanly. See DroppedCoachBullet. */
+  dropped: DroppedCoachBullet[]
 }
 
 /**

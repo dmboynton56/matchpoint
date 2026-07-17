@@ -423,12 +423,11 @@ def _record_coach_drops(
     `reason` is a stable short string from the documented set on
     `DroppedCoachBullet` -- used both for the WARN log and for the
     `reason` field on each appended `DroppedCoachBullet`. Called
-    twice in `/coach/start`: once after the citation_job_id
-    membership check (reason="citation_job_id_unknown") and once
-    after `validate_coach_citation_grounding`
-    (reason="citation_quote_not_substring"). Both checks must run
-    against the same starting list, so the caller passes two
-    separate `before` snapshots.
+    once in `/coach/start` after the citation_job_id membership
+    check (reason="citation_job_id_unknown"). Substring-based
+    drops are intentionally not tracked -- the start-side policy
+    accepts paraphrased quotes (see
+    `validate_coach_citation_grounding`'s docstring).
     """
     after_ids = {b.bullet_id for b in after}
     before_by_id = {b.bullet_id: b for b in before}
@@ -547,37 +546,32 @@ async def coach_start(
             or b.citation_job_id in known_job_ids
         ]
 
-        # Drop any bullets whose citation_quote isn't a substring of
-        # the cited job's description. The LLM sometimes fabricates
-        # the quote (often echoing the user's answer text rather than
-        # pulling from the job). Catching it here prevents the user
-        # from investing time in a bullet whose rewrite will fail
-        # with a confusing 502 error.
-        #
-        # Make the drop loud: capture each dropped bullet_id before
-        # the validator runs, then emit a WARN per drop and surface
-        # the set on the response so the paraphrase / fabrication
-        # rate is measurable from logs and telemetry. Previously
-        # this was silent -- the user just saw fewer bullets and
-        # the developer had no way to count how often the LLM was
-        # paraphrasing.
-        before_substring = list(bullets)
+        # Citation grounding at start is intentionally permissive:
+        # `validate_coach_citation_grounding` is a no-op under the
+        # experimental bullet-coach policy (see its docstring --
+        # paraphrased / lightly fabricated quotes are accepted in
+        # exchange for not 502-ing the user mid-workshop). The
+        # call is kept as a defense-in-depth seam so re-tightening
+        # the policy only requires re-enabling the check inside
+        # that function, not rewiring this route.
         bullets = validate_coach_citation_grounding(
             bullets, job_descriptions
         )
 
+        # Track only membership drops (citation_job_id_unknown).
+        # Substring-based drops are intentionally NOT tracked:
+        # the policy above accepts paraphrased quotes, so a
+        # `citation_quote_not_substring` reason would never fire
+        # and would be misleading telemetry. If the policy flips,
+        # re-introduce a `before_substring` snapshot here and a
+        # second `_record_coach_drops` call -- see git history for
+        # the pre-relaxed wiring.
         dropped_bullets: list[DroppedCoachBullet] = []
         _record_coach_drops(
             before_membership,
             bullets,
             dropped_bullets,
             reason="citation_job_id_unknown",
-        )
-        _record_coach_drops(
-            before_substring,
-            bullets,
-            dropped_bullets,
-            reason="citation_quote_not_substring",
         )
         # Server-side safety net: gpt-4o-mini over-classifies
         # STRONG for thin bullets, leaving the user with no

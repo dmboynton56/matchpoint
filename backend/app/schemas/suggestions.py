@@ -784,10 +784,36 @@ class CoachBullet(BaseModel):
     # override when its judgment differs (e.g. it sees a gap the
     # boolean reflection missed).
     category_gaps: list[CoachCategory] = Field(default_factory=list)
-    # Where this bullet sits in the candidate's resume. Optional —
-    # the parser can fail on unusual resume formats, in which case
-    # the route layer falls back to a generic "Resume" location.
-    location: BulletLocation | None = None
+    # Where this bullet sits in the candidate's resume. Optional in
+    # the schema so the LLM can omit it (the parser can fail on
+    # unusual resume formats, the LLM can miss the field), but every
+    # CoachBullet instance MUST carry a non-null location by the
+    # time it reaches the frontend — the UI reads `location.section`
+    # directly and would crash on null. The default_factory below
+    # supplies the fallback for the omitted case; the field
+    # validator backfills the same fallback when the LLM explicitly
+    # sends `location: null` (pydantic v2 does NOT run field
+    # validators on default values, only on provided ones).
+    location: BulletLocation | None = Field(
+        default_factory=lambda: BulletLocation(section="Resume")
+    )
+
+    @field_validator("location", mode="after")
+    @classmethod
+    def _default_location(cls, v: BulletLocation | None) -> BulletLocation:
+        """Backfill a generic 'Resume' location when the LLM omits it.
+
+        Pydantic accepts `None` for an `Optional` field, so the
+        LLM's null survives deserialization. This validator runs
+        after construction and replaces null with a fallback so
+        the instance invariant (`location is not None`) holds.
+        Future code that wants to differentiate "unknown" from
+        "section=Resume" can switch on `entry_title is None` —
+        the fallback leaves `entry_title` as None.
+        """
+        if v is None:
+            return BulletLocation(section="Resume")
+        return v
 
     @field_validator("category_gaps", mode="before")
     @classmethod
@@ -827,30 +853,27 @@ class DroppedCoachBullet(BaseModel):
     """A WEAK bullet the start validator discarded and the reason why.
 
     Surfaced in `CoachStartResponse.dropped` so the client can show
-    "we couldn't ground N of your bullets" and so the paraphrase /
-    fabrication rate is measurable from logs without relying on
-    silent-drop. Added when the LLM produces a `citation_quote`
-    that isn't a substring of the cited job's description -- the
-    classic "the LLM echoed the user's answer text back instead of
-    pulling from the JD" failure mode.
+    "we couldn't ground N of your bullets" and so the rate of
+    hallucinated job IDs is observable in logs without relying on
+    silent-drop.
 
     The `reason` field is a short stable string so future
     validators can add new reasons (e.g. `original_text_not_in_
-    resume`) without a schema migration. Current values:
-      - "citation_quote_not_substring": the LLM's quote didn't
-        match the cited job's description after normalization.
-        Classic paraphrasing failure -- the LLM echoed the user's
-        answer text or produced a plausible-looking but fabricated
-        excerpt instead of copying verbatim from the JD.
+    resume`) without a schema migration. Current value:
       - "citation_job_id_unknown": the LLM picked a
         `citation_job_id` that wasn't in the user's top matches,
         so no description snapshot exists to ground against.
-        Without this drop the bullet would survive start
-        (validate_coach_citation_grounding's "missing
-        description" branch keeps best-effort, designed for the
-        legitimate "job purged from Turso" case) and then fail
-        at rewrite because the route coerces the missing
+        Without this drop the bullet would survive start and then
+        fail at rewrite because the route coerces the missing
         description to "" and the substring check returns False.
+
+    Note: paraphrased or fabricated citation quotes are NOT
+    recorded here. The start-side citation-grounding policy is
+    intentionally permissive for the experimental bullet-coach
+    feature -- see `validate_coach_citation_grounding`'s
+    docstring. The historical `citation_quote_not_substring`
+    reason is reserved (not currently emitted) so the schema
+    doesn't need a migration if the policy is later re-tightened.
     """
 
     bullet_id: str = Field(max_length=64)
