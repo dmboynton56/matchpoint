@@ -1614,22 +1614,116 @@ def validate_coach_rewrite_grounding(
     # to substantive_rewrite so they get checked.
 
     # Tech-name shapes detected in the rewrite's RAW text (before
-    # tokenization lowercases and destroys casing signals):
-    #   - CamelCase like "FastAPI", "JavaScript", "PyTorch",
-    #     "TypeScript" -- leading cap followed by at least one
-    #     more [A-Z][a-z]+ chunk.
-    #
-    # We intentionally do NOT scan for single-word Capitalized
-    # shapes ("Kafka", "Rust", "Python"). The naive regex would
-    # also match mid-sentence English past-tense verbs
-    # ("Developed", "Designed", "Implemented") and there's no
-    # word-list-free way to distinguish the two -- earlier we
-    # caught "Developed" in legit rewrites as fabricated. Defense
-    # in depth: a fabricated single-word tech name used to satisfy
-    # a category-gap answer would also fail the category-coverage
-    # validator at the OTHER layer (which requires each
-    # non-skipped answer's words to appear in the rewrite).
+    # tokenization lowercases and destroys casing signals). Three
+    # shapes are covered, each with a distinct regex so the
+    # comments and safelist stay specific:
+    #   - CamelCase: "PyTorch", "JavaScript", "TypeScript" -- two
+    #     or more [Cap][a-z+] chunks back-to-back.
+    #   - Acronym-suffixed: "FastAPI", "PostgreSQL", "VueJS",
+    #     "NodeJS" -- a [Cap][a-z+] chunk followed by 2+
+    #     consecutive caps (no lowercase to break the run).
+    #     Distinct word shape from CamelCase -- the acronym
+    #     tail has no lowercase letters so the CamelCase regex
+    #     misses it.
+    #   - Single-word Capitalized: "Kafka", "Python", "Rust" -- a
+    #     single [Cap][a-z+] chunk. This shape is filtered
+    #     through _ENGLISH_PAST_PARTICIPLES below to avoid the
+    #     false positive where "Developed", "Designed", "Built"
+    #     in legit rewrites were flagged as fabricated tech. The
+    #     safelist covers the resume-bullet past-participles the
+    #     LLM most commonly leads sentences with; add to it when
+    #     a new false-positive verb surfaces.
     _CAMELCASE_RE = re.compile(r"\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b")
+    _ACRONYM_SUFFIXED_RE = re.compile(r"\b[A-Z][a-z]+[A-Z]{2,}\b")
+    _SINGLE_WORD_CAP_RE = re.compile(r"\b[A-Z][a-z]{1,}\b")
+    _ENGLISH_PAST_PARTICIPLES: frozenset[str] = frozenset({
+        # Common resume-bullet past-participles the LLM leads
+        # sentences with. Lowercased -- matched against
+        # `.lower()` of the regex capture, so case is normalized
+        # before lookup.
+        "built", "created", "designed", "developed", "implemented",
+        "led", "owned", "shipped", "managed", "supported", "improved",
+        "deployed", "integrated", "migrated", "optimized", "refactored",
+        "scaled", "tested", "automated", "configured", "debugged",
+        "documented", "engineered", "established", "launched",
+        "monitored", "orchestrated", "oversaw", "planned", "produced",
+        "reviewed", "streamlined", "trained", "translated", "tuned",
+        "validated", "wrote", "architected", "authored", "coordinated",
+        "delivered", "drafted", "enabled", "executed", "facilitated",
+        "founded", "generated", "mentored", "organized", "pioneered",
+        "programmed", "prototyped", "published", "researched",
+        "resolved", "restructured", "supervised", "triaged",
+        # User-reported 502: "Ensured [the X]..." at the start of a
+        # sentence led to a fabrication flag because "ensured"
+        # wasn't in the safelist above and never appeared in
+        # {original, citation_quote, answers}. Adding it keeps
+        # rule 2 quiet for this common resume verb. To revert:
+        # drop "ensured" from this set and the failure mode
+        # returns for rewrites that open with "Ensured ".
+        # NOTE: under stem-based matching below, "ensured" also
+        # covers "ensures" / "ensuring" automatically.
+        "ensured",
+        # Base forms for the two irregular verbs in the safelist
+        # whose past participle ("built" / "led") stems
+        # differently from their present-tense forms ("build" /
+        # "lead") under the tiny _stem suffix-stripper. Without
+        # these, "Building the X..." and "Leading the X..." at
+        # the start of a rewrite would still trip rule 2. Each
+        # base form covers -s/-es/-ing inflections of the same
+        # verb through the same stem-match path.
+        "build", "lead",
+    })
+
+    # Pre-computed stem set: derived from _ENGLISH_PAST_PARTICIPLES
+    # via the tiny `_stem` suffix-stripper. Lets a single
+    # safelist entry per verb catch its inflections without
+    # having to enumerate every form. "created" in the safelist
+    # covers "creates" / "creating" (both stem to "creat"); a
+    # second 502 on "Creating the X..." (user-reported just
+    # after the "ensured" fix) is what motivated this set.
+    # The match is a SECONDARY filter after exact-match against
+    # the safelist -- exact-match is cheaper and reads more
+    # clearly in the diff, so it stays.
+    _ENGLISH_PAST_PARTICIPLE_STEMS: frozenset[str] = frozenset(
+        _stem(p) for p in _ENGLISH_PAST_PARTICIPLES
+    )
+
+    def _detect_tech_tokens(text: str) -> set[str]:
+        """Lowercased tech-name tokens detected in raw text.
+
+        Runs all three regexes (CamelCase, acronym-suffixed,
+        single-word Capitalized) and applies the English-verb
+        safelist to single-word matches so resume past-participles
+        like "Developed" / "Designed" don't get flagged as tech.
+        Returns the union so the rewrite-side substance check can
+        see tech names whose casing signal was lost when _tokens
+        lowercased everything.
+        """
+        found: set[str] = set()
+        for m in _CAMELCASE_RE.finditer(text):
+            found.add(m.group(0).lower())
+        for m in _ACRONYM_SUFFIXED_RE.finditer(text):
+            found.add(m.group(0).lower())
+        for m in _SINGLE_WORD_CAP_RE.finditer(text):
+            token_lower = m.group(0).lower()
+            if token_lower in _ENGLISH_PAST_PARTICIPLES:
+                continue
+            # Stem-match fallback: lets one past-participle
+            # safelist entry (e.g. "created") cover inflections
+            # the LLM also leads sentences with ("creates",
+            # "creating"). The tiny suffix-stripping _stem
+            # collapses -ed/-ing/-es to the same root, so this
+            # is a tight match against real English verbs --
+            # tech names whose stem happens to share an
+            # -ed/-ing/-es suffix with a safelist entry are
+            # not a real risk in this codebase (no "Merged"
+            # past-participle entry means "Merging" still fails
+            # the check, etc.). See _ENGLISH_PAST_PARTICIPLE_STEMS
+            # for the pre-computed set.
+            if _stem(token_lower) in _ENGLISH_PAST_PARTICIPLE_STEMS:
+                continue
+            found.add(token_lower)
+        return found
 
     def _is_substantive(token: str, titlecase_source: set[str]) -> bool:
         if any(ch.isdigit() for ch in token):
@@ -1656,21 +1750,20 @@ def validate_coach_rewrite_grounding(
         tok for tok in rewrite_tokens
         if _is_substantive(tok, set())
     }
-    # Add CamelCase tech names from the rewrite's RAW text (not
-    # the lowercased tokens). This recovers the "PyTorch",
-    # "FastAPI", "JavaScript" cases that the lowercased substance
-    # check misses. Without this, the LLM could append
-    # "optimizing PyTorch models" at the end of a rewrite, source
-    # that only in the cited job quote (not the user's answers),
-    # and the validator wouldn't notice -- a fabrication the user
-    # can't catch from the UI. Mid-sentence Capitalized verbs
-    # ("Developed", "Designed") are NOT caught here -- by design;
-    # see the comment on _CAMELCASE_RE above.
-    rewrite_camelcase: set[str] = {
-        m.group(0).lower()
-        for m in _CAMELCASE_RE.finditer(rewritten_text)
-    }
-    substantive_rewrite |= rewrite_camelcase
+    # Add tech-name tokens from the rewrite's RAW text (before
+    # tokenization lowercases and destroys casing signals). This
+    # recovers the "PyTorch", "FastAPI", "PostgreSQL", "Kafka",
+    # "Python" cases the lowercased substance check misses.
+    # Without this scan, the LLM could append "optimizing PyTorch
+    # models" or "writing Python services" at the end of a
+    # rewrite, sourced only in the cited job quote (not the
+    # user's answers), and the validator wouldn't notice -- a
+    # fabrication the user can't catch from the UI. English
+    # past-participles ("Developed", "Designed", "Built") are
+    # filtered by the safelist above so we don't regress the
+    # false-positive class that originally justified excluding
+    # single-word detection.
+    substantive_rewrite |= _detect_tech_tokens(rewritten_text)
 
     # Build the source-side allow-set using the same detection rule
     # over raw source text. Without this, a source token like

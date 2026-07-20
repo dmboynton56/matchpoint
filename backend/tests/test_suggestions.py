@@ -1206,6 +1206,84 @@ class SubstantiveGroundingTests(unittest.TestCase):
             ok, f"verb-led rewrite wrongly rejected: {reasons}"
         )
 
+    def test_sentence_initial_ensured_not_flagged(self):
+        """Regression for the user-reported 502 on `/coach/rewrite`:
+        the LLM occasionally opens a rewrite with "Ensured [the
+        team]..." -- a common resume-bullet verb. "Ensured" matched
+        the single-word-Cap regex, fell through to rule 2's
+        source-bucket check, and was flagged as fabricated because
+        it didn't appear in {original, citation_quote, answers}.
+        Now in `_ENGLISH_PAST_PARTICIPLES` so it never reaches the
+        substantive token set. To revert: drop "ensured" from the
+        safelist and this test fails.
+        """
+        ok, reasons = self._check(
+            "Ensured the cohort had a working pipeline.",
+            "Built a thing.",
+            "Looking for someone to design pipelines.",
+            {"scope": "the cohort"},
+        )
+        fabrication_reasons = [
+            r for r in reasons
+            if "substantive claims" in r
+        ]
+        self.assertEqual(
+            fabrication_reasons,
+            [],
+            f"rewrite opening with 'Ensured' should not trigger "
+            f"rule 2's substantive-claims fabrication flag; "
+            f"got reasons: {reasons}",
+        )
+
+    def test_sentence_initial_inflected_verbs_filtered_by_stem_match(self):
+        """Regression: the user reported a 502 with 'Creating'
+        after the 'ensured' fix landed. Per-verb additions to the
+        safelist are whack-a-mole -- the LLM uses many verb
+        forms. The matcher now does a STEM-MATCH fallback against
+        `_ENGLISH_PAST_PARTICIPLE_STEMS` so a single past-participle
+        entry (e.g. 'created') catches 'creates', 'created', and
+        'creating' (all stem to 'creat'). This test pins the
+        systemic coverage for the three common inflections across
+        several verbs the LLM commonly leads sentences with.
+        To revert: drop the `_ENGLISH_PAST_PARTICIPLE_STEMS`
+        block + the stem-match check in `_detect_tech_tokens`,
+        and these failures come back.
+        """
+        cases = [
+            ("Creating", "Created the matching platform"),
+            ("Manages", "Managed the auth layer end to end"),
+            ("Designing", "Designed the data model from scratch"),
+            ("Deploys", "Deployed the service to production"),
+            ("Testing", "Tested the pipeline under load"),
+            ("Building", "Built the API in 2 weeks"),
+            ("Leading", "Led the migration off the legacy system"),
+        ]
+        for led_verb, source_phrase in cases:
+            with self.subTest(verb=led_verb):
+                # Construct a rewrite that opens with the verb
+                # form, and a source set where the past-participle
+                # variant is sourced but the led-verb form isn't.
+                rewrite = f"{led_verb} the {source_phrase.lower()}."
+                ok, reasons = self._check(
+                    rewrite,
+                    source_phrase + ".",
+                    "Looking for someone to do work.",
+                    {"scope": "the team"},
+                )
+                fabrication_reasons = [
+                    r for r in reasons
+                    if "substantive claims" in r
+                ]
+                self.assertEqual(
+                    fabrication_reasons,
+                    [],
+                    f"rewrite opening with '{led_verb}' should "
+                    f"not trigger rule 2's substantive-claims "
+                    f"fabrication flag (stem of {led_verb!r} "
+                    f"should match the past-participle entry in "
+                    f"the safelist). Got reasons: {reasons}",
+                )
+
 
 class CategoryCoverageSubstantiveOverlapTests(unittest.TestCase):
     """The category-coverage validator's overlap rule uses stems
@@ -1402,49 +1480,58 @@ class CitationGroundingTests(unittest.TestCase):
             citation_quote=citation_quote,
         )
 
-    def test_keeps_bullet_under_relaxed_grounding_policy(self):
-        # Originally this validator dropped WEAK bullets whose
-        # citation_quote didn't ground against the cited job's
-        # description. After the experimental-feature policy
-        # change (slight hallucinations accepted for bullet-coach),
-        # the validator keeps WEAK bullets with valid descriptions
-        # regardless of quote content. Pins the relaxed policy so
-        # future re-tightening is a deliberate choice, not an
-        # accident.
-        from app.schemas.suggestions import validate_coach_citation_grounding
-
-        bullet = self._weak(
-            citation_job_id="job-aaa",
-            citation_quote="frontier AI labs to train LLMs",
+    def test_unrelated_quote_fails_grounding_helpers(self):
+        # Grounding-behavior test for the lower-level helpers.
+        # An unrelated quote ("frontier AI labs to train LLMs")
+        # against a backend-engineer JD with no AI-lab language
+        # must NOT pass the strict-substring check, must score 0
+        # on the relaxed stem-overlap ratio, and must therefore
+        # fail `_citation_is_grounded` at any sane threshold. The
+        # route-level validator currently keeps such bullets as a
+        # deliberate experimental-feature policy, so this test
+        # pins the helpers themselves so they remain correct --
+        # any future re-tightening of the route to drop
+        # fabricated quotes will reuse these helpers and they
+        # must still do the right thing.
+        from app.schemas.suggestions import (
+            _quote_is_substring,
+            _citation_grounding_score,
+            _citation_is_grounded,
         )
-        job_descriptions = {
-            "job-aaa": "Looking for an engineer to design REST APIs.",
-        }
-        accepted = validate_coach_citation_grounding(
-            [bullet], job_descriptions
+
+        quote = "frontier AI labs to train LLMs"
+        description = "Looking for an engineer to design REST APIs."
+
+        self.assertFalse(
+            _quote_is_substring(quote, description),
+            "unrelated quote should not substring-match the JD",
         )
         self.assertEqual(
-            [b.bullet_id for b in accepted],
-            ["b1"],
-            "WEAK bullets with valid descriptions are kept under "
-            "the relaxed policy even when the quote is unrelated "
-            "to the description (the experimental-feature trade-off)",
+            _citation_grounding_score(quote, description),
+            0.0,
+            "unrelated quote should score 0 on the stem-overlap "
+            "ratio (no shared content vocabulary)",
+        )
+        self.assertFalse(
+            _citation_is_grounded(quote, description),
+            "unrelated quote must not be considered grounded by "
+            "the relaxed check -- the helper behaves correctly "
+            "even though the route currently chooses not to gate "
+            "on it",
         )
 
-    def test_keeps_bullet_with_real_quote(self):
-        from app.schemas.suggestions import validate_coach_citation_grounding
+    def test_real_quote_passes_substring_helper(self):
+        from app.schemas.suggestions import _quote_is_substring
 
-        bullet = self._weak(
-            citation_job_id="job-aaa",
-            citation_quote="Built a job matching platform",
+        quote = "Built a job matching platform"
+        description = (
+            "Looking for someone. Built a job matching platform "
+            "for internal use."
         )
-        job_descriptions = {
-            "job-aaa": "Looking for someone. Built a job matching platform for internal use.",
-        }
-        accepted = validate_coach_citation_grounding(
-            [bullet], job_descriptions
+        self.assertTrue(
+            _quote_is_substring(quote, description),
+            "verbatim substring of the JD should pass the helper",
         )
-        self.assertEqual([b.bullet_id for b in accepted], ["b1"])
 
     def test_strong_bullets_skip_the_check(self):
         # STRONG bullets don't go through /coach/rewrite, so a
@@ -1481,32 +1568,40 @@ class CitationGroundingTests(unittest.TestCase):
         )
         self.assertEqual([b.bullet_id for b in accepted], ["b1"])
 
-    def test_quote_matching_is_case_insensitive_and_whitespace_tolerant(self):
+    def test_normalized_substring_tolerates_case_and_whitespace(self):
         # _quote_is_substring normalizes both sides (lowercase +
-        # whitespace-collapsed). Verify the check tolerates the
-        # common case where the LLM reformatted the quote slightly.
-        from app.schemas.suggestions import validate_coach_citation_grounding
+        # whitespace-collapsed) before the substring check, so
+        # a quote with extra spaces and uppercase letters
+        # still matches a JD that uses the canonical form.
+        from app.schemas.suggestions import _quote_is_substring
 
-        bullet = self._weak(
-            citation_job_id="job-aaa",
-            citation_quote="Built  a  JOB matching platform",  # extra spaces + caps
+        # Original case + spacing on the JD side; LLM-returned
+        # quote with extra spaces and uppercase on the other.
+        quote = "Built  a  JOB matching platform"
+        description = "Built a job matching platform for internal use."
+        self.assertTrue(
+            _quote_is_substring(quote, description),
+            "case + whitespace differences should not block the "
+            "substring check",
         )
-        job_descriptions = {
-            "job-aaa": "Built a job matching platform for internal use.",
-        }
-        accepted = validate_coach_citation_grounding(
-            [bullet], job_descriptions
+        # And the inverse direction is also normalized: quote in
+        # the canonical form, description with extra spaces.
+        quote2 = "Built a job matching platform"
+        description2 = "Built  a  job  matching platform for internal use."
+        self.assertTrue(
+            _quote_is_substring(quote2, description2),
+            "extra whitespace on the JD side should not block "
+            "either -- normalization is symmetric",
         )
-        self.assertEqual([b.bullet_id for b in accepted], ["b1"])
 
-    def test_quote_matching_handles_unicode_and_trailing_punct(self):
+    def test_normalized_substring_tolerates_unicode_and_trailing_punct(self):
         """Regression for the user's reported 502: same quote
         logic at start and rewrite time should produce the same
         result. When it didn't, the underlying cause was that
         _normalize didn't handle either of two legitimate
         variations:
 
-        (1) Unicode: the LLM produces smart quotes (\u2019, \u201C)
+        (1) Unicode: the LLM produces smart quotes (\u2019, \u201c)
             and em-dashes, while job descriptions scraped from
             career sites often have straight quotes and hyphens.
             Same visual text, different code points -- substring
@@ -1519,154 +1614,122 @@ class CitationGroundingTests(unittest.TestCase):
         Both are now folded by _normalize's NFKC + side-punct
         strip before substring matching.
         """
-        from app.schemas.suggestions import validate_coach_citation_grounding
+        from app.schemas.suggestions import _quote_is_substring
 
         # (1) Smart-quote + em-dash in the quote; straight-quote +
-        # ASCII hyphens in the source. The validator's _normalize
-        # applies NFKC + manual em-dash replacement to make these
-        # comparable. (No pre-normalization here -- that would
-        # bypass the code path under test.)
-        bullet = self._weak(
-            citation_job_id="job-aaa",
-            # Curly quotes around "we build", em-dash at midpoint,
-            # trailing period.
-            citation_quote="we \u201cbuild\u201d with care \u2014 the team.",
-        )
-        job_descriptions = {
-            # Plain ASCII quotes, two-hyphen em-dash equivalent,
-            # no trailing period.
-            "job-aaa": 'we "build" with care -- the team',
-        }
-        accepted = validate_coach_citation_grounding(
-            [bullet], job_descriptions
-        )
-        self.assertEqual(
-            [b.bullet_id for b in accepted],
-            ["b1"],
+        # ASCII hyphens in the source. _normalize applies NFKC +
+        # manual em-dash replacement to make these comparable.
+        quote_unicode = "we \u201cbuild\u201d with care \u2014 the team."
+        description_ascii = 'we "build" with care -- the team'
+        self.assertTrue(
+            _quote_is_substring(quote_unicode, description_ascii),
             "smart quotes + em-dash should match straight quotes "
             "+ ASCII hyphens via NFKC + manual punctuation fold",
+        )
+        # Inverse: ASCII quote with curly-quote + em-dash source.
+        self.assertTrue(
+            _quote_is_substring(
+                'we "build" with care -- the team',
+                "we \u201cbuild\u201d with care \u2014 the team.",
+            ),
+            "normalization is symmetric across both sides",
         )
 
         # (2) Trailing period in the quote; no period at the
         # matching point in source. Side-punct strip handles this
         # without affecting the rest of the string.
-        bullet2 = self._weak(
-            citation_job_id="job-bbb",
-            citation_quote="Built a job matching platform.",
+        quote_with_period = "Built a job matching platform."
+        description_without_period = (
+            "Looking for engineers. Built a job matching platform "
+            "for internal use."
         )
-        job_descriptions2 = {
-            "job-bbb": "Looking for engineers. Built a job matching platform for internal use.",
-        }
-        accepted2 = validate_coach_citation_grounding(
-            [bullet2], job_descriptions2
-        )
-        self.assertEqual(
-            [b.bullet_id for b in accepted2],
-            ["b1"],
+        self.assertTrue(
+            _quote_is_substring(quote_with_period, description_without_period),
             "trailing-period mismatch should not fail the substring check",
         )
 
-    def test_paraphrased_quote_with_shared_vocabulary_passes(self):
-        """Under the relaxed policy (citation grounding check
-        disabled at /coach/start), WEAK bullets with paraphrased
-        quotes are kept. The score helper is still available for
-        diagnostic logging + future re-tightening, so this test
-        also pins that it returns a sensible non-zero score for a
-        genuine paraphrase.
+    def test_paraphrase_with_high_overlap_passes_relaxed_helper(self):
+        """A quote that paraphrases the JD but preserves its
+        vocabulary should score well on the relaxed stem-overlap
+        ratio and pass `_citation_is_grounded` at the current
+        CITATION_GROUNDING_THRESHOLD. Pins the helper behavior so
+        future threshold changes don't silently regress the
+        relaxed-policy path.
         """
         from app.schemas.suggestions import (
-            validate_coach_citation_grounding,
             _citation_grounding_score,
+            _citation_is_grounded,
+            CITATION_GROUNDING_THRESHOLD,
         )
 
-        # Quote is a paraphrase of the JD's substance but isn't a
-        # verbatim substring. The score helper should still return
-        # a high value (it's used for diagnostic logs).
-        bullet = self._weak(
-            citation_job_id="job-aaa",
-            citation_quote=(
-                "Annotated and validated machine learning datasets "
-                "while maintaining high labeling accuracy and "
-                "adherence to QA guidelines across hundreds of "
-                "annotations."
-            ),
+        # Quote paraphrases the JD's substance but isn't a verbatim
+        # substring. Stem overlap is high.
+        quote = (
+            "Annotated and validated machine learning datasets "
+            "while maintaining high labeling accuracy and "
+            "adherence to QA guidelines across hundreds of "
+            "annotations."
         )
-        job_descriptions = {
-            "job-aaa": (
-                "We are hiring an ML Data Operations specialist to "
-                "annotate and validate machine learning datasets. "
-                "You will maintain high labeling accuracy, adhere to "
-                "QA guidelines, and review annotations across "
-                "hundreds of examples per day."
-            ),
-        }
-        score = _citation_grounding_score(
-            bullet.citation_quote, job_descriptions["job-aaa"]
+        description = (
+            "We are hiring an ML Data Operations specialist to "
+            "annotate and validate machine learning datasets. "
+            "You will maintain high labeling accuracy, adhere to "
+            "QA guidelines, and review annotations across "
+            "hundreds of examples per day."
         )
-        self.assertGreater(
+        score = _citation_grounding_score(quote, description)
+        self.assertGreaterEqual(
             score,
-            0.5,
-            f"sanity: the score helper should return a high value "
-            f"for a genuine paraphrase (got {score:.2f}); if this "
-            "drops, the diagnostic log on /coach/rewrite loses "
-            "signal for debugging future grounding issues",
+            CITATION_GROUNDING_THRESHOLD,
+            f"sanity: a genuine paraphrase should score at or "
+            f"above the relaxed threshold (got {score:.2f}, "
+            f"threshold {CITATION_GROUNDING_THRESHOLD:.2f}). "
+            f"If this drops, the diagnostic log on /coach/rewrite "
+            f"loses signal and the helpers no longer distinguish "
+            f"paraphrase from fabrication.",
         )
-        accepted = validate_coach_citation_grounding(
-            [bullet], job_descriptions
-        )
-        self.assertEqual(
-            [b.bullet_id for b in accepted],
-            ["b1"],
-            "paraphrased bullet is kept under the relaxed policy",
+        self.assertTrue(
+            _citation_is_grounded(quote, description),
+            "high-overlap paraphrase should pass the relaxed "
+            "check at the configured threshold",
         )
 
-    def test_fabricated_quote_kept_under_relaxed_policy(self):
-        """Under the relaxed policy, WEAK bullets with quotes that
-        share ZERO vocabulary with the cited JD's description are
-        kept (the experimental-feature trade-off: slight
-        hallucinations accepted in exchange for not 502-ing the
-        user mid-workshop). The score helper still returns 0 for
-        such quotes -- that's diagnostic, not gating.
+    def test_fabricated_quote_fails_relaxed_helper(self):
+        """A quote fabricated from thin air (no shared content
+        vocabulary with the JD) must score 0 on the relaxed
+        stem-overlap ratio and therefore fail
+        `_citation_is_grounded` at any sane threshold. The
+        route-level validator currently keeps such bullets as a
+        deliberate experimental-feature policy, so this test pins
+        the helper behavior -- any future re-tightening of the
+        route to drop fabricated quotes will reuse these helpers
+        and they must still do the right thing.
         """
         from app.schemas.suggestions import (
-            validate_coach_citation_grounding,
             _citation_grounding_score,
+            _citation_is_grounded,
         )
 
         # Quote is fabricated from thin air -- no shared content
         # vocabulary with the JD.
-        bullet = self._weak(
-            citation_job_id="job-aaa",
-            citation_quote=(
-                "Frontier AI labs to train LLMs on cutting edge "
-                "research with novel architectures."
-            ),
+        quote = (
+            "Frontier AI labs to train LLMs on cutting edge "
+            "research with novel architectures."
         )
-        job_descriptions = {
-            "job-aaa": (
-                "We are hiring a backend engineer to design REST "
-                "APIs and maintain PostgreSQL databases."
-            ),
-        }
-        score = _citation_grounding_score(
-            bullet.citation_quote, job_descriptions["job-aaa"]
+        description = (
+            "We are hiring a backend engineer to design REST "
+            "APIs and maintain PostgreSQL databases."
         )
         self.assertEqual(
-            score,
+            _citation_grounding_score(quote, description),
             0.0,
-            "sanity: score helper should return 0 for a quote "
-            "with no shared content stems; this is the diagnostic "
-            "value you'd see in the rewrite log",
+            "fabricated quote must score 0 (no shared content stems)",
         )
-        accepted = validate_coach_citation_grounding(
-            [bullet], job_descriptions
-        )
-        self.assertEqual(
-            [b.bullet_id for b in accepted],
-            ["b1"],
-            "fabricated quote is still kept under the relaxed "
-            "policy -- the user accepted this trade-off for the "
-            "experimental bullet-coach feature",
+        self.assertFalse(
+            _citation_is_grounded(quote, description),
+            "fabricated quote must not be considered grounded by "
+            "the relaxed check -- the helper stays correct even "
+            "though the route currently chooses not to gate on it",
         )
 
 

@@ -779,10 +779,29 @@ async def coach_rewrite(
         effective_skipped_categories: list[CoachCategory] = (
             list(skipped_categories) + auto_skipped
         )
+        # Filter answers to only those whose categories are NOT
+        # in effective_skipped_categories. The LLM prompt omits
+        # skipped-category answers entirely (see the loop in
+        # `_build_rewrite_user_message`) so the validator should
+        # be consistent with what the LLM saw, and rule 4's
+        # job-only attribution shouldn't surface terms the user
+        # explicitly opted out of. `category_for_key` stores
+        # category names as strings (already `.value`-coerced at
+        # build time above), so compare against the string form
+        # of effective_skipped_categories for a clean set check.
+        effective_skipped_str: set[str] = {
+            c.value if hasattr(c, "value") else str(c)
+            for c in effective_skipped_categories
+        }
+        non_skipped_answers: dict[str, str] = {
+            key: value
+            for key, value in request.answers.items()
+            if category_for_key.get(key) not in effective_skipped_str
+        }
 
         rewritten_text = rewrite_bullet(
             original_text=bullet.get("original_text", ""),
-            answers=request.answers,
+            answers=non_skipped_answers,
             citation_quote=citation_quote,
             skipped_categories=[
                 c.value if hasattr(c, "value") else c
@@ -794,7 +813,7 @@ async def coach_rewrite(
         is_grounded, reasons = validate_coach_rewrite_grounding(
             rewritten_text,
             original_text=bullet.get("original_text", ""),
-            answers=request.answers,
+            answers=non_skipped_answers,
             citation_quote=citation_quote,
             citation_description=citation_description,
         )
@@ -834,28 +853,6 @@ async def coach_rewrite(
                 quote_substring_match,
                 quote_grounding_score,
                 citation_quote,
-            )
-            # Hallucination guard (rules 1-3 of
-            # validate_coach_rewrite_grounding). Restored after the
-            # qualitative-coach v2 migration (fe2a845): the route
-            # previously only logged this, so fabricated numbers,
-            # technologies, or ungrounded citations could slip
-            # through whenever category coverage passed. Run BEFORE
-            # the category-coverage check so fabrication is a hard
-            # stop -- coverage is a retry-able soft failure and its
-            # 502 message is more actionable for the user.
-            #
-            # Surface the validator's specific reason so the user
-            # gets the action hint -- e.g. "PyTorch appears only in
-            # the cited job" beats the generic "rewrite couldn't be
-            # grounded". Reasons may be empty (defensive) so we keep
-            # a generic fallback.
-            detail = (
-                reasons[0]
-                if reasons
-                else "The rewrite couldn't be grounded in your "
-                "answers and the cited job. Try rephrasing your "
-                "answers, or pick a different bullet."
             )
             # Hallucination guard (rules 1-3 of
             # validate_coach_rewrite_grounding). Restored after the
