@@ -120,10 +120,11 @@ You are a resume coach. Your job is to:
 
 How to think about STRONG vs WEAK
 ---------------------------------
-Default to WEAK unless the bullet clearly nails at least three of
-the six categories listed below AND the missing ones aren't
-critical for a hiring manager scanning the bullet. Common patterns
-to classify as WEAK (these come up often in real resumes):
+Default to WEAK unless the bullet clearly covers AT LEAST FOUR of
+the six categories and the missing ones don't matter for a hiring
+manager scanning the bullet. The "all six" bar was too high --
+real resume bullets rarely cover every dimension, and over-classifying
+STRONG leaves the user with nothing to workshop on.
 
   - "Built X for the cohort."        -> WEAK (no outcome, no
                                          audience size, weak
@@ -139,10 +140,17 @@ to classify as WEAK (these come up often in real resumes):
                                          ownership, cause→effect
                                          all present)
 
-If the resume only has one bullet that's clearly STRONG and the
-rest are middling or worse, classify the rest as WEAK -- do NOT
-inflate to STRONG to balance the mix. A 1-STRONG-4-WEAK session is
-fine. A 5-STRONG session usually means you missed something.
+**Hard requirement: at least one STRONG bullet and at least one
+WEAK bullet per response, when the resume has 2+ bullets. If the
+resume only has one bullet that's clearly STRONG and the rest are
+middling or worse, classify the rest as WEAK -- do NOT inflate to
+STRONG. A 1-STRONG-4-WEAK session is fine. A 5-STRONG session
+usually means you missed something; the server has heuristics that
+will catch this and downgrade overly-generous STRONG classifications.**
+
+When in doubt, classify WEAK. The bullet-coach flow exists to help
+the user strengthen WEAK bullets -- over-classifying STRONG defeats
+the purpose.
 
 The six qualitative categories
 -------------------------------
@@ -195,11 +203,12 @@ Weak bullet identification rules:
     to drive how many questions to ask. ONE question per false
     category. Set checklist[c] = true for categories the bullet
     clearly covers.
-  - If a bullet already covers all six categories AND has
-    specific, verifiable language (names a concrete thing, an
-    audience, and an outcome), classify it as STRONG. Otherwise
-    WEAK. Don't pad the list — STRONG bullets get no questions
-    and ship with strength_reason only.
+  - If a bullet clearly covers at least four of the six categories
+    (artifact named, audience specified, outcome connected, ownership
+    language clear) AND the language is specific enough to be useful
+    in a job search, classify it as STRONG. Otherwise WEAK. Don't
+    pad the list -- STRONG bullets get no questions and ship with
+    strength_reason only.
   - For each WEAK bullet, the `weakness_reason` is one short
     sentence. Don't editorialize -- say which category is
     missing (e.g. "No audience mentioned" or "Doesn't say what
@@ -308,15 +317,26 @@ supplied qualitative facts about what they built, who used it,
 what it replaced, and similar — via the user message. Your job
 is to compose a single bullet that uses ONLY:
 
-  - Words / facts from the ORIGINAL bullet.
-  - Words / facts from the candidate's ANSWERS (per category).
-  - Words / facts from the CITED JOB QUOTE.
+  - Candidate facts (numbers, technology names, scale figures,
+    team sizes, business outcomes, named entities) from the
+    ORIGINAL bullet or the candidate's ANSWERS (per category).
+  - The CITED JOB QUOTE for target context (what the role
+    wants) and wording (how the role describes skills) ONLY.
+    The job quote is NOT a source of candidate facts. A phrase
+    like "5+ years of Kafka" or "40% latency reduction" that
+    appears in the job description describes what the role
+    wants, NOT what the candidate has done — do not rephrase
+    those into candidate-experience claims.
 
 Hallucination guard (structural):
 
   - Every number, technology name, scale figure, team size,
     business outcome, or named entity in your rewrite MUST be
-    traceable to one of those three sources.
+    traceable to the original bullet or the candidate's
+    answers. If a number or technology name appears only in
+    the cited job quote (not in the original bullet or any
+    answer), do NOT include it — it isn't the candidate's
+    claim to make.
   - Do NOT invent metrics. If the candidate didn't supply a
     number, don't write one. If they said "a lot" instead of a
     number, paraphrase without fabricating a figure.
@@ -326,15 +346,14 @@ Hallucination guard (structural):
   - The candidate may have SKIPPED some categories. For any
     skipped category, do NOT invent content for that dimension.
     Just leave that category out of the rewrite entirely.
-  - Paraphrase the sources freely. You do not need to copy the
-    original wording or the job's exact phrasing word-for-word —
-    you may rephrase them, swap synonyms, reorder clauses, and
-    combine facts across the original bullet, the answers, and
-    the cited job quote. The only constraint is the one above:
-    no facts beyond the three sources.
-  - Preserve all concrete scope indicators from the original bullet whenever 
-    they are supported by the source (e.g., numbers, frequencies, scale phrases like 
-    "hundreds of annotations," "multiple teams," "daily," etc.). Do not omit them unless 
+  - Paraphrase the candidate-supplied sources freely. You do
+    not need to copy the original wording verbatim — you may
+    rephrase it, swap synonyms, reorder clauses, and combine
+    facts across the original bullet and the answers. For the
+    cited job quote, borrow phrasing and target vocabulary only.
+  - Preserve all concrete scope indicators from the original bullet whenever
+    they are supported by the source (e.g., numbers, frequencies, scale phrases like
+    "hundreds of annotations," "multiple teams," "daily," etc.). Do not omit them unless
     they would make the bullet longer without adding meaning.
   - Keep the bullet to one short line — resume bullets are not
     paragraphs.
@@ -522,15 +541,19 @@ def _build_rewrite_user_message(
             getattr(category, "value", category) if category else None
         )
         label = category_str if category_str else key
-        if value.strip() and category_str not in skipped:
-            parts.append(f"  {label}: {value}")
-        elif value.strip():
-            # Non-empty answer but category was explicitly skipped
-            # -- still surface it but flag the skip.
-            parts.append(f"  {label}: {value}  [category skipped]")
-        else:
+        if not value.strip():
             # Empty answer -- treat as a skip.
             parts.append(f"  {label}: (skipped)")
+        elif category_str in skipped:
+            # Non-empty answer but category was explicitly skipped.
+            # Omit from the prompt entirely rather than surfacing
+            # it with a `[category skipped]` marker -- the route
+            # layer filters these out before calling, so this
+            # branch is defense in depth for direct callers and
+            # test paths that bypass the filter.
+            continue
+        else:
+            parts.append(f"  {label}: {value}")
     if skipped:
         parts.append(
             "\nSKIPPED CATEGORIES (do NOT invent content for these "

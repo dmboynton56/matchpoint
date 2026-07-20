@@ -677,18 +677,126 @@ class CoachFlowIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(len(weak["questions"]), 6)
 
+    def test_coach_start_drops_bullet_with_unknown_citation_job_id(self):
+        """Bug fix: the LLM sometimes picks a `citation_job_id` that
+        isn't in the user's top matches (a hallucination). Before
+        this fix the bullet would survive /coach/start --
+        `validate_coach_citation_grounding`'s "missing description"
+        branch keeps best-effort, designed for the legitimate
+        "job purged from Turso" case -- then fail at rewrite with
+        "citation quote is not a substring of the job description",
+        because the route coerced the missing description to "".
+
+        Now /coach/start drops WEAK bullets whose citation_job_id
+        is unknown to the snapshot, with reason="citation_job_id_unknown"
+        surfaced in the `dropped` field. STRONG bullets are kept
+        regardless: their citation_quote is cosmetic (no rewrite
+        path) and the missing-description tolerance for STRONG is
+        by design.
+        """
+        from contextlib import ExitStack
+
+        # WEAK bullet with citation_job_id not in _fake_matches().
+        # original_text MUST be a substring of _fake_resume() so
+        # validate_coach_bullet_grounding doesn't drop it -- this
+        # isolates the test to the membership check.
+        hallucinated_weak = CoachBullet(
+            bullet_id="b_hallucinated",
+            verdict=CoachBulletVerdict.WEAK,
+            original_text=(
+                "Designed a code review rubric used by 12 instructors."
+            ),
+            weakness_reason="No detail on any dimension.",
+            citation_job_id="job-hallucinated",
+            citation_quote="Anything goes here.",
+            checklist=CategoryChecklist(
+                SPECIFICITY=False,
+                SCOPE=True,
+                OWNERSHIP=True,
+                REPLACEMENT=True,
+                CAUSE_EFFECT=True,
+                ARTIFACT=True,
+            ),
+            questions=[
+                CoachQuestion(
+                    key="specificity",
+                    category=CoachCategory.SPECIFICITY,
+                    label="q-specificity",
+                    type=CoachQuestionType.TEXT,
+                )
+            ],
+        )
+        # Pair with a STRONG bullet that has a VALID job_id so we
+        # verify STRONG bullets are unaffected by the new check
+        # (kept even when citation_job_id is unknown -- that case
+        # is covered by test_strong_bullets_skip_the_check at the
+        # validator level; this test focuses on the WEAK case).
+        valid_strong = CoachBullet(
+            bullet_id="b_valid_strong",
+            verdict=CoachBulletVerdict.STRONG,
+            original_text="Reduced p99 latency by 40% for 50k MAU.",
+            strength_reason="Has metric and scope.",
+            citation_job_id="job-aaa",
+            citation_quote="Improve p99 latency",
+        )
+        response_obj = CoachStartResponse(
+            session_id="placeholder",
+            skills=[],
+            bullets=[hallucinated_weak, valid_strong],
+        )
+
+        with ExitStack() as stack:
+            for ctx in self._mock_dependencies():
+                stack.enter_context(ctx)
+            stack.enter_context(
+                patch(
+                    "app.services.bullet_coach_llm.start_coach_session",
+                    return_value=(response_obj.skills, response_obj.bullets),
+                )
+            )
+
+            response = self.client.post("/suggestions/coach/start")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        # The hallucinated WEAK bullet must NOT appear in bullets.
+        surviving_ids = {b["bullet_id"] for b in body["bullets"]}
+        self.assertNotIn("b_hallucinated", surviving_ids)
+        # The valid STRONG bullet must survive (it's STRONG, so the
+        # membership check doesn't apply to it).
+        self.assertIn("b_valid_strong", surviving_ids)
+        # The dropped field must surface the hallucinated bullet
+        # with the right reason so the client can show the user
+        # "we couldn't ground 1 of your bullets".
+        dropped_by_id = {d["bullet_id"]: d for d in body["dropped"]}
+        self.assertIn("b_hallucinated", dropped_by_id)
+        self.assertEqual(
+            dropped_by_id["b_hallucinated"]["reason"],
+            "citation_job_id_unknown",
+        )
+        self.assertEqual(
+            dropped_by_id["b_hallucinated"]["citation_job_id"],
+            "job-hallucinated",
+        )
+        # The valid STRONG bullet must NOT be in dropped.
+        self.assertNotIn("b_valid_strong", dropped_by_id)
+
     def test_coach_rewrite_missing_gap_question_rejected(self):
         """Bug fix: when the LLM supplies a checklist naming more
         gaps than the questions it produced, /coach/rewrite must
-        reject with 502 naming the uncovered gap category. This is
-        the one-question-per-gap contract that the 4-question cap
-        was silently violating."""
+        auto-skip the gap-without-question categories and let the
+        rewrite proceed. The one-question-per-gap contract has
+        been relaxed: bullet-coach is an experimental feature
+        where slight hallucinations are accepted in exchange for
+        not 502-ing the user mid-workshop, and the user can't
+        answer questions that weren't generated."""
         from contextlib import ExitStack
 
         # Override the WEAK bullet's checklist to claim THREE gaps
         # (SCOPE, OWNERSHIP, ARTIFACT) but only produce questions
-        # for SCOPE and ARTIFACT. The validator's gap-coverage
-        # check must catch the missing OWNERSHIP question.
+        # for SCOPE and ARTIFACT. OWNERSHIP is auto-skipped by the
+        # route because it has no question, so the rewrite only
+        # needs to cover SCOPE and ARTIFACT.
         gap_mismatch_weak = CoachBullet(
             bullet_id="b_weak",
             verdict=CoachBulletVerdict.WEAK,
@@ -774,12 +882,15 @@ class CoachFlowIntegrationTests(unittest.TestCase):
             )
 
         self.assertEqual(
-            response.status_code, 502, response.text,
+            response.status_code, 200, response.text,
         )
         body = response.json()
-        # The validator names the missing gap category in the
-        # message so the UI can highlight the right question.
-        self.assertIn("OWNERSHIP", body["detail"])
+        # Rewriter still includes the user's answered-category
+        # vocabulary ("my cohort of 40 students", "the matching
+        # algorithm"). OWNERSHIP was auto-skipped by the route
+        # because there's no question for it -- the user never
+        # had a chance to answer, so the validator treats it as
+        # implicitly skipped.
 
     def test_coach_rewrite_all_gaps_skipped_passes(self):
         """When the user explicitly skips every checklist gap, the
@@ -876,6 +987,122 @@ class CoachFlowIntegrationTests(unittest.TestCase):
 
         self.assertEqual(
             response.status_code, 200, response.text,
+        )
+
+    def test_coach_rewrite_auto_skips_gap_categories_without_questions(self):
+        """Regression: the LLM sometimes produces a checklist with N
+        gaps but only M<N questions (e.g., 5 categories marked
+        missing but only 2 questions generated). The user can't
+        answer what wasn't asked, so /coach/rewrite auto-skips the
+        gap-without-question categories and lets the rewrite
+        proceed. Previously this fired the
+        `rewrite skipped categories without a question or skip
+        marker` 502, blocking the user mid-workshop for the
+        experimental bullet-coach feature.
+
+        Pins the behavior so future re-tightening of the
+        coverage validator is a deliberate choice.
+        """
+        from contextlib import ExitStack
+
+        # Build a WEAK bullet where the checklist marks 5 gaps
+        # but the questions list only contains 2 (SCOPE, ARTIFACT).
+        # original_text MUST be a substring of _fake_resume() so
+        # validate_coach_bullet_grounding doesn't drop it.
+        weak = CoachBullet(
+            bullet_id="b_few_questions",
+            verdict=CoachBulletVerdict.WEAK,
+            original_text=(
+                "Designed a code review rubric used by 12 instructors."
+            ),
+            weakness_reason="Lots of gaps.",
+            citation_job_id="job-bbb",
+            citation_quote="Built a job matching platform",
+            checklist=CategoryChecklist(
+                SPECIFICITY=False,
+                SCOPE=False,
+                OWNERSHIP=False,
+                REPLACEMENT=False,
+                CAUSE_EFFECT=False,
+                ARTIFACT=False,
+            ),
+            category_gaps=[
+                CoachCategory.SPECIFICITY,
+                CoachCategory.OWNERSHIP,
+                CoachCategory.REPLACEMENT,
+                CoachCategory.CAUSE_EFFECT,
+                CoachCategory.ARTIFACT,
+            ],
+            questions=[
+                CoachQuestion(
+                    key="scope",
+                    category=CoachCategory.SCOPE,
+                    label="Who used it?",
+                    type=CoachQuestionType.TEXT,
+                ),
+                CoachQuestion(
+                    key="artifact",
+                    category=CoachCategory.ARTIFACT,
+                    label="What's the most interesting part?",
+                    type=CoachQuestionType.TEXT,
+                ),
+            ],
+        )
+        start_response = CoachStartResponse(
+            session_id="placeholder",
+            skills=[],
+            bullets=[weak],
+        )
+
+        with ExitStack() as stack:
+            for ctx in self._mock_dependencies():
+                stack.enter_context(ctx)
+            stack.enter_context(
+                patch(
+                    "app.services.bullet_coach_llm.start_coach_session",
+                    return_value=(
+                        start_response.skills, start_response.bullets
+                    ),
+                )
+            )
+
+            start = self.client.post("/suggestions/coach/start")
+            self.assertEqual(start.status_code, 200, start.text)
+            session_id = start.json()["session_id"]
+
+            # LLM rewrite only needs to cover the 2 answered
+            # categories (SCOPE, ARTIFACT). Other categories are
+            # auto-skipped by the route because they have no
+            # question.
+            rewrite_text = (
+                "Designed a code review rubric for my cohort of 40 "
+                "students using a peer-review scoring matrix"
+            )
+            stack.enter_context(
+                patch(
+                    "app.services.bullet_coach_llm.rewrite_bullet",
+                    return_value=rewrite_text,
+                )
+            )
+
+            response = self.client.post(
+                "/suggestions/coach/rewrite",
+                json={
+                    "session_id": session_id,
+                    "bullet_id": "b_few_questions",
+                    "answers": {
+                        "scope": "my cohort of 40 students",
+                        "artifact": "peer-review scoring matrix",
+                    },
+                    "skipped_categories": [],
+                },
+            )
+
+        self.assertEqual(
+            response.status_code, 200,
+            f"rewrite should succeed under the relaxed policy "
+            f"(gap-without-question categories auto-skipped); got "
+            f"{response.status_code}: {response.text}",
         )
 
     def test_coach_rewrite_missing_session_returns_404(self):

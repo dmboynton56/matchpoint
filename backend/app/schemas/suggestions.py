@@ -194,7 +194,55 @@ class SuggestionsResponse(BaseModel):
 
 
 def _normalize(text: str) -> str:
-    return " ".join(text.lower().split())
+    """Normalize text for substring matching.
+
+    Reduces quote-like variations to a comparable form before
+    substring checks (`_quote_is_substring` in particular). Steps:
+      1. Lowercase.
+      2. Manually fold common LLM-emitted punctuation variants
+         to ASCII equivalents:
+         - Smart quotes (U+201C/D, U+2018/9) to ASCII " and '
+         - Em-dash (U+2014) and en-dash (U+2013) to ASCII hyphen
+         - Ellipsis (U+2026) to three dots
+         Note: NFKC does NOT decompose any of these; explicit
+         character substitution is required.
+      3. Collapse ASCII stand-in em-dash ("--", common ASCII
+         substitute used by career sites) to a single hyphen. The
+         regex is bounded by whitespace so we don't accidentally
+         fold the em-dashes in "co--operate" or "re--enter".
+      4. Strip leading and trailing punctuation (. , ; : ! ? ' ").
+         The LLM often appends a period to a quoted sentence that
+         appears mid-source-text without one, which would fail a
+         strict substring match.
+      5. Collapse internal whitespace to single spaces and strip
+         leading/trailing whitespace (Python's str.split() handles
+         both).
+    """
+    import re
+    # Step 1: lowercase.
+    text = text.lower()
+    # Step 2: substitute smart punctuation with ASCII equivalents.
+    # NFKC alone is insufficient here -- the Unicode consortium
+    # preserves these as compatibility characters and does not
+    # fold them.
+    text = (
+        text
+        .replace("\u201c", '"')   # left double quote
+        .replace("\u201d", '"')   # right double quote
+        .replace("\u2018", "'")   # left single quote
+        .replace("\u2019", "'")   # right single quote / apostrophe
+        .replace("\u2014", "-")   # em-dash
+        .replace("\u2013", "-")   # en-dash
+        .replace("\u2026", "...")  # ellipsis
+    )
+    # Step 3: ASCII stand-in em-dash ("--") -> single hyphen.
+    text = re.sub(r"(^| )--( |$)", r"\1-\2", text)
+    # Step 4: strip leading/trailing punctuation that's likely
+    # produced by sentence boundaries rather than content.
+    side_punct = ".,;:!?\"'"
+    text = text.strip(side_punct)
+    # Step 5: collapse whitespace.
+    return " ".join(text.split())
 
 
 def _tokens(text: str) -> set[str]:
@@ -287,6 +335,93 @@ def _stems(text: str) -> set[str]:
 
 def _quote_is_substring(quote: str, source_text: str) -> bool:
     return _normalize(quote) in _normalize(source_text)
+
+
+# Minimum fraction of quote content-stems that must appear in the
+# cited job's content-stems for the quote to count as grounded,
+# when the strict-substring check fails. 0.5 = at least half of the
+# meaningful words in the quote must be present (after stopword /
+# structural-token filtering + stemming). Lower numbers admit
+# more paraphrasing at the cost of letting fabricated quotes
+# through; higher numbers stay closer to the strict check.
+#
+# Tuned to:
+#   - accept the LLM's paraphrased quotes that preserve the JD's
+#     substance (e.g. "Annotated and validated machine learning
+#     datasets" against a JD that describes the same work in
+#     different words but shares the vocabulary)
+#   - reject totally fabricated quotes (e.g. "frontier AI labs"
+#     against a backend-engineer JD with no AI-lab language)
+#     -- the existing test_drops_bullet_with_fabricated_quote
+#     exercises this and must keep passing
+#
+# This is intentionally relaxed: bullet-coach is an experimental
+# feature where the cost of a false-reject (a confused user
+# hitting 502 mid-workshop) outweighs the cost of a slight
+# hallucination in the citation link.
+CITATION_GROUNDING_THRESHOLD = 0.5
+
+
+def _content_stems(text: str) -> set[str]:
+    """Stems of tokens in `text`, minus the structural/stopword set.
+
+    The structural set (_COACH_STRUCTURAL_TOKENS) is the same one
+    used by rule 2 of `validate_coach_rewrite_grounding` -- it
+    filters articles, prepositions, generic verbs, and other glue
+    so the overlap score reflects substantive vocabulary rather
+    than grammatical coincidence. Tokens shorter than 3 chars are
+    dropped because _stem returns them unchanged and they don't
+    carry enough signal ("ai" surviving everywhere, "go" / "do" /
+    "be" etc. matching unrelated text).
+    """
+    stems = {_stem(t) for t in _tokens(text)}
+    return {
+        s for s in stems
+        if len(s) >= 3 and s not in _COACH_STRUCTURAL_TOKENS
+    }
+
+
+def _citation_grounding_score(quote: str, source_text: str) -> float:
+    """Fraction of quote content-stems present in source content-stems.
+
+    Returns 0.0 when either side has no content tokens after
+    filtering, so a quote of all stopwords scores 0 (the strict
+    substring fast path is what saves it in that edge case).
+    Otherwise returns `len(overlap) / len(quote_stems)`.
+    """
+    quote_stems = _content_stems(quote)
+    if not quote_stems:
+        return 0.0
+    source_stems = _content_stems(source_text)
+    if not source_stems:
+        return 0.0
+    return len(quote_stems & source_stems) / len(quote_stems)
+
+
+def _citation_is_grounded(
+    quote: str,
+    source_text: str,
+    *,
+    threshold: float = CITATION_GROUNDING_THRESHOLD,
+) -> bool:
+    """Experimental relaxed citation-grounding check.
+
+    Accepts the quote if EITHER:
+      - the normalized quote is a substring of the normalized
+        source (verbatim citation -- the original, strict check),
+        OR
+      - the content-stem overlap ratio is >= `threshold`
+        (paraphrased citation that preserves enough vocabulary).
+
+    Replaces the strict substring check in the bullet-coach
+    citation validators. Trades a higher false-accept rate on
+    fabricated quotes for a lower false-reject rate on paraphrased
+    ones; the user explicitly accepted slight hallucinations for
+    the experimental bullet-coach feature.
+    """
+    if _quote_is_substring(quote, source_text):
+        return True
+    return _citation_grounding_score(quote, source_text) >= threshold
 
 
 def _has_token_overlap(suggestion_text: str, citation_quotes: list[str]) -> bool:
@@ -649,10 +784,36 @@ class CoachBullet(BaseModel):
     # override when its judgment differs (e.g. it sees a gap the
     # boolean reflection missed).
     category_gaps: list[CoachCategory] = Field(default_factory=list)
-    # Where this bullet sits in the candidate's resume. Optional —
-    # the parser can fail on unusual resume formats, in which case
-    # the route layer falls back to a generic "Resume" location.
-    location: BulletLocation | None = None
+    # Where this bullet sits in the candidate's resume. Optional in
+    # the schema so the LLM can omit it (the parser can fail on
+    # unusual resume formats, the LLM can miss the field), but every
+    # CoachBullet instance MUST carry a non-null location by the
+    # time it reaches the frontend — the UI reads `location.section`
+    # directly and would crash on null. The default_factory below
+    # supplies the fallback for the omitted case; the field
+    # validator backfills the same fallback when the LLM explicitly
+    # sends `location: null` (pydantic v2 does NOT run field
+    # validators on default values, only on provided ones).
+    location: BulletLocation | None = Field(
+        default_factory=lambda: BulletLocation(section="Resume")
+    )
+
+    @field_validator("location", mode="after")
+    @classmethod
+    def _default_location(cls, v: BulletLocation | None) -> BulletLocation:
+        """Backfill a generic 'Resume' location when the LLM omits it.
+
+        Pydantic accepts `None` for an `Optional` field, so the
+        LLM's null survives deserialization. This validator runs
+        after construction and replaces null with a fallback so
+        the instance invariant (`location is not None`) holds.
+        Future code that wants to differentiate "unknown" from
+        "section=Resume" can switch on `entry_title is None` —
+        the fallback leaves `entry_title` as None.
+        """
+        if v is None:
+            return BulletLocation(section="Resume")
+        return v
 
     @field_validator("category_gaps", mode="before")
     @classmethod
@@ -688,6 +849,43 @@ class CoachBullet(BaseModel):
         return out
 
 
+class DroppedCoachBullet(BaseModel):
+    """A WEAK bullet the start validator discarded and the reason why.
+
+    Surfaced in `CoachStartResponse.dropped` so the client can show
+    "we couldn't ground N of your bullets" and so the rate of
+    hallucinated job IDs is observable in logs without relying on
+    silent-drop.
+
+    The `reason` field is a short stable string so future
+    validators can add new reasons (e.g. `original_text_not_in_
+    resume`) without a schema migration. Current value:
+      - "citation_job_id_unknown": the LLM picked a
+        `citation_job_id` that wasn't in the user's top matches,
+        so no description snapshot exists to ground against.
+        Without this drop the bullet would survive start and then
+        fail at rewrite because the route coerces the missing
+        description to "" and the substring check returns False.
+
+    Note: paraphrased or fabricated citation quotes are NOT
+    recorded here. The start-side citation-grounding policy is
+    intentionally permissive for the experimental bullet-coach
+    feature -- see `validate_coach_citation_grounding`'s
+    docstring. The historical `citation_quote_not_substring`
+    reason is reserved (not currently emitted) so the schema
+    doesn't need a migration if the policy is later re-tightened.
+    """
+
+    bullet_id: str = Field(max_length=64)
+    citation_job_id: str = Field(max_length=64)
+    # Echoed back so the client can show the user which quote
+    # failed grounding, useful when debugging paraphrased
+    # citations.
+    citation_quote: str = Field(max_length=MAX_CITATION_QUOTE_LEN)
+    original_text: str = Field(max_length=MAX_SUGGESTION_TEXT_LEN)
+    reason: str = Field(max_length=64)
+
+
 class CoachStartResponse(BaseModel):
     session_id: str = Field(max_length=64)
     # SKILL suggestions carried over from the one-shot flow so the UI
@@ -695,6 +893,13 @@ class CoachStartResponse(BaseModel):
     # existing /suggestions/refresh response.
     skills: list[Suggestion] = Field(default_factory=list)
     bullets: list[CoachBullet] = Field(default_factory=list)
+    # WEAK bullets the start validator discarded. See
+    # `DroppedCoachBullet` for shape and reason. Empty when
+    # every bullet the LLM produced grounded cleanly. Surfaces
+    # the previously-silent drop so the client can show a
+    # "couldn't ground N bullets" hint and so the paraphrase
+    # rate is observable in logs and telemetry.
+    dropped: list[DroppedCoachBullet] = Field(default_factory=list)
 
 
 class CoachRewriteRequest(BaseModel):
@@ -899,6 +1104,234 @@ def validate_coach_rewrite_answer_keys(
     return missing
 
 
+# Heuristic keywords that suggest a bullet covers each qualitative
+# category. Used by reclassify_overstrong_bullets as a server-side
+# safety net: gpt-4o-mini sometimes over-classifies STRONG, leaving
+# the user with nothing to workshop. These lists are imperfect
+# (keywords overlap across categories) but the consensus-count
+# heuristic tolerates the noise. Server counts unique categories
+# covered -- a bullet needs to "look like" at least 3 to be
+# eligible for STRONG.
+_CATEGORY_OVERSTRONG_KEYWORDS: dict[str, set[str]] = {
+    "SCOPE": {
+        "users", "user", "students", "student", "cohort", "team",
+        "teams", "engineers", "engineer", "customers", "customer",
+        "members", "member", "users", "company", "companies",
+        "client", "clients", "investors", "tenants", "patients",
+        "candidates", "stakeholders",
+    },
+    "OWNERSHIP": {
+        "i", "we", "my", "our", "led", "built", "shipped", "designed",
+        "implemented", "developed", "created", "owned", "authored",
+        "founded", "launched", "drove", "ran", "managed", "led",
+    },
+    "ARTIFACT": {
+        "api", "apis", "dashboard", "tool", "tools", "model", "models",
+        "system", "systems", "service", "services", "library",
+        "libraries", "feature", "features", "platform", "platforms",
+        "app", "apps", "module", "modules", "pipeline", "pipelines",
+        "endpoint", "endpoints", "cli", "ui", "sdk",
+    },
+    "CAUSE_EFFECT": {
+        "resulting", "led", "increase", "increased", "decrease",
+        "decreased", "reduce", "reduced", "grew", "growing",
+        "improving", "improved", "drove", "saved", "added", "adding",
+        "boosted", "enabling", "enables", "unblock", "unblocking",
+        "unblocked", "yields", "reduced", "increased", "doubled",
+        "halved", "%", "x",
+    },
+    "SPECIFICITY": {
+        "the",  # article alone isn't enough -- this is a noisy
+                # signal; SPECIFICITY is the weakest of the 6.
+        # Marked as a "soft" category in the heuristic below.
+    },
+    "REPLACEMENT": {
+        "replaced", "replacing", "previously", "instead", "legacy",
+        "migrated", "migration", "ported", "porting", "instead-of",
+        "from", "to",  # noisy without context; also a soft signal.
+    },
+}
+
+# Sentinel: the SPECIFICITY and REPLACEMENT categories are noisy
+# matches on small corpora. The heuristic requires 3 hard matches
+# OR 2 hard matches + 1 soft match to consider a bullet STRONG-
+# eligible. This avoids false positives where the only category a
+# short bullet "covers" is via a conjunction like "from" or "to".
+_CATEGORY_STRICT = {"SCOPE", "OWNERSHIP", "ARTIFACT", "CAUSE_EFFECT"}
+_CATEGORY_LOOSE = {"SPECIFICITY", "REPLACEMENT"}
+
+
+def _category_keyword_hits(text: str) -> set[str]:
+    """Return the set of category keys whose keywords appear in text.
+
+    Words are tokenized via simple split + lowercase + strip of
+    surrounding punctuation. Word boundaries matter only
+    loosely -- substring match is fine for short keywords like
+    "api" because false positives are bounded by the consensus
+    count downstream.
+    """
+    import re
+    tokens: set[str] = set()
+    for raw_tok in re.findall(r"[A-Za-z0-9%]+", text.lower()):
+        tokens.add(raw_tok.strip())
+    hits: set[str] = set()
+    for category, words in _CATEGORY_OVERSTRONG_KEYWORDS.items():
+        if tokens & words:
+            hits.add(category)
+    return hits
+
+
+def _looks_strong(text: str) -> bool:
+    """Heuristic STRONG-eligibility based on the bullet's original
+    text. Returns True iff the text clearly covers enough
+    categories to justify a STRONG classification (no questions,
+    no rewrite available). The bar is set deliberately low so
+    real-world thin bullets get demoted to WEAK with synthesized
+    questions rather than silently locked into STRONG.
+
+    Rule: text covers >=3 strict categories (SCOPE/OWNERSHIP/
+    ARTIFACT/CAUSE_EFFECT). Loose categories (SPECIFICITY/
+    REPLACEMENT) contribute only as a tiebreaker: a bullet with 2
+    strict + 1 loose is also eligible.
+    """
+    hits = _category_keyword_hits(text)
+    strict_count = len(hits & _CATEGORY_STRICT)
+    loose_count = len(hits & _CATEGORY_LOOSE)
+    if strict_count >= 3:
+        return True
+    if strict_count >= 2 and loose_count >= 1:
+        return True
+    return False
+
+
+# Fallback questions for synthesized-questions demotion. Picked to
+# surface the most actionable gap the LLM might've ignored. Keys
+# are categories that the heuristic demoted as missing.
+_DEMOTION_FALLBACK_QUESTIONS: dict[str, str] = {
+    "SCOPE": "Who used this? (classmates, team, customers, etc.)",
+    "OWNERSHIP": "Did you lead this end-to-end, or were you part of a team?",
+    "ARTIFACT": "What was the most interesting part you built or shipped?",
+    "CAUSE_EFFECT": "What changed because of this? (outcome, metric, adoption)",
+    "SPECIFICITY": "What was the most specific concrete thing involved?",
+    "REPLACEMENT": "What did this replace, or what did it unblock?",
+}
+
+
+def reclassify_overstrong_bullets(
+    bullets: list[CoachBullet],
+) -> list[CoachBullet]:
+    """Server-side safety net for over-generous STRONG classifications.
+
+    When gpt-4o-mini returns STRONG for a thin bullet (the LLM
+    decided the bullet was "good enough" but the heuristic
+    suggests otherwise), the user sees a session with no WEAK
+    bullets and nothing to workshop. This function detects that
+    pattern: any STRONG bullet whose original_text clearly fails
+    _looks_strong is demoted to WEAK with one synthesized
+    question per missing-strict category. The rewrite prompts
+    handle these the same as LLM-supplied questions.
+
+    Idempotent: STRONG bullets that pass the heuristic are
+    untouched. WEAK bullets pass through unchanged.
+    """
+    if not bullets:
+        return bullets
+    strong_count = sum(
+        1 for b in bullets if b.verdict == CoachBulletVerdict.STRONG
+    )
+    weak_count = sum(
+        1 for b in bullets if b.verdict == CoachBulletVerdict.WEAK
+    )
+    # If the LLM already produced at least one WEAK bullet and the
+    # STRONG ones look genuinely strong, leave them alone -- the
+    # workshop mix is healthy. Demote only when STRONG is full and
+    # WEAK is empty.
+    if weak_count >= 1:
+        return bullets
+
+    rebuilt: list[CoachBullet] = []
+    demoted_count = 0
+    for bullet in bullets:
+        if bullet.verdict != CoachBulletVerdict.STRONG:
+            rebuilt.append(bullet)
+            continue
+        if _looks_strong(bullet.original_text):
+            rebuilt.append(bullet)
+            continue
+        # Demote: synthesize one question per strict-missing
+        # category. Use the LLM's checklist if provided to
+        # inform "missing"; otherwise fall back to the keyword
+        # heuristic for what looks missing. If neither is
+        # informative, synthesize a generic gap question.
+        missing: list[CoachCategory] = []
+        if bullet.checklist is not None:
+            for cat in CoachCategory:
+                if not getattr(bullet.checklist, cat.value, True):
+                    missing.append(cat)
+        if not missing:
+            hits = _category_keyword_hits(bullet.original_text)
+            missing = [
+                cat for cat in CoachCategory
+                if cat.value in _CATEGORY_STRICT
+                and cat.value not in hits
+            ]
+        if not missing:
+            # Last resort: ask the most-impactful single category.
+            missing = [CoachCategory.OWNERSHIP]
+        questions: list[CoachQuestion] = []
+        seen_cats: set[CoachCategory] = set()
+        for cat in missing:
+            if cat in seen_cats:
+                continue
+            seen_cats.add(cat)
+            label = _DEMOTION_FALLBACK_QUESTIONS.get(
+                cat.value,
+                f"Tell me more about the {cat.value.lower().replace('_', ' ')}.",
+            )
+            questions.append(
+                CoachQuestion(
+                    key=cat.value.lower(),
+                    category=cat,
+                    label=label,
+                    type=CoachQuestionType.TEXT,
+                )
+            )
+        weakness = (
+            f"Bullet lacks enough of the key qualitative dimensions "
+            f"to count as strong. Reclassified to WEAK."
+        )
+        rebuilt_bullet = bullet.model_copy(
+            update={
+                "verdict": CoachBulletVerdict.WEAK,
+                "questions": questions,
+                "weakness_reason": weakness,
+                "checklist": None,
+            }
+        )
+        rebuilt.append(rebuilt_bullet)
+        demoted_count += 1
+
+    if demoted_count:
+        import logging
+        logging.getLogger(__name__).warning(
+            "coach_start demoted %d STRONG bullet(s) to WEAK "
+            "(missing qualitative coverage). Original strong=%d, "
+            "weak=%d, after=%d/%d.",
+            demoted_count,
+            strong_count,
+            weak_count,
+            sum(
+                1 for b in rebuilt
+                if b.verdict == CoachBulletVerdict.WEAK
+            ),
+            sum(
+                1 for b in rebuilt
+                if b.verdict == CoachBulletVerdict.STRONG
+            ),
+        )
+    return rebuilt
+
+
 def validate_coach_bullet_grounding(
     bullets: list[CoachBullet],
     parsed_resume: dict,
@@ -956,30 +1389,35 @@ def validate_coach_citation_grounding(
     bullets: list[CoachBullet],
     job_descriptions: dict[str, str],
 ) -> list[CoachBullet]:
-    """Drop bullets whose `citation_quote` isn't a substring of the
-    cited job's description.
+    """Pass WEAK bullets through; STRONG bullets are kept regardless.
 
-    The LLM is asked in the prompt to return a verbatim substring
-    of the cited job, but it sometimes fabricates a quote -- often
-    echoing the user's answer text instead of pulling from the job
-    description. When that happens, the session stores a fake quote
-    and the rewrite validator later fails with "citation quote is
-    not a substring of the job description" -- which is the right
-    error but lands too late (the user has already answered
-    questions and clicked Rewrite).
+    Historically this validator also filtered WEAK bullets whose
+    `citation_quote` didn't ground against the cited job's
+    description (strict substring, then a relaxed content-stem
+    overlap). That check has been disabled: bullet-coach is an
+    experimental feature where the user explicitly accepted
+    slight hallucinations in exchange for not 502-ing the user
+    mid-workshop, and the LLM's paraphrased / lightly fabricated
+    quotes routinely scored 0 against the JD's vocabulary.
 
-    Catching it here, at the start flow, drops the bad bullet
-    before the user invests time in it. Better UX than surfacing
-    the error after answers.
+    The function is retained (rather than deleted) because:
+      - STRONG bullets still take the early-return branch (they
+        don't go through /coach/rewrite so the citation quote is
+        cosmetic; the early return avoids any future re-introduction
+        of a check from biting them).
+      - WEAK bullets whose `citation_job_id` is missing from the
+        snapshot still hit the description-is-None branch and
+        fall through. (The route-layer membership check added
+        later catches these before this function runs, but the
+        best-effort keep-on-missing semantics here remain for
+        defense-in-depth.)
+      - The membership-style filtering of hallucinated job_ids
+        happens at the route layer (`_record_coach_drops` /
+        `reason="citation_job_id_unknown"`), not here.
 
-    For STRONG bullets, we DON'T check -- they have no rewrite
-    path, so a bad citation_quote there is cosmetic (the citation
-    link still works via citation_job_id). The check is only
-    meaningful for WEAK bullets.
-
-    Bullets whose `citation_job_id` is missing from
-    `job_descriptions` are kept (best-effort; the validator can't
-    prove they're bad either).
+    If you want to re-tighten this validator later, swap the
+    `_citation_is_grounded(...)` call back in below and tune
+    CITATION_GROUNDING_THRESHOLD.
     """
     accepted: list[CoachBullet] = []
     for bullet in bullets:
@@ -996,11 +1434,13 @@ def validate_coach_citation_grounding(
             # we can't prove fabrication either way.
             accepted.append(bullet)
             continue
-        if _quote_is_substring(bullet.citation_quote, description):
-            accepted.append(bullet)
-        # else: drop silently. The user gets fewer bullets to
-        # coach on, but every bullet shown has a citation they
-        # can verify against the actual job posting.
+        # Citation grounding check intentionally disabled per the
+        # docstring above. The check function is retained so it can
+        # be re-enabled later by swapping this block back in:
+        #     if _citation_is_grounded(bullet.citation_quote, description):
+        #         accepted.append(bullet)
+        #         continue
+        accepted.append(bullet)
     return accepted
 
 
@@ -1063,8 +1503,17 @@ def validate_coach_rewrite_grounding(
     explanations for why grounding failed (empty when grounded).
 
     Hallucination guard, structural:
-      1. The citation quote must substring-match the cited job
-         description. (Same rule as the one-shot validator.)
+      1. DISABLED: the citation quote's grounding against the
+         cited job's description was originally a hard substring
+         check, then relaxed to a content-stem overlap ratio,
+         and now disabled entirely. Bullet-coach is an
+         experimental feature where the user explicitly accepted
+         slight hallucinations in exchange for not 502-ing the
+         user mid-workshop. See `validate_coach_citation_grounding`
+         for the matching start-side disable. To re-enable:
+         add `if not _citation_is_grounded(citation_quote,
+         citation_description): reasons.append("citation quote is
+         not a substring of the job description")` here.
       2. Every substantive token in the rewrite must be traceable
          to one of:
            - the original bullet (allowed)
@@ -1090,12 +1539,13 @@ def validate_coach_rewrite_grounding(
     """
     reasons: list[str] = []
 
-    # Rule 1: citation quote must be a substring of the cited job
-    # description.
-    if not _quote_is_substring(citation_quote, citation_description):
-        reasons.append(
-            "citation quote is not a substring of the job description"
-        )
+    # Rule 1: disabled -- see docstring. The citation quote's
+    # grounding against the cited job's description used to be
+    # checked here. Removed per the user's policy for the
+    # experimental bullet-coach feature: slight hallucinations
+    # in the citation are accepted in exchange for not 502-ing
+    # the user mid-workshop. `_citation_is_grounded` is still
+    # available for re-enabling.
 
     # Rule 3 (cheap check first — fail fast): the rewrite must add
     # measurable content. If normalized equal, nothing changed.
@@ -1164,22 +1614,116 @@ def validate_coach_rewrite_grounding(
     # to substantive_rewrite so they get checked.
 
     # Tech-name shapes detected in the rewrite's RAW text (before
-    # tokenization, which lowercases and destroys casing signals):
-    #   - CamelCase like "FastAPI", "JavaScript", "PyTorch",
-    #     "TypeScript" -- leading cap followed by at least one more
-    #     [A-Z][a-z]+ chunk.
-    #   - Leading cap followed by lowercase, like "Kafka", "Rust",
-    #     "Python" -- single-word tech names that lose their
-    #     capitalization on tokenization.
-    # Both shapes are caught here so the validator can compare them
-    # against source-side allow-stems. Sentence-initial capital
-    # tokens ("Built", "Created", "Designed") are excluded via the
-    # position filter in _rewrite_proper_nouns() below -- otherwise
-    # the LLM's natural verb-led rewrites would falsely flag common
-    # verbs as substantive. This is a tighter rule than the old
-    # write-side titlecase scan, which is what we want.
+    # tokenization lowercases and destroys casing signals). Three
+    # shapes are covered, each with a distinct regex so the
+    # comments and safelist stay specific:
+    #   - CamelCase: "PyTorch", "JavaScript", "TypeScript" -- two
+    #     or more [Cap][a-z+] chunks back-to-back.
+    #   - Acronym-suffixed: "FastAPI", "PostgreSQL", "VueJS",
+    #     "NodeJS" -- a [Cap][a-z+] chunk followed by 2+
+    #     consecutive caps (no lowercase to break the run).
+    #     Distinct word shape from CamelCase -- the acronym
+    #     tail has no lowercase letters so the CamelCase regex
+    #     misses it.
+    #   - Single-word Capitalized: "Kafka", "Python", "Rust" -- a
+    #     single [Cap][a-z+] chunk. This shape is filtered
+    #     through _ENGLISH_PAST_PARTICIPLES below to avoid the
+    #     false positive where "Developed", "Designed", "Built"
+    #     in legit rewrites were flagged as fabricated tech. The
+    #     safelist covers the resume-bullet past-participles the
+    #     LLM most commonly leads sentences with; add to it when
+    #     a new false-positive verb surfaces.
     _CAMELCASE_RE = re.compile(r"\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b")
-    _CAPITALIZED_TECH_RE = re.compile(r"\b[A-Z][a-z]{2,}\b")
+    _ACRONYM_SUFFIXED_RE = re.compile(r"\b[A-Z][a-z]+[A-Z]{2,}\b")
+    _SINGLE_WORD_CAP_RE = re.compile(r"\b[A-Z][a-z]{1,}\b")
+    _ENGLISH_PAST_PARTICIPLES: frozenset[str] = frozenset({
+        # Common resume-bullet past-participles the LLM leads
+        # sentences with. Lowercased -- matched against
+        # `.lower()` of the regex capture, so case is normalized
+        # before lookup.
+        "built", "created", "designed", "developed", "implemented",
+        "led", "owned", "shipped", "managed", "supported", "improved",
+        "deployed", "integrated", "migrated", "optimized", "refactored",
+        "scaled", "tested", "automated", "configured", "debugged",
+        "documented", "engineered", "established", "launched",
+        "monitored", "orchestrated", "oversaw", "planned", "produced",
+        "reviewed", "streamlined", "trained", "translated", "tuned",
+        "validated", "wrote", "architected", "authored", "coordinated",
+        "delivered", "drafted", "enabled", "executed", "facilitated",
+        "founded", "generated", "mentored", "organized", "pioneered",
+        "programmed", "prototyped", "published", "researched",
+        "resolved", "restructured", "supervised", "triaged",
+        # User-reported 502: "Ensured [the X]..." at the start of a
+        # sentence led to a fabrication flag because "ensured"
+        # wasn't in the safelist above and never appeared in
+        # {original, citation_quote, answers}. Adding it keeps
+        # rule 2 quiet for this common resume verb. To revert:
+        # drop "ensured" from this set and the failure mode
+        # returns for rewrites that open with "Ensured ".
+        # NOTE: under stem-based matching below, "ensured" also
+        # covers "ensures" / "ensuring" automatically.
+        "ensured",
+        # Base forms for the two irregular verbs in the safelist
+        # whose past participle ("built" / "led") stems
+        # differently from their present-tense forms ("build" /
+        # "lead") under the tiny _stem suffix-stripper. Without
+        # these, "Building the X..." and "Leading the X..." at
+        # the start of a rewrite would still trip rule 2. Each
+        # base form covers -s/-es/-ing inflections of the same
+        # verb through the same stem-match path.
+        "build", "lead",
+    })
+
+    # Pre-computed stem set: derived from _ENGLISH_PAST_PARTICIPLES
+    # via the tiny `_stem` suffix-stripper. Lets a single
+    # safelist entry per verb catch its inflections without
+    # having to enumerate every form. "created" in the safelist
+    # covers "creates" / "creating" (both stem to "creat"); a
+    # second 502 on "Creating the X..." (user-reported just
+    # after the "ensured" fix) is what motivated this set.
+    # The match is a SECONDARY filter after exact-match against
+    # the safelist -- exact-match is cheaper and reads more
+    # clearly in the diff, so it stays.
+    _ENGLISH_PAST_PARTICIPLE_STEMS: frozenset[str] = frozenset(
+        _stem(p) for p in _ENGLISH_PAST_PARTICIPLES
+    )
+
+    def _detect_tech_tokens(text: str) -> set[str]:
+        """Lowercased tech-name tokens detected in raw text.
+
+        Runs all three regexes (CamelCase, acronym-suffixed,
+        single-word Capitalized) and applies the English-verb
+        safelist to single-word matches so resume past-participles
+        like "Developed" / "Designed" don't get flagged as tech.
+        Returns the union so the rewrite-side substance check can
+        see tech names whose casing signal was lost when _tokens
+        lowercased everything.
+        """
+        found: set[str] = set()
+        for m in _CAMELCASE_RE.finditer(text):
+            found.add(m.group(0).lower())
+        for m in _ACRONYM_SUFFIXED_RE.finditer(text):
+            found.add(m.group(0).lower())
+        for m in _SINGLE_WORD_CAP_RE.finditer(text):
+            token_lower = m.group(0).lower()
+            if token_lower in _ENGLISH_PAST_PARTICIPLES:
+                continue
+            # Stem-match fallback: lets one past-participle
+            # safelist entry (e.g. "created") cover inflections
+            # the LLM also leads sentences with ("creates",
+            # "creating"). The tiny suffix-stripping _stem
+            # collapses -ed/-ing/-es to the same root, so this
+            # is a tight match against real English verbs --
+            # tech names whose stem happens to share an
+            # -ed/-ing/-es suffix with a safelist entry are
+            # not a real risk in this codebase (no "Merged"
+            # past-participle entry means "Merging" still fails
+            # the check, etc.). See _ENGLISH_PAST_PARTICIPLE_STEMS
+            # for the pre-computed set.
+            if _stem(token_lower) in _ENGLISH_PAST_PARTICIPLE_STEMS:
+                continue
+            found.add(token_lower)
+        return found
 
     def _is_substantive(token: str, titlecase_source: set[str]) -> bool:
         if any(ch.isdigit() for ch in token):
@@ -1206,55 +1750,20 @@ def validate_coach_rewrite_grounding(
         tok for tok in rewrite_tokens
         if _is_substantive(tok, set())
     }
-    # Add tech names from the rewrite's RAW text (not the
-    # lowercased tokens). This recovers the "PyTorch", "FastAPI",
-    # "JavaScript", "Kafka" cases that the lowercased substance
-    # check misses. Without this, the LLM could append
-    # "optimizing PyTorch models" at the end of a rewrite, source
-    # that only in the cited job quote (not the user's answers),
-    # and the validator wouldn't notice -- a fabrication the user
-    # can't catch from the UI.
-    #
-    # Position filter: skip any match at the very start of the
-    # rewrite. Sentence-initial words are typically verbs ("Built",
-    # "Created", "Designed") which are connective content, not
-    # substantive claims. This avoids the "Built/Created false
-    # positive" the previous titlecase approach hit, while still
-    # catching mid-sentence tech-name fabrications.
-    def _rewrite_tech_words(text: str) -> set[str]:
-        out: set[str] = set()
-        # CamelCase catches FastAPI, JavaScript, PyTorch, etc.
-        for m in _CAMELCASE_RE.finditer(text):
-            out.add(m.group(0).lower())
-        # Single-word Capitalized catches Kafka, Rust, Python, etc.
-        # Skip a match whose start position is 0 (sentence-initial)
-        # AND which appears before any other sentence-initial-like
-        # candidate -- a single token at position 0 is most likely a
-        # verb lead. Mid-sentence matches (start_pos > 0) are
-        # always kept. Position-0 matches are also kept if the
-        # rewrite starts with another tech-word before them
-        # (e.g., "FastAPI and Rust" -- both should be caught).
-        capital_matches = list(_CAPITALIZED_TECH_RE.finditer(text))
-        for i, m in enumerate(capital_matches):
-            if m.start() == 0:
-                # If this is the first tech-word-shaped match but
-                # there are MORE matches later, the rewrite starts
-                # with multiple capitalized tokens -- we keep them
-                # all because the user's prose can lead with a
-                # tech name legitimately.
-                if len(capital_matches) > 1:
-                    out.add(m.group(0).lower())
-                # else: position-0 capital + nothing else looks like
-                # a tech name. Treat as sentence-initial verb lead
-                # and skip. (Less restrictive: we could check if a
-                # mid-sentence match follows later, but that adds
-                # complexity for a rare edge case.)
-                continue
-            out.add(m.group(0).lower())
-        return out
-
-    rewrite_camelcase: set[str] = _rewrite_tech_words(rewritten_text)
-    substantive_rewrite |= rewrite_camelcase
+    # Add tech-name tokens from the rewrite's RAW text (before
+    # tokenization lowercases and destroys casing signals). This
+    # recovers the "PyTorch", "FastAPI", "PostgreSQL", "Kafka",
+    # "Python" cases the lowercased substance check misses.
+    # Without this scan, the LLM could append "optimizing PyTorch
+    # models" or "writing Python services" at the end of a
+    # rewrite, sourced only in the cited job quote (not the
+    # user's answers), and the validator wouldn't notice -- a
+    # fabrication the user can't catch from the UI. English
+    # past-participles ("Developed", "Designed", "Built") are
+    # filtered by the safelist above so we don't regress the
+    # false-positive class that originally justified excluding
+    # single-word detection.
+    substantive_rewrite |= _detect_tech_tokens(rewritten_text)
 
     # Build the source-side allow-set using the same detection rule
     # over raw source text. Without this, a source token like

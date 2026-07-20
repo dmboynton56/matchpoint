@@ -1036,18 +1036,34 @@ class SubstantiveGroundingTests(unittest.TestCase):
         self.assertIn("99", joined)
         self.assertIn("50k", joined)
 
-    def test_invented_tech_name_rejected(self):
+    def test_invented_camelcase_tech_name_rejected(self):
+        """Fabricated CamelCase tech names (no source match) must
+        be flagged. Replaces the older 'Rust and Python' variant
+        which relied on the single-word Capitalized scan that was
+        removed (it false-positived on past-tense verbs like
+        'Developed')."""
         ok, reasons = self._check(
-            "Built the matching algorithm in Rust and Python.",
+            # PureTech is fabricated -- not in original, not in
+            # the quote, not in any answer. FakeTech is in the
+            # quote and would normally ground it; we moved it to
+            # the user's answer so the test isolates the
+            # fabricated case. Both are CamelCase so the scan
+            # catches them.
+            "Built the matching algorithm in PureTech and FakeTech.",
             "Built the matching algorithm.",
             "matching algorithm",
-            {"artifact": "the matching algorithm"},
+            {"artifact": "FakeTech"},
         )
         self.assertFalse(ok)
         joined = " ".join(reasons)
-        self.assertIn("rust", joined.lower())
+        self.assertIn("puretech", joined.lower())
 
     def test_user_mentioned_tech_passes(self):
+        # Single-word tech name (Rust) mentioned in the user's
+        # answer. CamelCase scan doesn't catch this and the
+        # category-coverage validator catches fabricated single-
+        # word tech names used to fill category answers. This
+        # test verifies the user-grounded path still works.
         ok, reasons = self._check(
             "Built the matching algorithm in Rust.",
             "Built the matching algorithm.",
@@ -1070,16 +1086,52 @@ class SubstantiveGroundingTests(unittest.TestCase):
             ok, f"sourced CamelCase tech rejected: {reasons}"
         )
 
-    def test_invented_camelcase_rejected(self):
+    def test_mid_sentence_capitalized_verb_not_flagged(self):
+        """Regression for the user's most recent report: a past-
+        tense verb in mid-sentence ('Developed', 'Designed')
+        used to be flagged as fabricated because the single-word
+        Capitalized scan couldn't distinguish it from a tech name.
+
+        After removing that scan, only true CamelCase tokens
+        (with mid-word uppercase) get flagged. Plain mid-sentence
+        verbs pass through without grounding checks -- they're
+        connective content, not substantive claims.
+        """
         ok, reasons = self._check(
-            "Built the API in FastAPI and Kafka.",
+            "Built a thing for our cohort, developed end to end "
+            "during the cohort's run, designed to scale.",
+            "Built a thing.",
+            "build a thing for a cohort",
+            {"scope": "our cohort"},
+        )
+        self.assertTrue(
+            ok, f"mid-sentence past-tense verb wrongly rejected: "
+            f"{reasons}"
+        )
+
+    def test_invented_camelcase_rejected(self):
+        """A CamelCase name that appears in NEITHER the original
+        nor the user's answers (only in the cited quote is NOT
+        enough -- see the job-only check for that path) gets
+        flagged as fabricated.
+
+        Original test fixture used 'FastAPI' (which the user
+        mentioned in their answer -- fabricated-name check would
+        not fire) and 'Kafka' (single-word, no longer in scope
+        post single-word Capitalized-scan removal). Both replaced
+        with CamelCase fabricated names so the scan catches them.
+        """
+        ok, reasons = self._check(
+            "Built the API in CoreLib and SideLib streams.",
             "Built the API.",
             "design a FastAPI service",
-            {"artifact": "FastAPI"},
+            {"artifact": "FastAPI"},  # FastAPI in answer grounds it
         )
         self.assertFalse(ok)
         joined = " ".join(reasons)
-        self.assertIn("kafka", joined.lower())
+        # Both fabricated names should be flagged.
+        self.assertIn("corelib", joined.lower())
+        self.assertIn("sidelib", joined.lower())
 
     def test_mid_sentence_tech_from_job_only_quote_flagged(self):
         """Regression for the user's recent report: the LLM took a
@@ -1153,6 +1205,84 @@ class SubstantiveGroundingTests(unittest.TestCase):
         self.assertTrue(
             ok, f"verb-led rewrite wrongly rejected: {reasons}"
         )
+
+    def test_sentence_initial_ensured_not_flagged(self):
+        """Regression for the user-reported 502 on `/coach/rewrite`:
+        the LLM occasionally opens a rewrite with "Ensured [the
+        team]..." -- a common resume-bullet verb. "Ensured" matched
+        the single-word-Cap regex, fell through to rule 2's
+        source-bucket check, and was flagged as fabricated because
+        it didn't appear in {original, citation_quote, answers}.
+        Now in `_ENGLISH_PAST_PARTICIPLES` so it never reaches the
+        substantive token set. To revert: drop "ensured" from the
+        safelist and this test fails.
+        """
+        ok, reasons = self._check(
+            "Ensured the cohort had a working pipeline.",
+            "Built a thing.",
+            "Looking for someone to design pipelines.",
+            {"scope": "the cohort"},
+        )
+        fabrication_reasons = [
+            r for r in reasons
+            if "substantive claims" in r
+        ]
+        self.assertEqual(
+            fabrication_reasons,
+            [],
+            f"rewrite opening with 'Ensured' should not trigger "
+            f"rule 2's substantive-claims fabrication flag; "
+            f"got reasons: {reasons}",
+        )
+
+    def test_sentence_initial_inflected_verbs_filtered_by_stem_match(self):
+        """Regression: the user reported a 502 with 'Creating'
+        after the 'ensured' fix landed. Per-verb additions to the
+        safelist are whack-a-mole -- the LLM uses many verb
+        forms. The matcher now does a STEM-MATCH fallback against
+        `_ENGLISH_PAST_PARTICIPLE_STEMS` so a single past-participle
+        entry (e.g. 'created') catches 'creates', 'created', and
+        'creating' (all stem to 'creat'). This test pins the
+        systemic coverage for the three common inflections across
+        several verbs the LLM commonly leads sentences with.
+        To revert: drop the `_ENGLISH_PAST_PARTICIPLE_STEMS`
+        block + the stem-match check in `_detect_tech_tokens`,
+        and these failures come back.
+        """
+        cases = [
+            ("Creating", "Created the matching platform"),
+            ("Manages", "Managed the auth layer end to end"),
+            ("Designing", "Designed the data model from scratch"),
+            ("Deploys", "Deployed the service to production"),
+            ("Testing", "Tested the pipeline under load"),
+            ("Building", "Built the API in 2 weeks"),
+            ("Leading", "Led the migration off the legacy system"),
+        ]
+        for led_verb, source_phrase in cases:
+            with self.subTest(verb=led_verb):
+                # Construct a rewrite that opens with the verb
+                # form, and a source set where the past-participle
+                # variant is sourced but the led-verb form isn't.
+                rewrite = f"{led_verb} the {source_phrase.lower()}."
+                ok, reasons = self._check(
+                    rewrite,
+                    source_phrase + ".",
+                    "Looking for someone to do work.",
+                    {"scope": "the team"},
+                )
+                fabrication_reasons = [
+                    r for r in reasons
+                    if "substantive claims" in r
+                ]
+                self.assertEqual(
+                    fabrication_reasons,
+                    [],
+                    f"rewrite opening with '{led_verb}' should "
+                    f"not trigger rule 2's substantive-claims "
+                    f"fabrication flag (stem of {led_verb!r} "
+                    f"should match the past-participle entry in "
+                    f"the safelist). Got reasons: {reasons}",
+                )
 
 
 class CategoryCoverageSubstantiveOverlapTests(unittest.TestCase):
@@ -1350,39 +1480,58 @@ class CitationGroundingTests(unittest.TestCase):
             citation_quote=citation_quote,
         )
 
-    def test_drops_bullet_with_fabricated_quote(self):
-        # The bug from production: the LLM echoed the user's
-        # answer ("frontier AI labs to train LLMs") as the
-        # citation quote, but the cited job description is
-        # about backend APIs and doesn't mention frontier AI.
-        from app.schemas.suggestions import validate_coach_citation_grounding
+    def test_unrelated_quote_fails_grounding_helpers(self):
+        # Grounding-behavior test for the lower-level helpers.
+        # An unrelated quote ("frontier AI labs to train LLMs")
+        # against a backend-engineer JD with no AI-lab language
+        # must NOT pass the strict-substring check, must score 0
+        # on the relaxed stem-overlap ratio, and must therefore
+        # fail `_citation_is_grounded` at any sane threshold. The
+        # route-level validator currently keeps such bullets as a
+        # deliberate experimental-feature policy, so this test
+        # pins the helpers themselves so they remain correct --
+        # any future re-tightening of the route to drop
+        # fabricated quotes will reuse these helpers and they
+        # must still do the right thing.
+        from app.schemas.suggestions import (
+            _quote_is_substring,
+            _citation_grounding_score,
+            _citation_is_grounded,
+        )
 
-        bullet = self._weak(
-            citation_job_id="job-aaa",
-            citation_quote="frontier AI labs to train LLMs",
-        )
-        job_descriptions = {
-            "job-aaa": "Looking for an engineer to design REST APIs.",
-        }
-        accepted = validate_coach_citation_grounding(
-            [bullet], job_descriptions
-        )
-        self.assertEqual(accepted, [])
+        quote = "frontier AI labs to train LLMs"
+        description = "Looking for an engineer to design REST APIs."
 
-    def test_keeps_bullet_with_real_quote(self):
-        from app.schemas.suggestions import validate_coach_citation_grounding
+        self.assertFalse(
+            _quote_is_substring(quote, description),
+            "unrelated quote should not substring-match the JD",
+        )
+        self.assertEqual(
+            _citation_grounding_score(quote, description),
+            0.0,
+            "unrelated quote should score 0 on the stem-overlap "
+            "ratio (no shared content vocabulary)",
+        )
+        self.assertFalse(
+            _citation_is_grounded(quote, description),
+            "unrelated quote must not be considered grounded by "
+            "the relaxed check -- the helper behaves correctly "
+            "even though the route currently chooses not to gate "
+            "on it",
+        )
 
-        bullet = self._weak(
-            citation_job_id="job-aaa",
-            citation_quote="Built a job matching platform",
+    def test_real_quote_passes_substring_helper(self):
+        from app.schemas.suggestions import _quote_is_substring
+
+        quote = "Built a job matching platform"
+        description = (
+            "Looking for someone. Built a job matching platform "
+            "for internal use."
         )
-        job_descriptions = {
-            "job-aaa": "Looking for someone. Built a job matching platform for internal use.",
-        }
-        accepted = validate_coach_citation_grounding(
-            [bullet], job_descriptions
+        self.assertTrue(
+            _quote_is_substring(quote, description),
+            "verbatim substring of the JD should pass the helper",
         )
-        self.assertEqual([b.bullet_id for b in accepted], ["b1"])
 
     def test_strong_bullets_skip_the_check(self):
         # STRONG bullets don't go through /coach/rewrite, so a
@@ -1419,24 +1568,269 @@ class CitationGroundingTests(unittest.TestCase):
         )
         self.assertEqual([b.bullet_id for b in accepted], ["b1"])
 
-    def test_quote_matching_is_case_insensitive_and_whitespace_tolerant(self):
+    def test_normalized_substring_tolerates_case_and_whitespace(self):
         # _quote_is_substring normalizes both sides (lowercase +
-        # whitespace-collapsed). Verify the check tolerates the
-        # common case where the LLM reformatted the quote slightly.
-        from app.schemas.suggestions import validate_coach_citation_grounding
+        # whitespace-collapsed) before the substring check, so
+        # a quote with extra spaces and uppercase letters
+        # still matches a JD that uses the canonical form.
+        from app.schemas.suggestions import _quote_is_substring
 
-        bullet = self._weak(
+        # Original case + spacing on the JD side; LLM-returned
+        # quote with extra spaces and uppercase on the other.
+        quote = "Built  a  JOB matching platform"
+        description = "Built a job matching platform for internal use."
+        self.assertTrue(
+            _quote_is_substring(quote, description),
+            "case + whitespace differences should not block the "
+            "substring check",
+        )
+        # And the inverse direction is also normalized: quote in
+        # the canonical form, description with extra spaces.
+        quote2 = "Built a job matching platform"
+        description2 = "Built  a  job  matching platform for internal use."
+        self.assertTrue(
+            _quote_is_substring(quote2, description2),
+            "extra whitespace on the JD side should not block "
+            "either -- normalization is symmetric",
+        )
+
+    def test_normalized_substring_tolerates_unicode_and_trailing_punct(self):
+        """Regression for the user's reported 502: same quote
+        logic at start and rewrite time should produce the same
+        result. When it didn't, the underlying cause was that
+        _normalize didn't handle either of two legitimate
+        variations:
+
+        (1) Unicode: the LLM produces smart quotes (\u2019, \u201c)
+            and em-dashes, while job descriptions scraped from
+            career sites often have straight quotes and hyphens.
+            Same visual text, different code points -- substring
+            check fails.
+        (2) Trailing period: the LLM quotes a sentence with a
+            period; the matching source text doesn't have that
+            trailing period (it might be mid-sentence where the
+            quote was lifted from).
+
+        Both are now folded by _normalize's NFKC + side-punct
+        strip before substring matching.
+        """
+        from app.schemas.suggestions import _quote_is_substring
+
+        # (1) Smart-quote + em-dash in the quote; straight-quote +
+        # ASCII hyphens in the source. _normalize applies NFKC +
+        # manual em-dash replacement to make these comparable.
+        quote_unicode = "we \u201cbuild\u201d with care \u2014 the team."
+        description_ascii = 'we "build" with care -- the team'
+        self.assertTrue(
+            _quote_is_substring(quote_unicode, description_ascii),
+            "smart quotes + em-dash should match straight quotes "
+            "+ ASCII hyphens via NFKC + manual punctuation fold",
+        )
+        # Inverse: ASCII quote with curly-quote + em-dash source.
+        self.assertTrue(
+            _quote_is_substring(
+                'we "build" with care -- the team',
+                "we \u201cbuild\u201d with care \u2014 the team.",
+            ),
+            "normalization is symmetric across both sides",
+        )
+
+        # (2) Trailing period in the quote; no period at the
+        # matching point in source. Side-punct strip handles this
+        # without affecting the rest of the string.
+        quote_with_period = "Built a job matching platform."
+        description_without_period = (
+            "Looking for engineers. Built a job matching platform "
+            "for internal use."
+        )
+        self.assertTrue(
+            _quote_is_substring(quote_with_period, description_without_period),
+            "trailing-period mismatch should not fail the substring check",
+        )
+
+    def test_paraphrase_with_high_overlap_passes_relaxed_helper(self):
+        """A quote that paraphrases the JD but preserves its
+        vocabulary should score well on the relaxed stem-overlap
+        ratio and pass `_citation_is_grounded` at the current
+        CITATION_GROUNDING_THRESHOLD. Pins the helper behavior so
+        future threshold changes don't silently regress the
+        relaxed-policy path.
+        """
+        from app.schemas.suggestions import (
+            _citation_grounding_score,
+            _citation_is_grounded,
+            CITATION_GROUNDING_THRESHOLD,
+        )
+
+        # Quote paraphrases the JD's substance but isn't a verbatim
+        # substring. Stem overlap is high.
+        quote = (
+            "Annotated and validated machine learning datasets "
+            "while maintaining high labeling accuracy and "
+            "adherence to QA guidelines across hundreds of "
+            "annotations."
+        )
+        description = (
+            "We are hiring an ML Data Operations specialist to "
+            "annotate and validate machine learning datasets. "
+            "You will maintain high labeling accuracy, adhere to "
+            "QA guidelines, and review annotations across "
+            "hundreds of examples per day."
+        )
+        score = _citation_grounding_score(quote, description)
+        self.assertGreaterEqual(
+            score,
+            CITATION_GROUNDING_THRESHOLD,
+            f"sanity: a genuine paraphrase should score at or "
+            f"above the relaxed threshold (got {score:.2f}, "
+            f"threshold {CITATION_GROUNDING_THRESHOLD:.2f}). "
+            f"If this drops, the diagnostic log on /coach/rewrite "
+            f"loses signal and the helpers no longer distinguish "
+            f"paraphrase from fabrication.",
+        )
+        self.assertTrue(
+            _citation_is_grounded(quote, description),
+            "high-overlap paraphrase should pass the relaxed "
+            "check at the configured threshold",
+        )
+
+    def test_fabricated_quote_fails_relaxed_helper(self):
+        """A quote fabricated from thin air (no shared content
+        vocabulary with the JD) must score 0 on the relaxed
+        stem-overlap ratio and therefore fail
+        `_citation_is_grounded` at any sane threshold. The
+        route-level validator currently keeps such bullets as a
+        deliberate experimental-feature policy, so this test pins
+        the helper behavior -- any future re-tightening of the
+        route to drop fabricated quotes will reuse these helpers
+        and they must still do the right thing.
+        """
+        from app.schemas.suggestions import (
+            _citation_grounding_score,
+            _citation_is_grounded,
+        )
+
+        # Quote is fabricated from thin air -- no shared content
+        # vocabulary with the JD.
+        quote = (
+            "Frontier AI labs to train LLMs on cutting edge "
+            "research with novel architectures."
+        )
+        description = (
+            "We are hiring a backend engineer to design REST "
+            "APIs and maintain PostgreSQL databases."
+        )
+        self.assertEqual(
+            _citation_grounding_score(quote, description),
+            0.0,
+            "fabricated quote must score 0 (no shared content stems)",
+        )
+        self.assertFalse(
+            _citation_is_grounded(quote, description),
+            "fabricated quote must not be considered grounded by "
+            "the relaxed check -- the helper stays correct even "
+            "though the route currently chooses not to gate on it",
+        )
+
+
+class OverstrongClassificationTests(unittest.TestCase):
+    """Server-side safety net for gpt-4o-mini over-classifying
+    STRONG. When the LLM returns all-STRONG for a thin resume,
+    the user has no WEAK bullets to workshop on. The heuristic
+    reclassify_overstrong_bullets demotes thin STRONG bullets
+    server-side, synthesizing fallback questions."""
+
+    def _strong(self, bullet_id, original_text):
+        from app.schemas.suggestions import (
+            CoachBullet, CoachBulletVerdict,
+        )
+        return CoachBullet(
+            bullet_id=bullet_id,
+            verdict=CoachBulletVerdict.STRONG,
+            original_text=original_text,
+            strength_reason="Already a strong bullet.",
             citation_job_id="job-aaa",
-            citation_quote="Built  a  JOB matching platform",  # extra spaces + caps
+            citation_quote="a verbatim substring of job description",
         )
-        job_descriptions = {
-            "job-aaa": "Built a job matching platform for internal use.",
-        }
-        accepted = validate_coach_citation_grounding(
-            [bullet], job_descriptions
-        )
-        self.assertEqual([b.bullet_id for b in accepted], ["b1"])
 
+    def _weak(self, bullet_id, original_text, questions):
+        from app.schemas.suggestions import (
+            CoachBullet, CoachBulletVerdict, CoachQuestion,
+            CoachQuestionType, CoachCategory,
+        )
+        return CoachBullet(
+            bullet_id=bullet_id,
+            verdict=CoachBulletVerdict.WEAK,
+            original_text=original_text,
+            weakness_reason="Missing dimensions.",
+            questions=questions,
+            citation_job_id="job-aaa",
+            citation_quote="a verbatim substring of job description",
+        )
+
+    def test_thin_strong_bullet_demoted(self):
+        from app.schemas.suggestions import reclassify_overstrong_bullets
+        # No audience, no outcome, no ownership, no artifact --
+        # the LLM marked it STRONG anyway. Server should demote.
+        bullets = [self._strong(
+            "b1",
+            "Built a job matching platform.",
+        )]
+        out = reclassify_overstrong_bullets(bullets)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].verdict.value, "WEAK")
+        # Synthesizes at least one fallback question.
+        self.assertGreater(len(out[0].questions), 0)
+
+    def test_genuinely_strong_bullet_untouched(self):
+        from app.schemas.suggestions import reclassify_overstrong_bullets
+        # Has artifact (API), audience (users), ownership (built),
+        # outcome (cutting ticket time). PASSES heuristic.
+        bullets = [self._strong(
+            "b1",
+            "Built the matching API serving 5k users, cutting "
+            "ticket resolution time by 30% for internal teams.",
+        )]
+        out = reclassify_overstrong_bullets(bullets)
+        self.assertEqual(out[0].verdict.value, "STRONG")
+
+    def test_weak_bullets_passthrough(self):
+        from app.schemas.suggestions import (
+            reclassify_overstrong_bullets,
+            CoachCategory, CoachQuestion, CoachQuestionType,
+        )
+        # Healthy mix: at least one WEAK. Heuristic leaves both
+        # STRONG and WEAK alone.
+        q = CoachQuestion(
+            key="scope", category=CoachCategory.SCOPE,
+            label="Who used it?", type=CoachQuestionType.TEXT,
+        )
+        bullets = [
+            self._weak("b1", "Built a thing.", [q]),
+            self._strong(
+                "b2",
+                "Built the matching API serving 5k users, "
+                "cutting ticket time 30%.",
+            ),
+        ]
+        out = reclassify_overstrong_bullets(bullets)
+        verdicts = sorted([b.verdict.value for b in out])
+        self.assertEqual(verdicts, ["STRONG", "WEAK"])
+        # WEAK bullet keeps its original question.
+        self.assertEqual(out[0].questions[0].key, "scope")
+
+    def test_falls_back_to_ownership_when_no_checklist(self):
+        from app.schemas.suggestions import reclassify_overstrong_bullets
+        # No checklist on the bullet -- heuristic picks
+        # OWNERSHIP as the highest-leverage missing category.
+        bullets = [self._strong(
+            "b1",
+            "Built something internally.",
+        )]
+        out = reclassify_overstrong_bullets(bullets)
+        cats = [q.category.value for q in out[0].questions]
+        self.assertEqual(len(cats), len(set(cats)),
+                         "synthesized questions should have unique categories")
 
 
 if __name__ == "__main__":

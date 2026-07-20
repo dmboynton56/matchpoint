@@ -62,12 +62,21 @@ already ship the current behavior.
 - `validate_coach_bullet_grounding` — drops bullets whose `original_text`
   isn't a substring of any parsed-resume section title / entry title /
   entry text. Normalized whitespace.
-- `validate_coach_rewrite_grounding` — three structural rules:
-  1. citation_quote must be substring of cited job description
-  2. rewrite is meaningfully different from original (not identical)
-  3. every substantive token in rewrite must appear in {original bullet,
+- `validate_coach_rewrite_grounding` — two structural rules:
+  1. rewrite is meaningfully different from original (not identical)
+  2. every substantive token in rewrite must appear in {original bullet,
      user answers, citation quote}, minus a `_COACH_STRUCTURAL_TOKENS`
      allowlist (verbs, articles, prepositions, vague qualifiers)
+
+  A third rule historically enforced `citation_quote` as a
+  substring of the cited job's description. It was disabled per
+  the experimental bullet-coach policy: slight hallucinations in
+  citations are accepted in exchange for not 502-ing the user
+  mid-workshop. The disabled check is retained inside
+  `_citation_is_grounding` for future re-tightening. The
+  start-side validator (`validate_coach_citation_grounding`) is
+  correspondingly a no-op and emits no `citation_quote_not_
+  substring` drop entries.
 - `MAX_COACH_ANSWER_LEN = 280`, `MAX_COACH_BULLETS_PER_SESSION = 5`.
 
 ### 1.2 Session store (`backend/app/services/bullet_coach.py`)

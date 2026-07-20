@@ -271,7 +271,8 @@ function BulletCoachWeakItem({
                     <button
                       type="button"
                       onClick={() => onToggleSkip(question.category)}
-                      className="text-[10px] font-medium text-muted-foreground hover:text-foreground"
+                      disabled={pending}
+                      className="text-[10px] font-medium text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       {isSkipped ? "Unskip" : "Skip"}
                     </button>
@@ -293,9 +294,10 @@ function BulletCoachWeakItem({
                       onChange={(event) =>
                         onAnswerChange(key, event.target.value)
                       }
+                      disabled={pending}
                       rows={2}
                       placeholder="A short description — qualitative, not a number."
-                      className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground placeholder:text-muted-foreground/60 focus:border-primary focus:outline-none"
+                      className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground placeholder:text-muted-foreground/60 focus:border-primary focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
                     />
                   )}
                 </li>
@@ -539,12 +541,19 @@ export function ResumeSuggestionsCard({ enabled }: ResumeSuggestionsCardProps) {
     setState((current) => {
       if (current.kind !== "coach_ready") return current
       const existing = current.answers[bulletId] ?? {}
+      // Clear any visible rewrite for this bullet -- an answer
+      // change invalidates the prior response. The user re-runs
+      // Get rewrite against the new input. Keyed by bullet_id so
+      // rewrites for other bullets in the same session stay put.
+      const rewrites = { ...current.rewrites }
+      delete rewrites[bulletId]
       return {
         ...current,
         answers: {
           ...current.answers,
           [bulletId]: { ...existing, [key]: value },
         },
+        rewrites,
       }
     })
   }
@@ -595,6 +604,13 @@ export function ResumeSuggestionsCard({ enabled }: ResumeSuggestionsCardProps) {
           }
         }
       }
+      // Clear any visible rewrite for this bullet -- toggling
+      // a skip changes which answers reach the rewrite prompt
+      // (filtering rule in bullet_coach_llm + the routes.py
+      // non_skipped_answers filter), so the prior response is
+      // stale the moment the skip set changes.
+      const rewrites = { ...current.rewrites }
+      delete rewrites[bulletId]
       return {
         ...current,
         skipped_categories: {
@@ -602,6 +618,7 @@ export function ResumeSuggestionsCard({ enabled }: ResumeSuggestionsCardProps) {
           [bulletId]: next,
         },
         answers: nextAnswers,
+        rewrites,
       }
     })
   }
