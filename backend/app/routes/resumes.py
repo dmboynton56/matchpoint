@@ -391,12 +391,25 @@ async def handle_authenticated_upload(
     started_at = _log_upload_stage("storage_upload", started_at)
     embedding = generateEmbedding(extracted_text)
     started_at = _log_upload_stage("resume_embedding", started_at)
-    supabase.table("profiles").update(
+    # Upsert rather than update so the profile row is CREATED for
+    # brand-new accounts. PostgREST's .update().eq() silently affects
+    # 0 rows when the row doesn't exist yet, which means resume_text
+    # and resume_embedding never land for the user even though the
+    # upload reports success and the matches get persisted (matching
+    # uses extracted_text directly, not the profile). The downstream
+    # symptom is /suggestions/refresh failing on the next request
+    # because _fetch_resume_text returns null. Same upsert pattern
+    # the frontend uses in updateProfilePreferences / updateProfileTargetRole.
+    # Note: supabase-py takes on_conflict as a keyword string
+    # (snake_case), not a dict like the JS client.
+    supabase.table("profiles").upsert(
         {
+            "id": user_id,
             "resume_text": extracted_text,
             "resume_embedding": embedding,
-        }
-    ).eq("id", user_id).execute()
+        },
+        on_conflict="id",
+    ).execute()
     started_at = _log_upload_stage("profile_update", started_at)
 
     jobs = recalculate_job_matches_for_user(
