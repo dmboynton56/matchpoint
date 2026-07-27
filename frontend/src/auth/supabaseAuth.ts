@@ -101,6 +101,13 @@ export type ProfilePreferences = {
   preferred_work_modes: string[]
   minimum_base_salary: number | null
   salary_currency: string
+
+  preferred_country_codes: string[]
+  preferred_city: string | null
+  preferred_lat: number | null
+  preferred_lon: number | null
+  preferred_radius_km: number | null
+  target_seniority: string[]
 }
 
 export const getProfilePreferences = async (

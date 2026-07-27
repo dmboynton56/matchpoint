@@ -25,6 +25,6 @@ export const geocodeCityForProfile = async (
 ): Promise<GeocodeCityResult> => {
   return apiFetch<GeocodeCityResult>("/profile/geocode-city", {
     method: "POST",
-    body: { city },
+    body: JSON.stringify({ city }),
   })
 }
