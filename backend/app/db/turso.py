@@ -19,6 +19,8 @@ Public surface used by the rest of the app:
 
 from __future__ import annotations
 
+import gzip
+import io
 import json
 import os
 import pathlib
@@ -122,6 +124,17 @@ BROWSE_EXTRA_COLUMNS: list[tuple[str, str]] = [
     ("experience_level", "TEXT"),
     ("job_type", "TEXT"),
     ("metadata_derived_at", "TEXT"),
+    # Geolocation columns — populated by services/geo.py at pipeline time.
+    # Stored as ISO 3166-1 alpha-2 country code (e.g. "US") so the read path
+    # can do structured country-set comparisons against profile preferences.
+    ("geo_country_code", "TEXT"),
+    ("geo_city", "TEXT"),
+    ("geo_region", "TEXT"),
+    ("geo_lat", "REAL"),
+    ("geo_lon", "REAL"),
+    ("geo_confidence", "REAL"),
+    ("geo_source", "TEXT"),
+    ("geocoded_at", "TEXT"),
 ]
 
 BROWSE_INDEXES_SQL = [
@@ -130,7 +143,54 @@ BROWSE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_jobs_experience_level ON jobs (experience_level)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_job_type ON jobs (job_type)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_pay_min ON jobs (pay_min)",
+    # Country-code index lets the read path filter candidate jobs by the
+    # user's preferred_country_codes set without a full scan. libSQL supports
+    # indexed TEXT equality, which is all we need here.
+    "CREATE INDEX IF NOT EXISTS idx_jobs_geo_country_code ON jobs (geo_country_code)",
 ]
+
+# Geocode cache: keyed by a SHA-256 of the normalized input string. Place
+# strings don't change meaning over time, so we never expire entries — the
+# table grows slowly (one row per unique location string ever seen) and is
+# the difference between "one Photon call per job per day" and "one Photon
+# call per unique location string ever." Permanent by design.
+GEOCODE_CACHE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS geocode_cache (
+    location_key TEXT PRIMARY KEY,
+    location_raw TEXT NOT NULL,
+    geo_country_code TEXT,
+    geo_city TEXT,
+    geo_region TEXT,
+    geo_lat REAL,
+    geo_lon REAL,
+    geo_confidence REAL,
+    geo_source TEXT,
+    geocoded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_geocode_cache_country ON geocode_cache (geo_country_code);
+"""
+
+
+# Reference data: GeoNames cities15000.txt. ~25k cities, public domain,
+# one-time build via scripts/build_geonames_cache.py. The pipeline
+# reads from this table to geocode job location strings — no live
+# network calls. `name_lower` is the lookup key; `country_code` and
+# `admin1` are disambiguation when multiple cities share a name
+# (e.g. Portland, OR vs Portland, ME). `population` is a tiebreaker
+# so the most-likely-intended city wins for ambiguous names.
+GEOCITIES_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS geo_cities (
+    name_lower TEXT NOT NULL,
+    country_code TEXT NOT NULL,
+    admin1 TEXT,
+    lat REAL NOT NULL,
+    lon REAL NOT NULL,
+    population INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (name_lower, country_code, admin1)
+);
+CREATE INDEX IF NOT EXISTS idx_geo_cities_name ON geo_cities (name_lower);
+CREATE INDEX IF NOT EXISTS idx_geo_cities_country ON geo_cities (country_code);
+"""
 
 DATE_POSTED_WINDOW_DAYS: dict[str, int] = {
     "24h": 1,
@@ -266,6 +326,8 @@ def init_schema(client: "libsql.Connection | None" = None) -> None:  # type: ign
         warm = False
     if warm:
         _ensure_browse_columns(conn)
+        _ensure_geocode_cache_table(conn)
+        _ensure_geo_cities_table(conn)
         return
     # libsql's HTTP transport (Hrana) rejects multi-statement payloads, so
     # apply each DDL statement individually. Wrap each in try/except so a
@@ -359,6 +421,8 @@ def init_schema(client: "libsql.Connection | None" = None) -> None:  # type: ign
             "table (defaulted to 'greenhouse' for legacy rows)"
         )
     _ensure_browse_columns(conn)
+    _ensure_geocode_cache_table(conn)
+    _ensure_geo_cities_table(conn)
     conn.commit()
 
 
@@ -371,6 +435,45 @@ def _ensure_browse_columns(conn) -> None:
             conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {col_type}")
     for stmt in BROWSE_INDEXES_SQL:
         conn.execute(stmt)
+
+
+def _ensure_geocode_cache_table(conn) -> None:
+    """Idempotently create the geocode_cache table. Safe to call repeatedly.
+
+    The DDL is a single CREATE TABLE + INDEX pair split into two statements
+    because the Hrana HTTP transport rejects multi-statement payloads,
+    matching the pattern used elsewhere in this module. We swallow exceptions
+    so a stale or sandboxed libsql build never blocks the rest of the schema
+    migration — the table is best-effort, and the geocoding path falls back
+    to "unresolved" entries if the cache is missing.
+    """
+    for stmt in _split_statements(GEOCODE_CACHE_SCHEMA_SQL):
+        try:
+            conn.execute(stmt)
+        except Exception as exc:
+            print(
+                f"[init_schema] geocode_cache DDL skipped "
+                f"({type(exc).__name__}): {exc}"
+            )
+
+
+def _ensure_geo_cities_table(conn) -> None:
+    """Idempotently create the geo_cities reference table.
+
+    Mirrors the geocode_cache pattern: DDL is best-effort and split into
+    one-statement-per-line because the Hrana HTTP transport rejects
+    multi-statement payloads. The table starts empty after a fresh
+    migration — populate it with scripts/build_geonames_cache.py.
+    """
+    for stmt in _split_statements(GEOCITIES_SCHEMA_SQL):
+        try:
+            conn.execute(stmt)
+        except Exception as exc:
+            print(
+                f"[init_schema] geo_cities DDL skipped "
+                f"({type(exc).__name__}): {exc}"
+            )
+
 
 
 def _schema_is_warm(conn) -> bool:
@@ -467,8 +570,11 @@ def upsert_jobs(jobs: list[dict]) -> int:
         "(external_id, company, title, description, location, posted_at, "
         "apply_url, source, embedding, last_seen_at, summary, summary_source_hash, "
         "summary_model, summary_generated_at, workplace_type, pay_min, pay_max, "
-        "pay_currency, experience_level, job_type, metadata_derived_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "pay_currency, experience_level, job_type, metadata_derived_at, "
+        "geo_country_code, geo_city, geo_region, geo_lat, geo_lon, "
+        "geo_confidence, geo_source, geocoded_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+        "?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(external_id) DO UPDATE SET "
         "company=excluded.company, "
         "title=excluded.title, "
@@ -500,7 +606,27 @@ def upsert_jobs(jobs: list[dict]) -> int:
         "job_type=CASE WHEN excluded.job_type IS NOT NULL "
         "THEN excluded.job_type ELSE jobs.job_type END, "
         "metadata_derived_at=CASE WHEN excluded.metadata_derived_at IS NOT NULL "
-        "THEN excluded.metadata_derived_at ELSE jobs.metadata_derived_at END"
+        "THEN excluded.metadata_derived_at ELSE jobs.metadata_derived_at END, "
+        # Geo columns use the same first-write-wins semantics as the other
+        # derived columns: once a row has been geocoded, a re-scraped job
+        # without geo fields should NOT blank out the existing values. The
+        # backfill script is the only path that ever overwrites these.
+        "geo_country_code=CASE WHEN excluded.geo_country_code IS NOT NULL "
+        "THEN excluded.geo_country_code ELSE jobs.geo_country_code END, "
+        "geo_city=CASE WHEN excluded.geo_city IS NOT NULL "
+        "THEN excluded.geo_city ELSE jobs.geo_city END, "
+        "geo_region=CASE WHEN excluded.geo_region IS NOT NULL "
+        "THEN excluded.geo_region ELSE jobs.geo_region END, "
+        "geo_lat=CASE WHEN excluded.geo_lat IS NOT NULL "
+        "THEN excluded.geo_lat ELSE jobs.geo_lat END, "
+        "geo_lon=CASE WHEN excluded.geo_lon IS NOT NULL "
+        "THEN excluded.geo_lon ELSE jobs.geo_lon END, "
+        "geo_confidence=CASE WHEN excluded.geo_confidence IS NOT NULL "
+        "THEN excluded.geo_confidence ELSE jobs.geo_confidence END, "
+        "geo_source=CASE WHEN excluded.geo_source IS NOT NULL "
+        "THEN excluded.geo_source ELSE jobs.geo_source END, "
+        "geocoded_at=CASE WHEN excluded.geocoded_at IS NOT NULL "
+        "THEN excluded.geocoded_at ELSE jobs.geocoded_at END"
     )
     for job in jobs:
         external_id = job.get("external_id")
@@ -533,6 +659,14 @@ def upsert_jobs(jobs: list[dict]) -> int:
                 job.get("experience_level"),
                 job.get("job_type"),
                 job.get("metadata_derived_at"),
+                job.get("geo_country_code"),
+                job.get("geo_city"),
+                job.get("geo_region"),
+                job.get("geo_lat"),
+                job.get("geo_lon"),
+                job.get("geo_confidence"),
+                job.get("geo_source"),
+                job.get("geocoded_at"),
             ],
         )
         sent += 1
@@ -568,6 +702,351 @@ def purge_older_than(cutoff_iso: str) -> int:
     )
     conn.commit()
     return int(getattr(cursor, "rowcount", 0) or 0)
+
+
+# -----------------------------------------------------------------------------
+# Geocode cache (services/geo.py)
+# -----------------------------------------------------------------------------
+# Permanent cache, keyed by hash of the normalized location string. Lookups
+# hit the primary key (single-row read), writes are upserts. The cache table
+# is created lazily by init_schema() so it is always present by the time a
+# geocoding call happens.
+GEOCODE_CACHE_COLUMNS = (
+    "geo_country_code", "geo_city", "geo_region",
+    "geo_lat", "geo_lon", "geo_confidence", "geo_source", "geocoded_at",
+)
+
+
+# In-memory cache of the geo_cities dataset, loaded from the
+# data-cache branch on first read. The structure is:
+#   _geo_cities_cache: dict[str, list[dict]] mapping name_lower ->
+#   list of city records, sorted by population DESC.
+_geo_cities_cache = None
+_geo_cities_load_error = None
+_geo_cities_loaded = False
+_geo_cities_lock = threading.Lock()
+
+
+def _load_geo_cities_from_github():
+    """Fetch the gzipped geo_cities JSON from the data-cache branch."""
+    if not GITHUB_REPO_OWNER or not GITHUB_REPO_NAME:
+        return None
+    api_url = (
+        f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}"
+        f"/git/ref/heads/{EMBEDDINGS_BRANCH_REF}"
+    )
+    try:
+        with httpx.Client(timeout=EMBEDDINGS_FETCH_TIMEOUT_SECONDS,
+                          follow_redirects=True) as client:
+            resp = client.get(
+                api_url,
+                headers={"Accept": "application/vnd.github+json"},
+            )
+            if resp.status_code == 404:
+                print(
+                    f"[geo_cities] branch {EMBEDDINGS_BRANCH_REF!r} not "
+                    f"found on {GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME} "
+                    f"(404). Has build_geonames_cache been run yet?"
+                )
+                return None
+            resp.raise_for_status()
+            sha = resp.json()["object"]["sha"]
+            base = (
+                f"https://raw.githubusercontent.com/{GITHUB_REPO_OWNER}/"
+                f"{GITHUB_REPO_NAME}/{sha}/data/geo_cities"
+            )
+            file_resp = client.get(f"{base}/cities.json.gz")
+            file_resp.raise_for_status()
+    except Exception as exc:
+        print(
+            f"[geo_cities] data-cache fetch failed "
+            f"({type(exc).__name__}): {exc}"
+        )
+        return None
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(file_resp.content)) as gz:
+            raw = gz.read()
+        records = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        print(
+            f"[geo_cities] failed to parse gzipped JSON "
+            f"({type(exc).__name__}): {exc}"
+        )
+        return None
+    by_name = {}
+    for r in records:
+        nl = r.get("name_lower")
+        if not nl:
+            continue
+        by_name.setdefault(nl, []).append({
+            "country_code": r.get("country_code"),
+            "admin1": r.get("admin1") or "",
+            "lat": r.get("lat"),
+            "lon": r.get("lon"),
+            "population": r.get("population") or 0,
+        })
+    print(f"[geo_cities] loaded {len(records)} records "
+          f"({len(by_name)} unique names) from data-cache")
+    return by_name
+
+
+def _load_geo_cities_from_local():
+    """Load the gzipped JSON from a local file path. Used in tests."""
+    from app.services.git_data_cache import GEO_CITIES_REL_PATH
+    local_dir = pathlib.Path(EMBEDDINGS_LOCAL_PATH)
+    file_path = local_dir / pathlib.Path(GEO_CITIES_REL_PATH).name
+    if not file_path.exists():
+        return None
+    try:
+        with gzip.GzipFile(file_path, "rb") as gz:
+            raw = gz.read()
+        records = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        print(f"[geo_cities] local load failed: {exc}")
+        return None
+    by_name = {}
+    for r in records:
+        nl = r.get("name_lower")
+        if not nl:
+            continue
+        by_name.setdefault(nl, []).append({
+            "country_code": r.get("country_code"),
+            "admin1": r.get("admin1") or "",
+            "lat": r.get("lat"),
+            "lon": r.get("lon"),
+            "population": r.get("population") or 0,
+        })
+    return by_name
+
+
+def _get_geo_cities_cache():
+    """Lazy-load the in-memory geo_cities dict, once per process."""
+    global _geo_cities_cache, _geo_cities_loaded, _geo_cities_load_error
+    if _geo_cities_loaded:
+        return _geo_cities_cache
+    with _geo_cities_lock:
+        if _geo_cities_loaded:
+            return _geo_cities_cache
+        source = EMBEDDINGS_SOURCE.lower()
+        cache = None
+        if source == "github":
+            cache = _load_geo_cities_from_github()
+        elif source == "local":
+            cache = _load_geo_cities_from_local()
+        if cache is None and source != "turso":
+            if source == "github":
+                cache = _load_geo_cities_from_local()
+            elif source == "local":
+                cache = _load_geo_cities_from_github()
+        if cache is None:
+            _geo_cities_load_error = (
+                f"data-cache unavailable (source={source!r}); "
+                f"falling back to Turso SQL"
+            )
+            print(f"[geo_cities] {_geo_cities_load_error}")
+        _geo_cities_cache = cache
+        _geo_cities_loaded = True
+        return cache
+
+
+def _lookup_geo_cities_sql(name_lower):
+    """SQL fallback. Used only when the data-cache is unavailable."""
+    try:
+        conn = get_client()
+        cursor = conn.execute(
+            "SELECT country_code, admin1, lat, lon, population "
+            "FROM geo_cities WHERE name_lower = ? "
+            "ORDER BY population DESC",
+            [name_lower],
+        )
+    except Exception as exc:
+        print(f"[geo_cities] SQL read failed ({type(exc).__name__}): {exc}")
+        return []
+    return [
+        {
+            "country_code": row[0],
+            "admin1": row[1],
+            "lat": row[2],
+            "lon": row[3],
+            "population": row[4],
+        }
+        for row in cursor.fetchall()
+    ]
+
+
+def lookup_geo_cities(name_lower):
+    """Return all cities matching ``name_lower``.
+
+    Primary path: in-memory dict loaded from the data-cache branch.
+    Fallback path: SQL against the geo_cities table in Turso.
+    """
+    if not name_lower:
+        return []
+    cache = _get_geo_cities_cache()
+    if cache is not None:
+        return cache.get(name_lower, [])
+    return _lookup_geo_cities_sql(name_lower)
+
+
+def upsert_geo_cities_batch(rows: list[dict]) -> int:
+    """Bulk insert into geo_cities. ON CONFLICT replaces existing rows.
+
+    Used by the one-time build script. ``rows`` is a list of dicts with
+    keys: name_lower, country_code, admin1, lat, lon, population.
+
+    Performance note: a single multi-row INSERT with 500 value groups
+    is ~16x faster than 500 individual executes against libSQL's Hrana
+    transport. We use the multi-row form here.
+
+    Resilience: the build script inserts 193k rows in 387 batches. Turso's
+    HTTP transport occasionally drops the connection mid-batch with
+    "Connection reset by peer." When that happens we reconnect and retry
+    the failed batch, so a transient network blip doesn't lose the whole
+    run.
+    """
+    if not rows:
+        return 0
+    BATCH_SIZE = 500
+    sent = 0
+    for i in range(0, len(rows), BATCH_SIZE):
+        chunk = rows[i:i + BATCH_SIZE]
+        # Build a single multi-row INSERT. 500 rows × 6 params = 3000
+        # placeholders, ~24KB SQL — well under the 1MB Hrana limit.
+        placeholders = ",".join(["(?, ?, ?, ?, ?, ?)"] * len(chunk))
+        sql = (
+            "INSERT INTO geo_cities "
+            "(name_lower, country_code, admin1, lat, lon, population) "
+            f"VALUES {placeholders} "
+            "ON CONFLICT(name_lower, country_code, admin1) DO UPDATE SET "
+            "lat=excluded.lat, lon=excluded.lon, population=excluded.population"
+        )
+        flat: list = []
+        for row in chunk:
+            flat.append(row.get("name_lower"))
+            flat.append(row.get("country_code"))
+            flat.append(row.get("admin1") or "")
+            flat.append(row.get("lat"))
+            flat.append(row.get("lon"))
+            flat.append(row.get("population") or 0)
+        # Retry loop: on connection reset, reconnect and try again.
+        # On any other exception, propagate — we don't want to silently
+        # skip bad data.
+        for attempt in range(3):
+            try:
+                conn = get_client()
+                conn.execute(sql, flat)
+                conn.commit()
+                sent += len(chunk)
+                break
+            except Exception as exc:
+                err_str = str(exc).lower()
+                is_transient = (
+                    "connection reset" in err_str
+                    or "connection error" in err_str
+                    or "timeout" in err_str
+                    or "remote disconnected" in err_str
+                    or "broken pipe" in err_str
+                )
+                if not is_transient or attempt == 2:
+                    raise
+                print(
+                    f"[upsert_geo_cities_batch] transient error on batch "
+                    f"{i // BATCH_SIZE + 1}, retrying: {exc}"
+                )
+                # Force a fresh connection on the next attempt.
+                close()
+    return sent
+
+
+def count_geo_cities() -> int:
+    """Return the row count of geo_cities. Used by the build script to
+    confirm the table is populated."""
+    try:
+        conn = get_client()
+        cursor = conn.execute("SELECT COUNT(*) FROM geo_cities")
+        return int(cursor.fetchone()[0] or 0)
+    except Exception:
+        return 0
+
+
+def get_cached_geocode(location_key: str) -> dict | None:
+    """Return the cached geocode result for a normalized location key.
+
+    Returns None if the key is missing or the cache table is unreadable. The
+    geocoding path treats None as "not cached, go to Photon."
+    """
+    if not location_key:
+        return None
+    try:
+        conn = get_client()
+        cursor = conn.execute(
+            "SELECT geo_country_code, geo_city, geo_region, geo_lat, geo_lon, "
+            "geo_confidence, geo_source, geocoded_at FROM geocode_cache "
+            "WHERE location_key = ?",
+            [location_key],
+        )
+    except Exception as exc:
+        # Cache table missing or transient read failure — treat as miss.
+        print(f"[geocode_cache] read failed ({type(exc).__name__}): {exc}")
+        return None
+    row = cursor.fetchone()
+    if not row:
+        return None
+    return {
+        "geo_country_code": row[0],
+        "geo_city": row[1],
+        "geo_region": row[2],
+        "geo_lat": row[3],
+        "geo_lon": row[4],
+        "geo_confidence": row[5],
+        "geo_source": row[6],
+        "geocoded_at": row[7],
+    }
+
+
+def set_cached_geocode(location_key: str, location_raw: str, result: dict) -> None:
+    """Write-through upsert a geocode result. Exceptions are logged, not raised.
+
+    The cache is a write-through accelerator, not a source of truth — callers
+    always accept the result regardless of whether the write succeeded. The
+    `geocoded_at` is set by the caller's clock (UTC ISO) so the cache column
+    reflects when the geocoding actually happened.
+    """
+    if not location_key:
+        return
+    try:
+        conn = get_client()
+        conn.execute(
+            "INSERT INTO geocode_cache "
+            "(location_key, location_raw, geo_country_code, geo_city, geo_region, "
+            "geo_lat, geo_lon, geo_confidence, geo_source, geocoded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(location_key) DO UPDATE SET "
+            "location_raw=excluded.location_raw, "
+            "geo_country_code=excluded.geo_country_code, "
+            "geo_city=excluded.geo_city, "
+            "geo_region=excluded.geo_region, "
+            "geo_lat=excluded.geo_lat, "
+            "geo_lon=excluded.geo_lon, "
+            "geo_confidence=excluded.geo_confidence, "
+            "geo_source=excluded.geo_source, "
+            "geocoded_at=excluded.geocoded_at",
+            [
+                location_key,
+                location_raw,
+                result.get("geo_country_code"),
+                result.get("geo_city"),
+                result.get("geo_region"),
+                result.get("geo_lat"),
+                result.get("geo_lon"),
+                result.get("geo_confidence"),
+                result.get("geo_source"),
+                result.get("geocoded_at"),
+            ],
+        )
+        conn.commit()
+    except Exception as exc:
+        print(f"[geocode_cache] write failed ({type(exc).__name__}): {exc}")
 
 
 def _experience_level_filter_sql(levels: list[str]) -> tuple[str, list[Any]]:
@@ -871,6 +1350,90 @@ def batch_update_job_metadata(updates: list[tuple[str, dict]]) -> None:
                 metadata.get("experience_level"),
                 metadata.get("job_type"),
                 metadata.get("metadata_derived_at"),
+                job_id,
+            ],
+        )
+    conn.commit()
+
+
+# -----------------------------------------------------------------------------
+# Geolocation backfill helpers
+# -----------------------------------------------------------------------------
+# Mirrors the metadata-backfill pattern: the backfill script fetches rows
+# that are still missing geo, calls geocode_job_location() per row, and
+# writes the result back in a single batched UPDATE. The pipeline also
+# calls these helpers on every new row before the upsert goes through.
+JOB_GEO_COLUMNS = (
+    "geo_country_code", "geo_city", "geo_region",
+    "geo_lat", "geo_lon", "geo_confidence", "geo_source", "geocoded_at",
+)
+
+
+def fetch_jobs_for_geo_backfill(*, limit: int = 100) -> list[dict]:
+    """Return jobs that have a location but have never been geocoded.
+
+    The gate is ``geocoded_at IS NULL`` — not ``geo_country_code IS NULL`` —
+    because we want to skip macro/unresolved rows on subsequent runs too.
+    Without this, a row resolving to "Remote" would be re-fetched every
+    iteration of the backfill loop forever, since the macro path always
+    leaves geo_country_code NULL. The backfill only runs once per cluster,
+    but the seed/install path can be re-invoked to retry a Photon outage
+    without re-doing the unresolved work.
+    """
+    conn = get_client()
+    cursor = conn.execute(
+        "SELECT id, location FROM jobs "
+        "WHERE location IS NOT NULL AND location != '' "
+        "AND geocoded_at IS NULL LIMIT ?",
+        [limit],
+    )
+    return _fetchall_dicts(cursor)
+
+
+def update_job_geo(job_id: str, geo: dict) -> None:
+    """Write the geo_* columns for a single job. ``id`` is the Turso UUID."""
+    conn = get_client()
+    conn.execute(
+        "UPDATE jobs SET geo_country_code = ?, geo_city = ?, geo_region = ?, "
+        "geo_lat = ?, geo_lon = ?, geo_confidence = ?, geo_source = ?, "
+        "geocoded_at = ? WHERE id = ?",
+        [
+            geo.get("geo_country_code"),
+            geo.get("geo_city"),
+            geo.get("geo_region"),
+            geo.get("geo_lat"),
+            geo.get("geo_lon"),
+            geo.get("geo_confidence"),
+            geo.get("geo_source"),
+            geo.get("geocoded_at"),
+            job_id,
+        ],
+    )
+    conn.commit()
+
+
+def batch_update_job_geo(updates: list[tuple[str, dict]]) -> None:
+    """Batched version of update_job_geo. One transaction, N rows."""
+    if not updates:
+        return
+    conn = get_client()
+    sql = (
+        "UPDATE jobs SET geo_country_code = ?, geo_city = ?, geo_region = ?, "
+        "geo_lat = ?, geo_lon = ?, geo_confidence = ?, geo_source = ?, "
+        "geocoded_at = ? WHERE id = ?"
+    )
+    for job_id, geo in updates:
+        conn.execute(
+            sql,
+            [
+                geo.get("geo_country_code"),
+                geo.get("geo_city"),
+                geo.get("geo_region"),
+                geo.get("geo_lat"),
+                geo.get("geo_lon"),
+                geo.get("geo_confidence"),
+                geo.get("geo_source"),
+                geo.get("geocoded_at"),
                 job_id,
             ],
         )
@@ -1191,16 +1754,20 @@ def _vector_search_legacy(
 
 
 def fetch_full_jobs(job_ids: list[str]) -> dict[str, dict]:
-    """Return `{job_id: {id, title, company, location, apply_url, description, posted_at}}`
+    """Return `{job_id: {id, title, company, location, apply_url, description, posted_at, geo_*}}`
     for the given ids. Preserves the dict-by-id shape that
-    `routes/resumes.py.fetch_full_jobs` already used to return.
+    `routes/resumes.py.fetch_full_jobs` already used to return, plus the
+    geo_* columns so the read path can compare against user preferences
+    without a second round-trip.
     """
     if not job_ids:
         return {}
     conn = get_client()
     placeholders = ",".join(["?"] * len(job_ids))
     sql = (
-        "SELECT id, title, company, location, apply_url, description, posted_at "
+        "SELECT id, title, company, location, apply_url, description, posted_at, "
+        "geo_country_code, geo_city, geo_region, geo_lat, geo_lon, "
+        "geo_confidence, geo_source, geocoded_at "
         f"FROM jobs WHERE id IN ({placeholders})"
     )
     cursor = conn.execute(sql, list(job_ids))
@@ -1213,6 +1780,14 @@ def fetch_full_jobs(job_ids: list[str]) -> dict[str, dict]:
             "apply_url": row[4],
             "description": row[5],
             "posted_at": row[6],
+            "geo_country_code": row[7],
+            "geo_city": row[8],
+            "geo_region": row[9],
+            "geo_lat": row[10],
+            "geo_lon": row[11],
+            "geo_confidence": row[12],
+            "geo_source": row[13],
+            "geocoded_at": row[14],
         }
         for row in cursor.fetchall()
     }
@@ -1230,8 +1805,15 @@ __all__ = [
     "fetch_job_text",
     "fetch_jobs_for_metadata_backfill",
     "fetch_jobs_for_summary_backfill",
+    "fetch_jobs_for_geo_backfill",
     "update_job_metadata",
     "batch_update_job_metadata",
+    "update_job_geo",
+    "batch_update_job_geo",
+    "JOB_GEO_COLUMNS",
+    "lookup_geo_cities",
+    "upsert_geo_cities_batch",
+    "count_geo_cities",
     "vector_search",
     "fetch_full_jobs",
     "close",

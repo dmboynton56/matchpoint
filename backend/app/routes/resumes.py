@@ -9,9 +9,18 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from app.db import turso
 from app.db.database import supabase
 from app.routes.auth import get_optional_user, get_current_user
-from app.schemas.ranking import JobRankInput, UserPreferences
+from pydantic import BaseModel, Field
+from app.schemas.ranking import (
+    JobRankInput,
+    LocationPreferences,
+    UserPreferences,
+)
 from app.services.cleaning import resolve_job_location
 from app.services.embedding import generateEmbedding
+from app.services.geo import (
+    geocode_job_location,
+    location_compatibility,
+)
 from app.services.job_facts import extract_job_facts
 from app.services.ranking import (
     SCORING_JOB_DESCRIPTION_CHAR_LIMIT,
@@ -22,7 +31,23 @@ from app.services.ranking import (
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-VECTOR_RETRIEVAL_LIMIT = 10
+# Pipeline tuning.
+#
+# The LLM sees VECTOR_RETRIEVAL_LIMIT jobs and returns at most
+# AUTHENTICATED_JOB_LIMIT. Going LLM-in > LLM-out gives the model room
+# to choose the best 10 from a wider pool — better matches for users
+# whose top vector candidates aren't all true winners.
+#
+# VECTOR_RETRIEVAL_OVERFETCH compensates for the geolocation hard
+# filter. We ask vector search for (limit * overfetch) so the LLM
+# still sees the full `limit` candidates even when the location filter
+# drops some. With overfetch=2 and a 30% country-match rate, a US
+# candidate gets ~6 surviving of 20 fetched — still well above the
+# 10-job return limit, so the filter doesn't starve the LLM of input.
+# With overfetch=2 and no filter (existing user with no prefs), we
+# fetch 40 and trim to 20 by similarity ranking before the LLM call.
+VECTOR_RETRIEVAL_LIMIT = 20
+VECTOR_RETRIEVAL_OVERFETCH = 2
 VISITOR_JOB_LIMIT = 3
 AUTHENTICATED_JOB_LIMIT = 10
 RESUME_SIGNED_URL_EXPIRES_SECONDS = 300
@@ -223,6 +248,14 @@ def recalculate_job_matches_for_user(
 
     preferences = fetch_user_preferences(user_id)
     started_at = _log_upload_stage(f"{stage_prefix}_fetch_preferences", started_at)
+    # Structured location prefs are an additional fetch; soft-fails on
+    # missing columns (returns empty LocationPreferences → no filter).
+    # This is the no-regression guarantee for users who haven't set
+    # structured location preferences yet.
+    location_preferences = fetch_user_location_preferences(user_id)
+    started_at = _log_upload_stage(
+        f"{stage_prefix}_fetch_location_preferences", started_at
+    )
     match_query_embedding = generateEmbedding(
         build_match_query_text(resume_text, preferences)
     )
@@ -233,6 +266,7 @@ def recalculate_job_matches_for_user(
         match_query_embedding,
         return_limit=AUTHENTICATED_JOB_LIMIT,
         preferences=preferences,
+        location_preferences=location_preferences,
     )
     started_at = _log_upload_stage(f"{stage_prefix}_job_scoring", started_at)
 
@@ -241,30 +275,152 @@ def recalculate_job_matches_for_user(
     return jobs
 
 
+def _location_compatibility_note(
+    score: float,
+    job_geo: dict,
+    profile_location: dict | None,
+) -> str:
+    """Generate a short human-readable note explaining the score.
+
+    Used as ``location_compatibility_note`` in JobFacts so the LLM and
+    the front-end both get a readable string instead of having to
+    interpret a bare number.
+    """
+    if not profile_location:
+        return ""
+    job_country = job_geo.get("geo_country_code")
+    preferred = profile_location.get("preferred_country_codes") or []
+    if score == 0.0:
+        return (
+            f"Filtered: job country {job_country!r} is not in the user's "
+            f"preferred set ({preferred!r})."
+        )
+    if score == 0.5:
+        return "Job location could not be geocoded; relying on LLM scoring."
+    if score == 0.75:
+        return "Country matched but job coordinates are missing."
+    if score >= 1.0 and profile_location.get("location_mode") == "city_radius":
+        return "Within the user's preferred radius."
+    if score >= 1.0:
+        return "Country matches user preference."
+    return f"Partial match (score={score:.2f})."
+
+
 def score_job_matches(
     extracted_text: str,
     query_embedding: list[float],
     *,
     return_limit: int,
     vector_retrieval_limit: int = VECTOR_RETRIEVAL_LIMIT,
+    vector_retrieval_overfetch: int = VECTOR_RETRIEVAL_OVERFETCH,
     preferences: UserPreferences | None = None,
+    location_preferences: LocationPreferences | None = None,
 ) -> list[dict]:
+    # Fetch more from the vector index than the LLM batch size so the
+    # geolocation hard filter can drop candidates without starving the
+    # LLM of input. With overfetch=2 and a 50% filter rate, the LLM
+    # still sees the full desired batch. With overfetch=2 and no
+    # filter (the no-regression path for existing users), we trim
+    # the extra fetch by similarity below.
+    vector_match_fetch_limit = max(
+        vector_retrieval_limit,
+        vector_retrieval_limit * vector_retrieval_overfetch,
+    )
     vector_matches = fetch_vector_job_matches(
-        query_embedding, limit=vector_retrieval_limit
+        query_embedding, limit=vector_match_fetch_limit
     )
     job_ids = [str(job["id"]) for job in vector_matches]
     full_jobs_by_id = fetch_full_jobs(job_ids)
 
-    score_inputs: list[JobRankInput] = []
-    display_jobs_by_id: dict[str, dict] = {}
+    # If the user has no structured location preferences, treat this
+    # as "no filter" so location_compatibility always returns 1.0 for
+    # every job. The contract test in test_location_compatibility.py
+    # locks this in.
+    profile_location = (
+        location_preferences.model_dump()
+        if location_preferences is not None
+        else None
+    )
+    # Seniority filter: drop jobs whose experience_level is outside
+    # the user's target_seniority set. Default is
+    # ["internship", "entry", "mid"] so a junior candidate doesn't
+    # get matched against "Staff Engineer" or "Director" roles.
+    # Jobs with experience_level IS NULL pass through (don't punish
+    # what we don't know).
+    target_seniority = (
+        location_preferences.target_seniority
+        if location_preferences is not None
+        else ["internship", "entry", "mid"]
+    )
+    target_seniority_set = {s.lower() for s in (target_seniority or [])}
+
+    # First pass: collect every survivor of the location AND
+    # seniority filter, in vector-search order (most-similar first).
+    # We rank by a combined similarity + location score below; this
+    # is just the candidate pool.
+    # Tuple of (vector_match, full_job, job_geo, location_score).
+    survivors: list[tuple[dict, dict, dict, float]] = []
     for vector_match in vector_matches:
         job_id = str(vector_match["id"])
         full_job = full_jobs_by_id.get(job_id, {})
+        job_geo = {
+            "geo_country_code": full_job.get("geo_country_code"),
+            "geo_city": full_job.get("geo_city"),
+            "geo_region": full_job.get("geo_region"),
+            "geo_lat": full_job.get("geo_lat"),
+            "geo_lon": full_job.get("geo_lon"),
+            "geo_source": full_job.get("geo_source"),
+        }
+        location_score = location_compatibility(job_geo, profile_location)
+        if location_score == 0.0:
+            # Hard filter — wrong country. Drop entirely.
+            continue
+        # Seniority filter. Drop senior/lead/exec roles for users
+        # who haven't opted in. The experience_level column comes
+        # from job_metadata.derive_browse_metadata and is the same
+        # source the browse UI uses, so this is consistent with
+        # the rest of the product.
+        experience_level = (full_job.get("experience_level") or "").lower() or None
+        if (
+            experience_level is not None
+            and target_seniority_set
+            and experience_level not in target_seniority_set
+        ):
+            continue
+        survivors.append((vector_match, full_job, job_geo, location_score))
+
+    # Second pass: rank by a combined score. The weights reflect the
+    # current intent: similarity is still the dominant signal (the
+    # user wants jobs that match their skills), but a strong local
+    # job can outrank a more-similar distant one. Tunable via
+    # LOCATION_RANK_WEIGHT below — raise to bias more toward local,
+    # lower to bias more toward skills.
+    LOCATION_RANK_WEIGHT = 0.30
+    SIMILARITY_RANK_WEIGHT = 1.0 - LOCATION_RANK_WEIGHT
+    for vector_match, full_job, _job_geo, _location_score in survivors:
+        similarity = float(vector_match.get("similarity") or 0.0)
+        full_job["_rank_score"] = (
+            SIMILARITY_RANK_WEIGHT * similarity
+            + LOCATION_RANK_WEIGHT * _location_score
+        )
+    survivors.sort(
+        key=lambda t: t[1]["_rank_score"],
+        reverse=True,
+    )
+    # Take the top N by combined rank. Beyond that, the LLM has
+    # diminishing returns and the user gets diminishing variety.
+    survivors = survivors[:vector_retrieval_limit]
+
+    score_inputs: list[JobRankInput] = []
+    display_jobs_by_id: dict[str, dict] = {}
+    for vector_match, full_job, job_geo, location_score in survivors:
+        job_id = str(vector_match["id"])
         raw_location = full_job.get("location") or vector_match.get("location") or ""
         resolved_location = resolve_job_location(
             raw_location,
             full_job.get("description") or "",
         )
+
         display_job = {
             "id": job_id,
             "title": full_job.get("title") or vector_match["title"],
@@ -277,6 +433,14 @@ def score_job_matches(
             title=display_job["title"],
             location=display_job["location"],
             description=display_job["description"],
+        )
+        # Forward the score to the LLM. The teammate-owned prompt in
+        # ranking.py will see this in the structured job_facts dict
+        # and can use it as ground truth for its own location_fit
+        # dimension instead of guessing from the raw location string.
+        facts.location_compatibility_score = location_score
+        facts.location_compatibility_note = (
+            _location_compatibility_note(location_score, job_geo, profile_location)
         )
         display_jobs_by_id[job_id] = display_job
         score_inputs.append(
@@ -309,6 +473,18 @@ def score_job_matches(
             ),
             None,
         )
+        # Override the LLM's location_fit with the calibrated value from
+        # the route's location_compatibility() call. The LLM has no
+        # visibility into the user's anchor city (only the country
+        # preference and the resume text), so its location_fit values
+        # are inconsistent: a Portland user sees NYC at 0.68 instead
+        # of the distance-curve's 0.62, and Bellevue at 0.50 instead
+        # of 0.93. The structured score is calibrated against the
+        # user's actual preferences and is the source of truth.
+        # The LLM still scores the other dimensions and writes the
+        # notes — only the numeric location_fit is replaced.
+        if facts is not None and facts.location_compatibility_score is not None:
+            score.location_fit = facts.location_compatibility_score
         scored_jobs.append(
             {
                 "id": job["id"],
@@ -548,3 +724,280 @@ async def delete_resume(
             status_code=500,
             detail="Internal server error deleting resume",
         ) from e
+
+
+# -----------------------------------------------------------------------------
+# Structured location preferences
+# -----------------------------------------------------------------------------
+# Mirrors the `fetch_user_preferences` defensive pattern: if the new
+# columns don't exist yet (pre-migration), we silently return an empty
+# LocationPreferences so existing users see no regression. The matching
+# route treats an empty location profile as "no filter" — see
+# `location_compatibility`'s contract test for the no-regression cases.
+
+_LOCATION_PREFERENCE_COLUMNS = (
+    "location_mode, preferred_country_codes, preferred_city, "
+    "preferred_lat, preferred_lon, preferred_radius_km, preferred_regions, "
+    "target_seniority"
+)
+
+
+def _normalize_country_codes(value) -> list[str]:
+    """Normalize country codes: uppercase, strip, dedupe, alpha-2 only.
+
+    Anything that doesn't look like a 2-letter ISO code is dropped. This
+    is a defensive filter — the front-end should be sending valid codes
+    already, but a bad input from an old client should never crash the
+    matching route.
+    """
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, str):
+            continue
+        code = raw.strip().upper()
+        if len(code) != 2 or not code.isalpha():
+            continue
+        if code in seen:
+            continue
+        seen.add(code)
+        out.append(code)
+    return out
+
+
+def fetch_user_location_preferences(user_id: str) -> LocationPreferences:
+    """Return the user's structured location preferences.
+
+    Soft-fails on missing columns (returns empty preferences) so this
+    can be called from the matching route before the migration lands.
+    An empty LocationPreferences has location_mode='country' and
+    no country codes — `location_compatibility` returns 1.0 for every
+    job in that state, so existing users see zero regression.
+    """
+    try:
+        response = (
+            supabase.table("profiles")
+            .select(_LOCATION_PREFERENCE_COLUMNS)
+            .eq("id", user_id)
+            .maybe_single()
+            .execute()
+        )
+    except Exception as exc:
+        if not _is_missing_preference_columns_error(exc):
+            logger.exception("fetch_user_location_preferences failed")
+            raise
+        return LocationPreferences()
+    data = _response_data(response, stage="fetch_user_location_preferences") or {}
+    return LocationPreferences(
+        location_mode=data.get("location_mode") or "country",
+        preferred_country_codes=_normalize_country_codes(
+            data.get("preferred_country_codes")
+        ),
+        preferred_city=data.get("preferred_city"),
+        preferred_lat=data.get("preferred_lat"),
+        preferred_lon=data.get("preferred_lon"),
+        preferred_radius_km=data.get("preferred_radius_km"),
+        preferred_regions=_normalize_text_array(
+            data.get("preferred_regions")
+        ),
+        target_seniority=_normalize_text_array(
+            data.get("target_seniority")
+        ),
+    )
+
+
+class LocationPreferencesUpdate(BaseModel):
+    """Body of PATCH /profile/location-preferences.
+
+    All fields optional so the client can update one without re-sending
+    the others. ``None`` means "don't change"; an empty list / empty
+    string means "explicitly clear." The route's semantics distinguish
+    these two cases (None is preserved, falsy values clear the column).
+    """
+
+    location_mode: str | None = Field(default=None, max_length=32)
+    preferred_country_codes: list[str] | None = None
+    preferred_city: str | None = Field(default=None, max_length=160)
+    preferred_lat: float | None = None
+    preferred_lon: float | None = None
+    preferred_radius_km: int | None = Field(default=None, ge=0, le=20000)
+    preferred_regions: list[str] | None = None
+    target_seniority: list[str] | None = None
+
+
+@router.patch("/profile/location-preferences")
+async def update_location_preferences(
+    payload: LocationPreferencesUpdate,
+    current_user=Depends(get_current_user),
+):
+    """Update the user's structured location preferences.
+
+    Debug: the function prints the user_id and payload so you can
+    confirm the request hit the route and the Supabase client is
+    pointed at the right project. Look for "[location-prefs]" in
+    server logs.
+    """
+    logger.info("[location-prefs] hit user=%s payload=%s",
+                current_user.id, payload.model_dump())
+    """Update the user's structured location preferences.
+
+    Behavior:
+        - Field present and non-None: written to the profile.
+        - Field None: not written (preserved as-is).
+        - preferred_city provided: server-side geocoded via the same
+          Photon pipeline the jobs use, so the resulting lat/lon
+          matches the format the read path expects.
+
+    Returns the merged LocationPreferences so the client can confirm
+    what landed. ``recalculate_matches`` defaults to True because
+    changing location prefs is the entire point of this endpoint —
+    the existing matches are stale until the user's country set
+    is re-applied to them.
+    """
+    user_id = current_user.id
+    update: dict = {}
+
+    if payload.location_mode is not None:
+        if payload.location_mode not in {"country", "city_radius", "any"}:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "location_mode must be one of 'country', 'city_radius', "
+                    "'any'."
+                ),
+            )
+        update["location_mode"] = payload.location_mode
+
+    if payload.preferred_country_codes is not None:
+        update["preferred_country_codes"] = _normalize_country_codes(
+            payload.preferred_country_codes
+        )
+
+    if payload.preferred_city is not None:
+        city = payload.preferred_city.strip()
+        update["preferred_city"] = city or None
+        if city:
+            # Server-side geocode the city so the stored lat/lon match
+            # the format the read path uses for jobs. If Photon can't
+            # resolve it we still save the city string and leave
+            # lat/lon null — the user can edit and retry.
+            geo = geocode_job_location(city)
+            if geo.get("geo_lat") is not None and geo.get("geo_lon") is not None:
+                update["preferred_lat"] = geo["geo_lat"]
+                update["preferred_lon"] = geo["geo_lon"]
+            else:
+                update["preferred_lat"] = None
+                update["preferred_lon"] = None
+
+    if payload.preferred_lat is not None:
+        update["preferred_lat"] = payload.preferred_lat
+    if payload.preferred_lon is not None:
+        update["preferred_lon"] = payload.preferred_lon
+    if payload.preferred_radius_km is not None:
+        update["preferred_radius_km"] = payload.preferred_radius_km
+
+    if payload.preferred_regions is not None:
+        update["preferred_regions"] = _normalize_text_array(
+            payload.preferred_regions
+        )
+
+    if payload.target_seniority is not None:
+        # Validate the values to avoid garbage in the column. The
+        # candidate set comes from job_metadata.EXPERIENCE_LEVEL_PATTERNS;
+        # we hard-code the allowed values here rather than import the
+        # constant to keep the schema layer decoupled from the
+        # inference layer.
+        allowed = {
+            "internship", "entry", "mid", "senior", "lead", "executive",
+        }
+        cleaned = [
+            v.strip().lower() for v in payload.target_seniority
+            if isinstance(v, str) and v.strip().lower() in allowed
+        ]
+        # If the user submitted only invalid values, fall back to the
+        # safe default rather than wiping the column.
+        if cleaned:
+            update["target_seniority"] = cleaned
+
+    if not update:
+        return {"updated": False, "preferences": fetch_user_location_preferences(user_id).model_dump()}
+
+    try:
+        # Upsert keyed on the user id so a user who somehow has no
+        # profile row yet still gets one created. Same defensive
+        # pattern as the resume upload flow.
+        result = supabase.table("profiles").upsert(
+            {"id": user_id, **update}, on_conflict="id"
+        ).execute()
+        logger.info("[location-prefs] upsert OK user=%s update=%s result=%s",
+                    user_id, update, getattr(result, "data", None))
+    except Exception as exc:
+        logger.warning("[location-prefs] upsert failed user=%s exc=%s: %s",
+                       user_id, type(exc).__name__, exc)
+        if _is_missing_preference_columns_error(exc):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Location preferences columns are not yet provisioned "
+                    "on the profiles table. Apply the migration first."
+                ),
+            ) from exc
+        logger.exception("update_location_preferences failed")
+        raise HTTPException(
+            status_code=500, detail="Failed to update location preferences."
+        ) from exc
+
+    merged = fetch_user_location_preferences(user_id)
+    return {
+        "updated": True,
+        "preferences": merged.model_dump(),
+    }
+
+
+@router.get("/profile/location-preferences")
+async def get_location_preferences(
+    current_user=Depends(get_current_user),
+):
+    """Read the user's current location preferences."""
+    user_id = current_user.id
+    prefs = fetch_user_location_preferences(user_id)
+    return {"preferences": prefs.model_dump()}
+
+
+class GeocodeCityRequest(BaseModel):
+    city: str = Field(..., min_length=1, max_length=160)
+
+
+@router.post("/profile/geocode-city")
+async def geocode_city_for_profile(
+    payload: GeocodeCityRequest,
+    current_user=Depends(get_current_user),
+):
+    """Server-side geocode a city string the user typed in the
+    profile form. Returns the resolved lat/lon so the frontend
+    can show "Detected: Portland, OR" before the user saves.
+
+    The actual write to profiles happens in PATCH
+    /profile/location-preferences. This endpoint is just the
+    preview step.
+    """
+    geo = geocode_job_location(payload.city)
+    if geo.get("geo_source") == "unresolved" or not geo.get("geo_lat"):
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Could not geocode {payload.city!r}. "
+                "Try a more specific name (city, region) or "
+                "an alternative spelling."
+            ),
+        )
+    return {
+        "city": payload.city,
+        "country_code": geo.get("geo_country_code"),
+        "region": geo.get("geo_region"),
+        "lat": geo.get("geo_lat"),
+        "lon": geo.get("geo_lon"),
+    }
+

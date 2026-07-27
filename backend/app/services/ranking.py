@@ -51,6 +51,15 @@ Use JOB facts as grounded truth when they are present. Use USER_PREFERENCES only
 for preference scoring; do not invent location, pay, or position preferences from
 the resume unless they are explicitly present in USER_PREFERENCES.
 
+When the job's `facts` object includes `location_compatibility_score` (a float
+between 0 and 1), use that value directly as your `location_fit` score. It has
+already been calibrated to the candidate's location preferences and the job's
+distance from the candidate's anchor city (or country centroid if no city is
+set). The accompanying `location_compatibility_note` explains the score in plain
+English and is suitable for use in the regular comment. Do not re-derive
+`location_fit` from the raw location string — the structured number is the
+grounded truth.
+
 Estimate interview_likelihood as a separate realistic chance this candidate
 would get an interview from the job evidence and resume evidence. It is not the
 overall match score. Score skills_fit, experience_fit, seniority_fit,
@@ -58,6 +67,15 @@ location_fit, pay_fit, role_fit, and preference_fit from 0-1 as match-quality
 signals. If a preference or job fact is unknown, use a neutral fit near 0.75 and
 explain that the evidence is missing. Use vector_similarity only as weak
 context, not as the score.
+
+Seniority calibration: when the job's title or `facts.experience_level`
+indicates a level clearly above what the resume supports (e.g. the resume
+shows apprentice or early-career and the job is Senior, Staff, Principal,
+or Director), score `seniority_fit` low (0.1-0.3) and include a warning
+that flags the gap. The route has already pre-filtered jobs whose
+experience_level is outside the user's target_seniority, so jobs that
+reach you should generally be in-range; trust the structured signal
+over the title alone when scoring seniority.
 
 Return exactly three match_notes with is_warning=false plus zero or more
 match_notes with is_warning=true. Regular comments and warnings serve different
