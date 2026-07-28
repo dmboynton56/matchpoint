@@ -44,10 +44,9 @@ class LocationPreferences(BaseModel):
 
     Seniority fields: the route filters jobs whose ``experience_level``
     is NOT in ``target_seniority`` (matched against the `jobs`
-    table's `experience_level` column). Default is
-    ``["internship", "entry", "mid"]`` so a junior candidate doesn't
-    get matched against "Staff Engineer" or "Director" roles. A user
-    can override by setting this to include "senior" or "lead".
+    table's `experience_level` column). Default is an empty list —
+    no seniority filtering — until the user opts in, e.g. by setting
+    this to ``["internship", "entry", "mid"]``.
 
     All fields are optional. Empty values mean "no preference" — the
     route does not filter on them.
