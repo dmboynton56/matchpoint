@@ -48,6 +48,13 @@ logger = logging.getLogger(__name__)
 # fetch 40 and trim to 20 by similarity ranking before the LLM call.
 VECTOR_RETRIEVAL_LIMIT = 20
 VECTOR_RETRIEVAL_OVERFETCH = 2
+# The country-filtered fetch needs a bigger pool than the global fetch:
+# its job is to guarantee representation from the user's actual country
+# even when national/global volume (SF, NYC, remote-US postings) would
+# otherwise crowd it out on raw similarity. A same-sized limit as the
+# global search means "top 40 in-country" can still miss real, relevant
+# local jobs whose similarity is merely moderate rather than top-tier.
+LOCAL_VECTOR_RETRIEVAL_OVERFETCH = 5
 VISITOR_JOB_LIMIT = 3
 AUTHENTICATED_JOB_LIMIT = 10
 RESUME_SIGNED_URL_EXPIRES_SECONDS = 300
@@ -175,6 +182,17 @@ def fetch_vector_job_matches(query_embedding: list[float], *, limit: int) -> lis
     return turso.vector_search(query_embedding, limit=limit)
 
 
+def fetch_vector_job_matches_filtered(
+    query_embedding: list[float], *, limit: int, country_codes: set[str]
+) -> list[dict]:
+    # Same as fetch_vector_job_matches, but restricted to jobs whose
+    # geo_country_code is in `country_codes` before computing cosine
+    # similarity. Guarantees the user's preferred country gets a fair
+    # shot at retrieval instead of being diluted by the full corpus.
+    return turso.vector_search_filtered(
+        query_embedding, limit=limit, country_codes=country_codes
+    )
+
 def fetch_full_jobs(job_ids: list[str]) -> dict[str, dict]:
     if not job_ids:
         return {}
@@ -297,7 +315,7 @@ def _location_compatibility_note(
         )
     if score == 0.5:
         return "Job location could not be geocoded; relying on LLM scoring."
-    if score == 0.75:
+    if score == 0.7:
         return "Country matched but job coordinates are missing."
     if score >= 1.0 and profile_location.get("location_mode") == "city_radius":
         return "Within the user's preferred radius."
@@ -329,6 +347,35 @@ def score_job_matches(
     vector_matches = fetch_vector_job_matches(
         query_embedding, limit=vector_match_fetch_limit
     )
+
+    # Retrieval is pure text similarity across the whole corpus, with
+    # no awareness of geography. That means a user's preferred country
+    # only ever acts as a re-ranking signal on whichever jobs happened
+    # to win on similarity — a real location can get starved out of
+    # the candidate pool entirely before location ever gets a vote.
+    # Run a second, geo-scoped retrieval and merge it in so the user's
+    # preferred country is guaranteed representation.
+    normalized_country_codes = set()
+    if location_preferences is not None:
+        normalized_country_codes = {
+            c.upper() for c in (location_preferences.preferred_country_codes or [])
+        }
+    if normalized_country_codes:
+            local_fetch_limit = max(
+                vector_match_fetch_limit,
+                vector_retrieval_limit * LOCAL_VECTOR_RETRIEVAL_OVERFETCH,
+            )
+            local_matches = fetch_vector_job_matches_filtered(
+                query_embedding,
+                limit=local_fetch_limit,
+                country_codes=normalized_country_codes,
+            )
+            seen_ids = {str(m["id"]) for m in vector_matches}
+            for m in local_matches:
+                if str(m["id"]) not in seen_ids:
+                    vector_matches.append(m)
+                    seen_ids.add(str(m["id"]))
+
     job_ids = [str(job["id"]) for job in vector_matches]
     full_jobs_by_id = fetch_full_jobs(job_ids)
 
@@ -350,7 +397,7 @@ def score_job_matches(
     target_seniority = (
         location_preferences.target_seniority
         if location_preferences is not None
-        else ["internship", "entry", "mid"]
+        else []
     )
     target_seniority_set = {s.lower() for s in (target_seniority or [])}
 
@@ -834,15 +881,6 @@ async def update_location_preferences(
 ):
     """Update the user's structured location preferences.
 
-    Debug: the function prints the user_id and payload so you can
-    confirm the request hit the route and the Supabase client is
-    pointed at the right project. Look for "[location-prefs]" in
-    server logs.
-    """
-    logger.info("[location-prefs] hit user=%s payload=%s",
-                current_user.id, payload.model_dump())
-    """Update the user's structured location preferences.
-
     Behavior:
         - Field present and non-None: written to the profile.
         - Field None: not written (preserved as-is).
@@ -851,10 +889,8 @@ async def update_location_preferences(
           matches the format the read path expects.
 
     Returns the merged LocationPreferences so the client can confirm
-    what landed. ``recalculate_matches`` defaults to True because
-    changing location prefs is the entire point of this endpoint —
-    the existing matches are stale until the user's country set
-    is re-applied to them.
+    what landed. Matches are not recalculated here; the client
+    triggers that separately.
     """
     user_id = current_user.id
     update: dict = {}
@@ -931,8 +967,9 @@ async def update_location_preferences(
         result = supabase.table("profiles").upsert(
             {"id": user_id, **update}, on_conflict="id"
         ).execute()
-        logger.info("[location-prefs] upsert OK user=%s update=%s result=%s",
-                    user_id, update, getattr(result, "data", None))
+        logger.debug(
+            "[location-prefs] upsert OK fields=%s", sorted(update.keys())
+        )
     except Exception as exc:
         logger.warning("[location-prefs] upsert failed user=%s exc=%s: %s",
                        user_id, type(exc).__name__, exc)

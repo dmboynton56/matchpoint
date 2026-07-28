@@ -24,14 +24,14 @@ SCORING_BATCH_SIZE = int(os.getenv("SCORING_BATCH_SIZE", "5"))
 SCORING_PARALLELISM = int(os.getenv("SCORING_PARALLELISM", "2"))
 SCORING_REASONING_EFFORT = os.getenv("SCORING_REASONING_EFFORT", "none")
 MATCH_SCORE_WEIGHTS = {
-    "skills_fit": 0.25,
-    "experience_fit": 0.18,
-    "role_fit": 0.17,
-    "seniority_fit": 0.10,
-    "location_fit": 0.10,
-    "pay_fit": 0.075,
-    "preference_fit": 0.075,
-    "interview_likelihood": 0.05,
+    "skills_fit": 0.22,
+    "role_fit": 0.16,
+    "experience_fit": 0.15,
+    "location_fit": 0.20,
+    "pay_fit": 0.10,
+    "seniority_fit": 0.08,
+    "preference_fit": 0.06,
+    "interview_likelihood": 0.03,
 }
 
 scoring_client = client.with_options(

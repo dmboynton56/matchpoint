@@ -21,7 +21,7 @@ alter table public.profiles
   add column if not exists preferred_lon double precision,
   add column if not exists preferred_radius_km integer,
   add column if not exists preferred_regions text[] default '{}',
-  add column if not exists target_seniority text[] default '{internship,entry,mid}';
+  add column if not exists target_seniority text[];
 
 -- Index for the new column. The matching route uses
 --   WHERE experience_level = ANY(target_seniority)

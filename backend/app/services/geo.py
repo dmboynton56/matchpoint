@@ -545,7 +545,12 @@ def _strip_disambiguation_tokens(normalized: str) -> str:
         if tl in short_codes or tl in country_names or tl in state_names:
             continue
         kept.append(t)
-    return " ".join(kept).strip()
+    stripped = " ".join(kept).strip()
+    if not stripped:
+        # Every token looked like a region/country hint — the string is
+        # most likely the place name itself ("Columbia, SC", "Ontario").
+        return " ".join(tokens[:1]).strip()
+    return stripped
 
 
 def _disambiguate_offline(
@@ -829,25 +834,28 @@ def location_compatibility(
         code.upper() for code in preferred_country_codes
         if isinstance(code, str) and code
     }
-    if not normalized_country_codes:
-        # No country filter set with any mode — the user hasn't
-        # told us what they want, so show everything. This is the
-        # zero-regression path for users who set location_mode but
-        # haven't picked countries yet.
+
+    has_explicit_anchor = isinstance(profile_location.get("preferred_lat"), (int, float)) and \
+                        isinstance(profile_location.get("preferred_lon"), (int, float))
+
+    if not normalized_country_codes and not has_explicit_anchor:
+        # Truly nothing set — zero-regression path.
         return 1.0
 
-    # We have a country filter. The job must match.
-    if not job_geo:
+    if not job_geo or job_geo.get("geo_source") == "unresolved":
         return 0.5
-    if job_geo.get("geo_source") == "unresolved":
-        return 0.5
+
     job_country = job_geo.get("geo_country_code")
-    if not job_country:
-        # Macro-only result (Remote, LATAM) — country unknown.
-        return 0.5
-    job_country = job_country.upper()
-    if job_country not in normalized_country_codes:
-        return 0.0
+    if job_country:
+        job_country = job_country.upper()
+
+    # Hard country filter only applies if the user actually chose countries.
+    if normalized_country_codes and (not job_country or job_country not in normalized_country_codes):
+        return 0.0 if job_country else 0.5
+
+    # From here: either country matched, or user has no country filter but
+    # does have an explicit city anchor — do distance scoring either way.
+    anchor_lat, anchor_lon = _resolve_anchor(profile_location, normalized_country_codes)
 
     # Country matched. Now compute the distance-based score.
     # The anchor (user's reference point) is determined by the
@@ -874,37 +882,26 @@ def location_compatibility(
     return _distance_score(distance, willing_to_relocate_km)
 
 
+def _coerce_float(value) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):  # bool is an int subclass — exclude it
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _resolve_anchor(
     profile_location: dict,
     normalized_country_codes: set[str],
 ) -> tuple[float | None, float | None]:
-    """Pick the best (lat, lon) anchor for the user's location.
-
-    Priority:
-      1. User-set preferred_lat / preferred_lon (most precise).
-      2. Geocoded preferred_city (already resolved server-side).
-      3. Default tech hub for the user's first preferred country.
-         SF for US, London for GB, Toronto for CA, Bangalore for IN,
-         Berlin for DE, Sydney for AU, etc. These give sensible
-         distance scores for users who picked a country but didn't
-         bother selecting a city — much better than the population
-         centroid, which lands in Kansas for the US and gives every
-         job in the country the same ~0.65 score.
-      4. Country population centroid as a last-resort fallback for
-         countries not in the tech-hub table.
-
-    Returns (None, None) only if the user has no country preference
-    either, in which case the caller treats the anchor as unknown
-    and returns 0.7 (country-level match, no distance info).
-    """
-    lat = profile_location.get("preferred_lat")
-    lon = profile_location.get("preferred_lon")
-    if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
-        return float(lat), float(lon)
+    lat = _coerce_float(profile_location.get("preferred_lat"))
+    lon = _coerce_float(profile_location.get("preferred_lon"))
+    if lat is not None and lon is not None:
+        return lat, lon
     if normalized_country_codes:
-        # Try a tech hub first — gives meaningful distance signals
-        # for users who picked a country but no city. Falls back
-        # to the population centroid if we don't have a hub entry.
         for cc in sorted(normalized_country_codes):
             hub = _country_tech_hub(cc)
             if hub is not None:

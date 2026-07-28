@@ -42,10 +42,8 @@ const COUNTRY_OPTIONS = [
   { code: "CA", label: "Canada" },
   { code: "GB", label: "United Kingdom" },
   { code: "DE", label: "Germany" },
-  { code: "IE", label: "Ireland" },
   { code: "NL", label: "Netherlands" },
   { code: "AU", label: "Australia" },
-  { code: "NZ", label: "New Zealand" },
   { code: "IN", label: "India" },
   { code: "JP", label: "Japan" },
 ]

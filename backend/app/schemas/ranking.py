@@ -63,7 +63,7 @@ class LocationPreferences(BaseModel):
     preferred_radius_km: int | None = Field(default=None, ge=0, le=20000)
     preferred_regions: list[str] = Field(default_factory=list, max_length=8)
     target_seniority: list[str] = Field(
-        default_factory=lambda: ["internship", "entry", "mid"],
+        default_factory=list,
         max_length=8,
     )
 

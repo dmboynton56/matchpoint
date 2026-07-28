@@ -221,6 +221,7 @@ def check_location_preferences_columns() -> None:
         "preferred_lon",
         "preferred_radius_km",
         "preferred_regions",
+        "target_seniority",
     )
     try:
         # The simplest possible query that asks PostgREST about the

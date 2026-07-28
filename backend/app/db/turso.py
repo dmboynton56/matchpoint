@@ -1383,7 +1383,7 @@ def fetch_jobs_for_geo_backfill(*, limit: int = 100) -> list[dict]:
     conn = get_client()
     cursor = conn.execute(
         "SELECT id, location FROM jobs "
-        "WHERE location IS NOT NULL AND location != '' "
+        "WHERE location IS NOT NULL AND trim(location) != '' "
         "AND geocoded_at IS NULL LIMIT ?",
         [limit],
     )
@@ -1692,6 +1692,90 @@ def vector_search(
     # Slow path: legacy behavior. Full table scan + per-row Python cosine.
     return _vector_search_legacy(query_embedding, limit=limit)
 
+def _fetch_ids_by_country_codes(country_codes: set[str]) -> set[str]:
+    """Return the set of job ids whose geo_country_code is in `country_codes`.
+
+    Cheap id-only SELECT, uses idx_jobs_geo_country_code. Used to restrict
+    the in-memory embedding matrix to a geographically relevant subset
+    before running cosine similarity.
+    """
+    if not country_codes:
+        return set()
+    conn = get_client()
+    placeholders = ",".join(["?"] * len(country_codes))
+    cursor = conn.execute(
+        f"SELECT id FROM jobs WHERE geo_country_code IN ({placeholders})",
+        list(country_codes),
+    )
+    return {str(row[0]) for row in cursor.fetchall()}
+
+
+def vector_search_filtered(
+    query_embedding: list[float], *, limit: int, country_codes: set[str]
+) -> list[dict]:
+    """Same contract as vector_search, but restricted to jobs whose
+    geo_country_code is in `country_codes`.
+
+    Retrieval in vector_search is pure text similarity across the whole
+    corpus — it has no awareness of geography. That means a user's
+    preferred country only ever acts as a *re-ranking* signal on whichever
+    jobs happened to win on similarity against the full corpus, which can
+    starve out a real, well-matched local job (e.g. Seattle/Twitch) if
+    other regions' postings are more numerous or more keyword-dense.
+
+    This runs the identical fast-path matmul, just over a pre-filtered
+    subset of the (matrix, ids) artifact, so the user's chosen country
+    is guaranteed a fair shot at retrieval instead of only surviving on
+    global similarity rank.
+
+    Falls back to an empty list (not the legacy per-row scan) if the
+    fast-path matrix is unavailable — the caller already has a full,
+    unfiltered vector_search result to merge with, so a filtered-empty
+    result here just means "no extra local candidates found," not
+    "retrieval broke."
+    """
+    if not country_codes:
+        return []
+    cached = _get_matrix_and_ids()
+    if cached is None:
+        return []
+    matrix, ids = cached
+
+    allowed_ids = _fetch_ids_by_country_codes(country_codes)
+    if not allowed_ids:
+        return []
+
+    keep_indices = [i for i, job_id in enumerate(ids) if job_id in allowed_ids]
+    if not keep_indices:
+        return []
+
+    sub_matrix = matrix[keep_indices]
+    sub_ids = [ids[i] for i in keep_indices]
+
+    from app.services.embedding_matrix import top_k_ids
+    top = top_k_ids(sub_matrix, sub_ids, query_embedding, limit)
+    if not top:
+        return []
+
+    top_ids = [job_id for job_id, _ in top]
+    meta_by_id = _fetch_metadata_for_ids(top_ids)
+    out: list[dict] = []
+    for job_id, sim in top:
+        meta = meta_by_id.get(job_id)
+        if not meta:
+            continue
+        out.append(
+            {
+                "id": job_id,
+                "title": meta["title"],
+                "company": meta["company"],
+                "location": meta["location"],
+                "apply_url": meta["apply_url"],
+                "similarity": sim,
+            }
+        )
+    return out
+
 
 def _fetch_metadata_for_ids(job_ids: list[str]) -> dict[str, dict]:
     """Cheap SELECT for title/company/location/apply_url keyed on the
@@ -1815,6 +1899,7 @@ __all__ = [
     "upsert_geo_cities_batch",
     "count_geo_cities",
     "vector_search",
+    "vector_search_filtered",
     "fetch_full_jobs",
     "close",
     "get_client",

@@ -102,6 +102,7 @@ def main() -> None:
                     "id, preferred_locations, location_mode, "
                     "preferred_country_codes"
                 )
+                .order("id")
                 .range(offset, offset + BATCH_SIZE - 1)
                 .execute()
             )

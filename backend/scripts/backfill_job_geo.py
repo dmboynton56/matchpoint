@@ -38,23 +38,23 @@ def main() -> None:
     total_updated = 0
     total_already_geo = 0
 
+    seen_ids: set[str] = set()
     while True:
         rows = turso.fetch_jobs_for_geo_backfill(limit=BATCH_SIZE)
         if not rows:
             break
 
+        row_ids = {row["id"] for row in rows}
+        if row_ids and row_ids <= seen_ids:
+            # Same rows came back again — something upstream failed to
+            # persist geocoded_at. Stop instead of spinning forever.
+            break
+        seen_ids |= row_ids
+
         batch: list[tuple[str, dict]] = []
         for row in rows:
-            # geocode_job_location is documented to never raise. The cache
-            # write-through means that a second pass on the same location
-            # hits the cache and never hits Photon again.
             geo = geocode_job_location(row.get("location") or "")
-            if not geo.get("geo_country_code"):
-                # Still write the row so we record geo_source = "unresolved"
-                # and geocoded_at — the read path uses "we tried" as a
-                # load-bearing signal distinct from "we never checked."
-                pass
-            else:
+            if geo.get("geo_country_code"):
                 total_already_geo += 1
             batch.append((row["id"], geo))
 
