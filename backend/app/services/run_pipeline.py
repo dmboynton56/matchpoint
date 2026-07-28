@@ -32,6 +32,7 @@ try:
         encode as encode_embedding_matrix,
     )
     from .git_data_cache import GitDataCacheError, push_matrix_to_branch
+    from .geo import geocode_job_location
     from ..db import turso
 except ImportError:
     from scraper100 import scrape_all
@@ -45,6 +46,7 @@ except ImportError:
         encode as encode_embedding_matrix,
     )
     from git_data_cache import GitDataCacheError, push_matrix_to_branch
+    from geo import geocode_job_location
     from db import turso
 
 
@@ -243,6 +245,31 @@ def run_pipeline():
         )
         metadata["metadata_derived_at"] = metadata_derived_timestamp()
         job.update(metadata)
+
+    print("\n=== STEP 3.6: Geocoding locations ===")
+    geo_ok = 0
+    geo_unresolved = 0
+    for job in new_jobs:
+        try:
+            # geocode_job_location is documented to never raise, but a
+            # bug in the cache helper or a libsql write failure could
+            # surface one. Wrap defensively so a single bad row never
+            # blocks the rest of the pipeline.
+            geo = geocode_job_location(job.get("location"))
+        except Exception as e:
+            print(f"  geocode failed for {job.get('external_id')!r}: {e}")
+            geo = {
+                "geo_country_code": None, "geo_city": None, "geo_region": None,
+                "geo_lat": None, "geo_lon": None,
+                "geo_confidence": 0.0, "geo_source": "unresolved",
+                "geocoded_at": None,
+            }
+        job.update(geo)
+        if geo.get("geo_country_code"):
+            geo_ok += 1
+        else:
+            geo_unresolved += 1
+    print(f"  Geocoded: {geo_ok} with country, {geo_unresolved} unresolved")
 
     embedding_texts = [job["description"] for job in new_jobs]
 

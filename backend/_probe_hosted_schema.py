@@ -208,6 +208,55 @@ def check_resume_suggestions() -> None:
         _unexpected(exc)
 
 
+def check_location_preferences_columns() -> None:
+    """Verify the location-preferences columns on profiles are visible
+    to PostgREST. Tells you whether the schema cache is stale.
+    """
+    _section("Check 4: profiles.location_preferences columns (PostgREST cache)")
+    expected = (
+        "location_mode",
+        "preferred_country_codes",
+        "preferred_city",
+        "preferred_lat",
+        "preferred_lon",
+        "preferred_radius_km",
+        "preferred_regions",
+        "target_seniority",
+    )
+    try:
+        # The simplest possible query that asks PostgREST about the
+        # new columns. If the cache is stale, this 400s with
+        # "column does not exist". If the columns don't exist in
+        # pg_catalog at all, this also 400s (indistinguishable from
+        # the cache-stale case at the PostgREST layer, but pg_catalog
+        # is the source of truth).
+        response = (
+            supabase.table("profiles")
+            .select(",".join(expected))
+            .limit(1)
+            .execute()
+        )
+        print("OK: PostgREST can see all location-preference columns.")
+        print(f"    (rows returned: {len(response.data or [])})")
+    except APIError as exc:
+        msg = str(exc)
+        if "column" in msg.lower() and "does not exist" in msg.lower():
+            print("MISSING: at least one location-preference column is not")
+            print("         visible to PostgREST. Either:")
+            print("         - The migration hasn't run (run supabase db push)")
+            print("         - The PostgREST schema cache is stale.")
+            print("         Run this in the SQL editor to reload it:")
+            print("           NOTIFY pgrst, 'reload schema';")
+            print()
+            print("         detail:", msg)
+            sys.exit(2)
+        if "Could not find the table" in msg or (
+            "relation" in msg.lower() and "does not exist" in msg.lower()
+        ):
+            _fail("profiles table does not exist on the target DB.")
+        _unexpected(exc)
+
+
 def main() -> None:
     print("Hosted Supabase schema probe")
     print("URL:", os.environ.get("SUPABASE_URL", "<not set>"))
@@ -221,6 +270,7 @@ def main() -> None:
         # check_two_query_fallback always exits; we don't return.
 
     check_resume_suggestions()
+    check_location_preferences_columns()
 
     print()
     print("=" * 64)

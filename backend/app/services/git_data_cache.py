@@ -35,6 +35,9 @@ from pathlib import Path
 
 BRANCH_NAME = "data-cache"
 REPO_RELATIVE_PATHS = ("data/embeddings/matrix.npy", "data/embeddings/matrix_ids.json")
+# GeoNames cities reference data, used by the offline geocoder.
+# Single gzipped JSON file; built by scripts/build_geonames_cache.py.
+GEO_CITIES_REL_PATH = "data/geo_cities/cities.json.gz"
 
 
 class GitDataCacheError(RuntimeError):
@@ -279,9 +282,180 @@ def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+
+
+def push_geo_cities_to_branch(
+    gz_bytes: bytes,
+    *,
+    branch: str = BRANCH_NAME,
+    commit_message: str | None = None,
+) -> None:
+    """Write the gzipped geo_cities JSON to the data-cache branch.
+
+    Same pattern as push_matrix_to_branch: temp worktree, commit,
+    force-with-lease push, gc. Single file instead of two.
+    """
+    if not _git_available():
+        raise GitDataCacheError("git is not installed or not on PATH")
+
+    repo_root = _repo_root()
+    rel_path = Path(GEO_CITIES_REL_PATH)
+    rel_dir = rel_path.parent
+
+    with tempfile.TemporaryDirectory(prefix="data-cache-geo-") as tmp:
+        worktree = Path(tmp) / "wt"
+        # Fetch the branch so --force-with-lease has something to compare to.
+        fetch = _run(["git", "fetch", "origin", branch], repo_root)
+        if fetch.returncode != 0:
+            print(
+                f"[data-cache] git fetch origin {branch} returned "
+                f"{fetch.returncode} (likely first run, branch not on remote yet)"
+            )
+
+        # Clean up any stale worktree on this branch from a previous run.
+        list_cmd = _run(
+            ["git", "worktree", "list", "--porcelain"], repo_root
+        )
+        if list_cmd.returncode == 0:
+            current_path = None
+            current_branch = None
+            stale_to_remove: list[str] = []
+            for raw_line in list_cmd.stdout.splitlines():
+                line = raw_line.strip()
+                if line.startswith("worktree "):
+                    current_path = line[len("worktree "):]
+                elif line.startswith("branch "):
+                    current_branch = line[len("branch "):]
+                    if (
+                        current_path is not None
+                        and current_branch == f"refs/heads/{branch}"
+                        and current_path != str(worktree)
+                    ):
+                        stale_to_remove.append(current_path)
+                    current_path = None
+                    current_branch = None
+            for stale_path in stale_to_remove:
+                print(
+                    f"[data-cache] removing stale worktree on {branch}: "
+                    f"{stale_path}"
+                )
+                _run(
+                    ["git", "worktree", "remove", "--force", stale_path],
+                    repo_root,
+                )
+                _run(["git", "worktree", "prune"], repo_root)
+
+        # Check if the branch exists locally
+        local_exists = _run(
+            ["git", "rev-parse", "--verify", f"refs/heads/{branch}"], repo_root
+        )
+        if local_exists.returncode == 0:
+            wt_add = _run(
+                ["git", "worktree", "add", str(worktree), branch], repo_root
+            )
+        else:
+            origin_ref = f"refs/remotes/origin/{branch}"
+            origin_exists = _run(
+                ["git", "rev-parse", "--verify", origin_ref], repo_root
+            )
+            if origin_exists.returncode == 0:
+                wt_add = _run(
+                    [
+                        "git", "worktree", "add",
+                        "--track", "-B", branch,
+                        str(worktree), f"origin/{branch}",
+                    ],
+                    repo_root,
+                )
+            else:
+                wt_add = _run(
+                    ["git", "worktree", "add", "--orphan", "-B", branch, str(worktree)],
+                    repo_root,
+                )
+        if wt_add.returncode != 0:
+            raise GitDataCacheError(
+                f"git worktree add failed:\n  stdout: {wt_add.stdout}\n  "
+                f"stderr: {wt_add.stderr}"
+            )
+
+        origin_ref = f"refs/remotes/origin/{branch}"
+        if _run(["git", "rev-parse", "--verify", origin_ref], repo_root).returncode == 0:
+            reset = _run(
+                ["git", "reset", "--hard", f"origin/{branch}"],
+                worktree,
+            )
+            if reset.returncode != 0:
+                raise GitDataCacheError(
+                    f"git reset --hard origin/{branch} failed:\n  "
+                    f"stdout: {reset.stdout}\n  stderr: {reset.stderr}"
+                )
+        else:
+            _run(["git", "rm", "-rf", "--quiet", "."], worktree)
+
+        # Write the geo_cities file
+        target_dir = worktree / rel_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        (worktree / rel_path).write_bytes(gz_bytes)
+
+        add = _run(["git", "add", "--", str(rel_path)], worktree)
+        if add.returncode != 0:
+            raise GitDataCacheError(
+                f"git add {rel_path} failed:\n  "
+                f"stdout: {add.stdout}\n  stderr: {add.stderr}"
+            )
+
+        status = _run(["git", "status", "--porcelain"], worktree)
+        if not status.stdout.strip():
+            print(f"[data-cache] no changes to commit on {branch}, skipping push")
+            return
+
+        head_check = _run(["git", "rev-parse", "--verify", "HEAD"], worktree)
+        msg = commit_message or f"geo: update cities.json.gz ({_utc_timestamp()})"
+        git_identity = [
+            "-c", "user.name=matchpoint-pipeline",
+            "-c", "user.email=pipeline@matchpoint.local",
+        ]
+        if head_check.returncode == 0:
+            commit = _run(
+                ["git", *git_identity, "commit", "--amend", "--no-edit", "-m", msg],
+                worktree,
+            )
+        else:
+            commit = _run(
+                ["git", *git_identity, "commit", "-m", msg, "--allow-empty"],
+                worktree,
+            )
+        if commit.returncode != 0:
+            raise GitDataCacheError(
+                f"git commit failed:\n  stdout: {commit.stdout}\n  "
+                f"stderr: {commit.stderr}"
+            )
+
+        push = _run(
+            ["git", "push", "origin", f"HEAD:{branch}", "--force-with-lease"],
+            worktree,
+        )
+        if push.returncode != 0:
+            raise GitDataCacheError(
+                f"git push --force-with-lease to origin/{branch} failed:\n  "
+                f"stdout: {push.stdout}\n  stderr: {push.stderr}"
+            )
+
+        print(f"[data-cache] pushed geo_cities to origin/{branch} (commit {msg!r})")
+
+    gc = _run(["git", "gc", "--prune=now", "--aggressive"], repo_root)
+    if gc.returncode != 0:
+        print(
+            f"[data-cache] git gc failed (non-fatal): "
+            f"stdout: {gc.stdout} stderr: {gc.stderr}"
+        )
+
+
 __all__ = [
     "BRANCH_NAME",
     "REPO_RELATIVE_PATHS",
+    "GEO_CITIES_REL_PATH",
     "GitDataCacheError",
     "push_matrix_to_branch",
+    "push_geo_cities_to_branch",
 ]

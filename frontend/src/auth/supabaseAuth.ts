@@ -101,6 +101,13 @@ export type ProfilePreferences = {
   preferred_work_modes: string[]
   minimum_base_salary: number | null
   salary_currency: string
+
+  preferred_country_codes: string[]
+  preferred_city: string | null
+  preferred_lat: number | null
+  preferred_lon: number | null
+  preferred_radius_km: number | null
+  target_seniority: string[]
 }
 
 export const getProfilePreferences = async (
@@ -109,7 +116,7 @@ export const getProfilePreferences = async (
   const { data, error } = await supabase
     .from("profiles")
     .select(
-      "target_role, preferred_locations, preferred_work_modes, minimum_base_salary, salary_currency"
+      "target_role, preferred_locations, preferred_work_modes, minimum_base_salary, salary_currency, preferred_country_codes, preferred_city, preferred_lat, preferred_lon, preferred_radius_km, target_seniority"
     )
     .eq("id", userId)
     .maybeSingle()
@@ -125,6 +132,12 @@ export const getProfilePreferences = async (
       preferred_work_modes: data?.preferred_work_modes ?? [],
       minimum_base_salary: data?.minimum_base_salary ?? null,
       salary_currency: data?.salary_currency ?? "USD",
+      preferred_country_codes: data?.preferred_country_codes ?? [],
+      preferred_city: data?.preferred_city ?? null,
+      preferred_lat: data?.preferred_lat ?? null,
+      preferred_lon: data?.preferred_lon ?? null,
+      preferred_radius_km: data?.preferred_radius_km ?? null,
+      target_seniority: data?.target_seniority ?? [],
     },
   }
 }
@@ -137,6 +150,12 @@ export const updateProfilePreferences = async (
     preferred_work_modes: string[]
     minimum_base_salary: number | null
     salary_currency?: string
+    preferred_country_codes?: string[]
+    preferred_city?: string | null
+    preferred_lat?: number | null
+    preferred_lon?: number | null
+    preferred_radius_km?: number | null
+    target_seniority?: string[]
   }
 ): Promise<ProfileResult<null>> => {
   const targetRole = preferences.target_role.trim()
@@ -159,6 +178,15 @@ export const updateProfilePreferences = async (
         : null,
       minimum_base_salary: preferences.minimum_base_salary,
       salary_currency: preferences.salary_currency ?? "USD",
+      preferred_country_codes:
+        preferences.preferred_country_codes ?? [],
+      preferred_city: preferences.preferred_city ?? null,
+      preferred_lat: preferences.preferred_lat ?? null,
+      preferred_lon: preferences.preferred_lon ?? null,
+      preferred_radius_km: preferences.preferred_radius_km ?? null,
+      target_seniority: preferences.target_seniority ?? [
+        "internship", "entry", "mid",
+      ],
     },
     { onConflict: "id" }
   )
