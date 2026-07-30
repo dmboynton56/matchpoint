@@ -30,9 +30,12 @@ Built during our apprenticeship in [Flatiron School's Accelerated AI Engineering
 
 - Resume upload and parsing for personalized job matching
 - Ranked job listings with match scores, fit signals, and match notes
+- Full job search catalog by keywords, location, experience, job type, workplace, pay range, and date posted, with paginated results and a chat-style search assistant that can set your filters from a sentence
+- Match scores factor in your preferred locations, with explicit `location_fit` signals and warnings when a role requires onsite work or relocation that conflicts with your preferences
+- Resume optimization & bullet coaching identifies missing skills and weak bullets against target jobs, recommends learning resources from our curated links table, and rewrites weak bullets without hallucinating experience or technologies
 - User profiles with target role, locations, work mode, and salary preferences
 - Auth via email/password and Google (Supabase)
-- Post-apply follow-up flow (track applied, favorites, hide jobs — UI in progress)
+- Post-apply follow-up flow (track applied, favorites, hide jobs)
 
 ## Local development
 
